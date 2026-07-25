@@ -57,6 +57,12 @@ COMMANDS                                                      *simplegit-command
   Open the commit history of the current file. Inside the window: <CR> shows
   the commit's changes to this file, `a` shows the whole commit, `q` closes.
 
+:SimpleGitLog                                                    *:SimpleGitLog*
+  Open the repository-wide commit graph (git log --graph) for the repository
+  containing the current file (or the working directory for unnamed
+  buffers). Inside the window: <CR> shows the commit under the cursor, `m`
+  loads the next page of commits, `q` closes.
+
 :SimpleGitDiff [rev]                                            *:SimpleGitDiff*
   Diff the current file against [rev] (default HEAD) in a vertical split.
   `q` in the revision buffer closes the diff.
@@ -102,6 +108,7 @@ MAPPINGS                                                      *simplegit-mapping
   <Plug>(simplegit-blame)              :SimpleGitBlame
   <Plug>(simplegit-blame-line)         :SimpleGitBlameLine
   <Plug>(simplegit-history)            :SimpleGitHistory
+  <Plug>(simplegit-log)                :SimpleGitLog
   <Plug>(simplegit-diff)               :SimpleGitDiff
   <Plug>(simplegit-status)             :SimpleGitStatus
   <Plug>(simplegit-toggle-line-blame)  :SimpleGitToggleLineBlame
@@ -139,6 +146,12 @@ g:simplegit_history_limit (default 200)               *g:simplegit_history_limit
 
 g:simplegit_history_height (default 15)              *g:simplegit_history_height*
   Maximum height of the history window.
+
+g:simplegit_log_limit (default 200)                       *g:simplegit_log_limit*
+  Commits fetched per :SimpleGitLog page (`m` fetches the next page).
+
+g:simplegit_log_height (default 20)                      *g:simplegit_log_height*
+  Maximum height of the commit graph window.
 
 g:simplegit_signs (default 1)                                 *g:simplegit_signs*
   Show hunk markers in the sign column.

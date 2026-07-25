@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.0 (2026-07-26)
+
+Repository commit graph (protocol 4).
+
+- New `:SimpleGitLog` (default `<leader>gl`, `<Plug>(simplegit-log)`): a
+  repository-wide `git log --graph` view with branch topology, short shas,
+  dates, authors, refs and subjects. `<CR>` shows the commit under the
+  cursor, `m` appends the next page (`--skip` paging), `q` closes.
+- New daemon request `graph_log` with structured per-row output; connector
+  rows (graph-only lines such as `|/`) are preserved so the topology renders
+  exactly as git drew it. Malformed rows degrade to connector rows instead
+  of misaligning columns.
+- New options `g:simplegit_log_limit` (page size, default 200) and
+  `g:simplegit_log_height` (window cap, default 20); new highlight groups
+  `SimpleGitLogGraph`, `SimpleGitLogSha`, `SimpleGitLogRefs`.
+- Protocol bumped to 4: rerun `./install.sh` so the Vim side and daemon
+  stay in step.
+
 ## 0.4.0 (2026-07-25)
 
 Toolchain modernization release.

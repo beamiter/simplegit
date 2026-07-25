@@ -71,6 +71,7 @@ command! SimpleGitBlame simplegit#ToggleBlame()
 command! SimpleGitBlameLine simplegit#BlameLine()
 command! SimpleGitToggleLineBlame simplegit#ToggleLineBlame()
 command! SimpleGitHistory simplegit#History()
+command! SimpleGitLog simplegit#Log()
 command! SimpleGitStatus simplegit#Status()
 command! -nargs=? SimpleGitDiff simplegit#Diff(<q-args>)
 command! -nargs=? SimpleGitShow simplegit#Show(<q-args>)
@@ -87,6 +88,7 @@ command! SimpleGitToggleSigns simplegit#ToggleSigns()
 nnoremap <silent> <Plug>(simplegit-blame) <Cmd>SimpleGitBlame<CR>
 nnoremap <silent> <Plug>(simplegit-blame-line) <Cmd>SimpleGitBlameLine<CR>
 nnoremap <silent> <Plug>(simplegit-history) <Cmd>SimpleGitHistory<CR>
+nnoremap <silent> <Plug>(simplegit-log) <Cmd>SimpleGitLog<CR>
 nnoremap <silent> <Plug>(simplegit-diff) <Cmd>SimpleGitDiff<CR>
 nnoremap <silent> <Plug>(simplegit-status) <Cmd>SimpleGitStatus<CR>
 nnoremap <silent> <Plug>(simplegit-toggle-line-blame) <Cmd>SimpleGitToggleLineBlame<CR>
@@ -106,6 +108,9 @@ if g:simplegit_enable_default_mappings
   endif
   if maparg('<leader>gh', 'n') ==# ''
     nmap <silent> <leader>gh <Plug>(simplegit-history)
+  endif
+  if maparg('<leader>gl', 'n') ==# ''
+    nmap <silent> <leader>gl <Plug>(simplegit-log)
   endif
   if maparg('<leader>gd', 'n') ==# ''
     nmap <silent> <leader>gd <Plug>(simplegit-diff)

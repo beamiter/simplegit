@@ -92,6 +92,26 @@ if WaitFor(() => OtherWindowName() =~# '^simplegit://history/', 'history window 
 endif
 GotoSrc()
 
+# --- Repository commit graph --------------------------------------------------
+def LogWinBuf(): number
+  for win in getwininfo()
+    if bufname(win.bufnr) ==# 'simplegit://log'
+      return win.bufnr
+    endif
+  endfor
+  return -1
+enddef
+
+simplegit#Log()
+if WaitFor(() => LogWinBuf() != -1, 'log graph window opens')
+  var log_buf = LogWinBuf()
+  Check(get(getbufline(log_buf, 1), 0, '')
+    =~# '^[ |/\\*_.-]*\x\{7,} \d\{4}-\d\{2}-\d\{2} ', 'log graph line format')
+  var log_shas = getbufvar(log_buf, 'simplegit_graph_shas', [])
+  Check(!empty(log_shas), 'log graph shas recorded')
+endif
+GotoSrc()
+
 # --- Repository status -------------------------------------------------------
 simplegit#Status()
 if WaitFor(() => OtherWindowName() ==# 'simplegit://status', 'status window opens')

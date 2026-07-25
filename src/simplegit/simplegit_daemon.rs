@@ -18,7 +18,7 @@ const MAX_CONTENT_BYTES: usize = 2 * 1024 * 1024;
 // Keep enough headroom for the envelope and a maximum-width u64 request ID.
 const MAX_REQUEST_LINE_BYTES: usize = (MAX_REQUEST_PATH_BYTES + MAX_CONTENT_BYTES) * 6 + 1024;
 const MAX_OUTPUT_LINES: usize = 200_000;
-const PROTOCOL_VERSION: u32 = 3;
+const PROTOCOL_VERSION: u32 = 4;
 const GIT_REPOSITORY_ENV_VARS: [&str; 8] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -45,6 +45,16 @@ enum Request {
         path: String,
         #[serde(default)]
         limit: u32,
+    },
+    /// Repository-wide commit graph (`git log --graph`), with paging.
+    #[serde(rename = "graph_log")]
+    GraphLog {
+        id: u64,
+        path: String,
+        #[serde(default)]
+        limit: u32,
+        #[serde(default)]
+        skip: u32,
     },
     /// A commit (message plus patch), optionally restricted to one file.
     #[serde(rename = "show")]
@@ -102,6 +112,18 @@ struct LogEntry {
     subject: String,
 }
 
+/// One rendered `git log --graph` line. Connector-only lines (for example
+/// `|/` or `| *` without a commit) carry an empty `sha` and empty fields.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct GraphRow {
+    graph: String,
+    sha: String,
+    date: String,
+    author: String,
+    refs: String,
+    subject: String,
+}
+
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct Hunk {
     old_start: u32,
@@ -141,6 +163,13 @@ enum Event {
         id: u64,
         path: String,
         entries: Vec<LogEntry>,
+    },
+    #[serde(rename = "graph_log")]
+    GraphLog {
+        id: u64,
+        path: String,
+        skip: u32,
+        rows: Vec<GraphRow>,
     },
     #[serde(rename = "show")]
     Show { id: u64, lines: Vec<String> },
@@ -440,6 +469,83 @@ async fn handle_log(id: u64, path: String, limit: u32, tx: EventTx, _permit: Own
                     id,
                     path,
                     entries: parse_log(&stdout),
+                },
+            )
+            .await;
+        }
+        Err(message) => send_event(&tx, &Event::Error { id, message }).await,
+    }
+}
+
+/// Parse `git log --graph` output where each commit line embeds
+/// `\u{1f}`-separated fields after the graph prefix.
+fn parse_graph_log(stdout: &str) -> Vec<GraphRow> {
+    stdout
+        .lines()
+        .map(|line| {
+            let mut fields = line.split('\u{1f}');
+            let graph = fields.next().unwrap_or("").to_string();
+            match (
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+            ) {
+                (Some(sha), Some(date), Some(author), Some(refs), Some(subject)) => GraphRow {
+                    graph,
+                    sha: sha.to_string(),
+                    date: date.to_string(),
+                    author: author.to_string(),
+                    refs: refs.to_string(),
+                    subject: subject.to_string(),
+                },
+                _ => GraphRow {
+                    graph,
+                    sha: String::new(),
+                    date: String::new(),
+                    author: String::new(),
+                    refs: String::new(),
+                    subject: String::new(),
+                },
+            }
+        })
+        .collect()
+}
+
+async fn handle_graph_log(
+    id: u64,
+    path: String,
+    limit: u32,
+    skip: u32,
+    tx: EventTx,
+    _permit: OwnedSemaphorePermit,
+) {
+    let dir = file_dir(&path);
+    let limit = if limit == 0 { 200 } else { limit.min(10_000) };
+    let count = format!("-n{limit}");
+    let skip_arg = format!("--skip={skip}");
+    let result = run_git(
+        &dir,
+        &[
+            "log",
+            "--graph",
+            "--date=short",
+            &count,
+            &skip_arg,
+            "--pretty=format:\u{1f}%h\u{1f}%ad\u{1f}%an\u{1f}%D\u{1f}%s",
+        ],
+    )
+    .await;
+    match result {
+        Ok(stdout) => {
+            send_event(
+                &tx,
+                &Event::GraphLog {
+                    id,
+                    path,
+                    skip,
+                    rows: parse_graph_log(&stdout),
                 },
             )
             .await;
@@ -997,6 +1103,7 @@ fn request_id_and_path(req: &Request) -> (u64, Option<&str>) {
         Request::Version { id } => (*id, None),
         Request::Blame { id, path } => (*id, Some(path)),
         Request::Log { id, path, .. } => (*id, Some(path)),
+        Request::GraphLog { id, path, .. } => (*id, Some(path)),
         Request::Show { id, path, .. } => (*id, Some(path)),
         Request::Cat { id, path, .. } => (*id, Some(path)),
         Request::Status { id, path } => (*id, Some(path)),
@@ -1079,6 +1186,16 @@ where
                 let tx = out_tx.clone();
                 let permit = git_limiter.clone().acquire_owned().await.unwrap();
                 requests.spawn(handle_log(id, path, limit, tx, permit));
+            }
+            Request::GraphLog {
+                id,
+                path,
+                limit,
+                skip,
+            } => {
+                let tx = out_tx.clone();
+                let permit = git_limiter.clone().acquire_owned().await.unwrap();
+                requests.spawn(handle_graph_log(id, path, limit, skip, tx, permit));
             }
             Request::Show {
                 id,
@@ -1263,7 +1380,7 @@ u UU N... 100644 100644 100644 100644 aaaa bbbb cccc conflict.rs\n\
             .unwrap();
         daemon.await.unwrap().unwrap();
         assert!(response.contains("\"type\":\"version\""));
-        assert!(response.contains("\"protocol\":3"));
+        assert!(response.contains("\"protocol\":4"));
     }
 
     const DIFF_FIXTURE: &str = "\
@@ -1344,5 +1461,40 @@ index aaaa111..bbbb222 100644\n\
         // The staged '+seven' regression: insertion extracted after a net -1
         // earlier hunk must land after old line 6, not before it.
         assert_eq!(lone_hunk_header(6, 0, 6, 1, false), "@@ -6,0 +7,1 @@");
+    }
+
+    #[test]
+    fn parse_graph_log_splits_commit_and_connector_rows() {
+        let sep = '\u{1f}';
+        let stdout = format!(
+            "* {sep}abc1234{sep}2026-07-26{sep}Alice{sep}HEAD -> main, origin/main{sep}Subject one\n\
+             | * {sep}def5678{sep}2026-07-25{sep}Bob{sep}{sep}feature: two\n\
+             |/\n\
+             * {sep}0011223{sep}2026-07-24{sep}Carol{sep}tag: v1.0{sep}three\n"
+        );
+        let rows = parse_graph_log(&stdout);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].graph, "* ");
+        assert_eq!(rows[0].sha, "abc1234");
+        assert_eq!(rows[0].refs, "HEAD -> main, origin/main");
+        assert_eq!(rows[0].subject, "Subject one");
+        assert_eq!(rows[1].graph, "| * ");
+        assert_eq!(rows[1].refs, "");
+        // Connector-only line carries the graph text and nothing else.
+        assert_eq!(rows[2].graph, "|/");
+        assert_eq!(rows[2].sha, "");
+        assert_eq!(rows[3].date, "2026-07-24");
+        assert_eq!(rows[3].refs, "tag: v1.0");
+    }
+
+    #[test]
+    fn parse_graph_log_ignores_malformed_field_counts() {
+        // Fewer than five fields after the graph prefix must degrade to a
+        // connector row instead of misaligning columns.
+        let stdout = "* \u{1f}abc1234\u{1f}2026-07-26\n";
+        let rows = parse_graph_log(stdout);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sha, "");
+        assert_eq!(rows[0].graph, "* ");
     }
 }

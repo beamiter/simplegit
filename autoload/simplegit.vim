@@ -326,6 +326,8 @@ def OnDaemonLine(line: string)
     OnBlame(ctx, ev)
   elseif ev.type ==# 'log'
     OnLog(ctx, ev)
+  elseif ev.type ==# 'graph_log'
+    OnGraphLog(ctx, ev)
   elseif ev.type ==# 'show'
     OnShow(ctx, ev)
   elseif ev.type ==# 'cat'
@@ -349,7 +351,7 @@ def OnVersion(ev: dict<any>)
         \ && version !=# '' && type(protocol) == v:t_number
     s_daemon_version = version
     s_daemon_protocol = protocol
-    if protocol != 3
+    if protocol != 4
       s_daemon_ready = false
       s_daemon_incompatible = true
       s_wait_queue = []
@@ -955,6 +957,134 @@ export def History()
   var limit = ConfNum('simplegit_history_limit', 200)
   if !Dispatch({type: 'log', path: path, limit: limit},
       {kind: 'log', interactive: true, path: path})
+    Warn('daemon unavailable; run ./install.sh')
+  endif
+enddef
+
+# =============================================================
+# Repository-wide commit graph
+# =============================================================
+def ValidGraphRow(row: any): bool
+  return type(row) == v:t_dict
+        \ && type(get(row, 'graph', v:null)) == v:t_string
+        \ && type(get(row, 'sha', v:null)) == v:t_string
+        \ && type(get(row, 'date', v:null)) == v:t_string
+        \ && type(get(row, 'author', v:null)) == v:t_string
+        \ && type(get(row, 'refs', v:null)) == v:t_string
+        \ && type(get(row, 'subject', v:null)) == v:t_string
+enddef
+
+def GraphRowDisplay(row: dict<any>): string
+  if row.sha ==# ''
+    return row.graph
+  endif
+  var refs = row.refs ==# '' ? '' : '(' .. row.refs .. ') '
+  return printf('%s%s %s %-14.14s %s%s',
+    row.graph, row.sha, row.date, row.author, refs, row.subject)
+enddef
+
+def OnGraphLog(ctx: dict<any>, ev: dict<any>)
+  var rows = get(ev, 'rows', v:null)
+  if type(rows) != v:t_list
+    DebugLog('ignored malformed graph_log response')
+    return
+  endif
+  var path = get(ctx, 'path', '')
+  var append_mode = get(ctx, 'append', false)
+  var display: list<string> = []
+  var shas: list<string> = []
+  for row in rows
+    if !ValidGraphRow(row)
+      continue
+    endif
+    shas->add(row.sha)
+    display->add(GraphRowDisplay(row))
+  endfor
+  if empty(display) && !append_mode
+    Warn('no commits found')
+    return
+  endif
+
+  if append_mode
+    var buf = get(ctx, 'bufnr', -1)
+    var win = bufwinid(buf)
+    if win == -1
+      return
+    endif
+    if empty(display)
+      Warn('no more commits')
+      return
+    endif
+    win_gotoid(win)
+    setlocal modifiable
+    append(line('$'), display)
+    setlocal nomodifiable
+    b:simplegit_graph_shas = get(b:, 'simplegit_graph_shas', [])->extend(shas)
+    b:simplegit_graph_skip = get(b:, 'simplegit_graph_skip', 0)
+      + len(filter(copy(shas), (_, sha) => sha !=# ''))
+    return
+  endif
+
+  var height = min([max([len(display), 5]), ConfNum('simplegit_log_height', 20)])
+  OpenScratch('simplegit://log', height)
+  setline(1, display)
+  setlocal nomodifiable nowrap
+  b:simplegit_graph_shas = shas
+  b:simplegit_graph_skip = len(filter(copy(shas), (_, sha) => sha !=# ''))
+  b:simplegit_src_path = path
+
+  syntax match SimpleGitLogGraph /^[ |\/\\*_.-]*/
+  syntax match SimpleGitLogSha /^[ |\/\\*_.-]*\zs\x\{7,}\ze /
+  syntax match SimpleGitBlameDate /\d\{4}-\d\{2}-\d\{2}/
+  syntax match SimpleGitLogRefs /([^)]\+)/
+  highlight default link SimpleGitLogGraph Comment
+  highlight default link SimpleGitLogSha Identifier
+  highlight default link SimpleGitLogRefs Special
+
+  nnoremap <silent><buffer> <CR> <ScriptCmd>GraphLogShow()<CR>
+  nnoremap <silent><buffer> m <ScriptCmd>GraphLogMore()<CR>
+  execute ':1'
+enddef
+
+def GraphLogShow()
+  var shas = get(b:, 'simplegit_graph_shas', [])
+  var path = get(b:, 'simplegit_src_path', '')
+  var lnum = line('.')
+  if lnum > len(shas) || path ==# ''
+    return
+  endif
+  var sha = shas[lnum - 1]
+  if sha ==# ''
+    return
+  endif
+  if !Dispatch({type: 'show', path: path, rev: sha},
+      {kind: 'show', interactive: true, title: 'commit ' .. sha})
+    Warn('daemon unavailable')
+  endif
+enddef
+
+def GraphLogMore()
+  var path = get(b:, 'simplegit_src_path', '')
+  if path ==# ''
+    return
+  endif
+  var limit = ConfNum('simplegit_log_limit', 200)
+  var skip = get(b:, 'simplegit_graph_skip', 0)
+  if !Dispatch({type: 'graph_log', path: path, limit: limit, skip: skip},
+      {kind: 'graph_log', interactive: true, path: path,
+       append: true, bufnr: bufnr('%')})
+    Warn('daemon unavailable')
+  endif
+enddef
+
+export def Log()
+  var path = BufFilePath(bufnr('%'))
+  if path ==# ''
+    path = getcwd()
+  endif
+  var limit = ConfNum('simplegit_log_limit', 200)
+  if !Dispatch({type: 'graph_log', path: path, limit: limit, skip: 0},
+      {kind: 'graph_log', interactive: true, path: path})
     Warn('daemon unavailable; run ./install.sh')
   endif
 enddef

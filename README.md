@@ -9,6 +9,7 @@ Like the other `simple*` plugins, rendering stays in Vim9script and all git work
 - **Inline line blame** (GitLens style): `author, 3 days ago • commit summary` appears as virtual text after the current line, debounced and only when the buffer is unmodified.
 - **Blame sidebar** (`:SimpleGitBlame`): per-line commit/date/author, scroll-synced with the file; `<CR>` opens the commit, `p` pops up its details, `q` closes.
 - **File history** (`:SimpleGitHistory`): `git log --follow` for the current file; `<CR>` shows the commit's changes to this file, `a` the whole commit.
+- **Commit graph** (`:SimpleGitLog`): repository-wide `git log --graph` with branch topology, refs and dates; `<CR>` shows the commit under the cursor, `m` loads more commits.
 - **Diff against a revision** (`:SimpleGitDiff [rev]`): vertical `diffthis` split of the working file against HEAD or any revision.
 - **Commit inspection** (`:SimpleGitShow [rev]`): message, stats and patch with `git` syntax highlighting.
 - **Repository status** (`:SimpleGitStatus`): branch plus changed files; `<CR>` opens a file, `d` opens and diffs it, `a`/`u` stage/unstage it, `R` refreshes.
@@ -47,6 +48,7 @@ The installer performs a locked release build, atomically installs `lib/simplegi
 | `:SimpleGitBlame` | Toggle the blame sidebar |
 | `:SimpleGitBlameLine` | Popup blame for the current line |
 | `:SimpleGitHistory` | File history window |
+| `:SimpleGitLog` | Repository commit graph |
 | `:SimpleGitDiff [rev]` | Diff file against `rev` (default `HEAD`) |
 | `:SimpleGitShow [rev]` | Show a commit |
 | `:SimpleGitStatus` | Repository status window |
@@ -80,6 +82,7 @@ let g:simplegit_line_blame = 1         " inline current-line annotation
 let g:simplegit_blame_delay = 350      " ms of cursor rest before it appears
 let g:simplegit_blame_width = 34       " sidebar width
 let g:simplegit_history_limit = 200    " max commits in :SimpleGitHistory
+let g:simplegit_log_limit = 200        " commits per :SimpleGitLog page
 let g:simplegit_signs = 1              " sign-column hunk markers
 let g:simplegit_max_signs = 500        " place no signs above this count
 let g:simplegit_hunk_delay = 300       " live-diff debounce while typing (ms)
