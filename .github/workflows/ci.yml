@@ -33,3 +33,6 @@ jobs:
           response="$(printf '%s\n' '{"type":"version","id":1}' | ./lib/simplegit-daemon)"
           grep -F '"type":"version"' <<<"$response"
           grep -F '"protocol":1' <<<"$response"
+
+      - name: Run Vim integration test against the built daemon
+        run: make vim-integration

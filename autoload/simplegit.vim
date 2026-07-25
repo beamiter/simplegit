@@ -644,7 +644,8 @@ def OpenBlameWindow(bufnr: number)
   setwinvar(src_win, '&cursorbind', 1)
 
   var width = ConfNum('simplegit_blame_width', 34)
-  execute 'silent keepalt vertical topleft ' .. width .. 'new'
+  silent keepalt vertical topleft new
+  execute 'vertical resize ' .. width
   silent execute 'file ' .. fnameescape('simplegit://blame/' .. fnamemodify(bufname(bufnr), ':t'))
   setlocal buftype=nofile bufhidden=wipe noswapfile nobuflisted
   setlocal nonumber norelativenumber nowrap nofoldenable foldcolumn=0 signcolumn=no
@@ -658,7 +659,7 @@ def OpenBlameWindow(bufnr: number)
 
   syntax match SimpleGitBlameSha /^\x\{7}/
   syntax match SimpleGitBlameDate /\d\{4}-\d\{2}-\d\{2}/
-  syntax match SimpleGitBlameUncommitted /^0\{7} ~ uncommitted.*/
+  syntax match SimpleGitBlameUncommitted /^0\{7} \~ uncommitted.*/
 
   nnoremap <silent><buffer> <CR> <ScriptCmd>BlameWindowShow()<CR>
   nnoremap <silent><buffer> p <ScriptCmd>BlameWindowPopup()<CR>
@@ -770,7 +771,10 @@ enddef
 # Scratch windows (show / history / status)
 # =============================================================
 def OpenScratch(name: string, height: number): number
-  execute 'silent keepalt botright ' .. (height > 0 ? height .. 'new' : 'new')
+  silent keepalt botright new
+  if height > 0
+    execute 'resize ' .. height
+  endif
   silent execute 'file ' .. fnameescape(name)
   setlocal buftype=nofile bufhidden=wipe noswapfile nobuflisted
   setlocal nonumber norelativenumber nofoldenable foldcolumn=0 signcolumn=no

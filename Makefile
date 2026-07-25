@@ -1,6 +1,6 @@
-.PHONY: check fmt clippy test vim-test
+.PHONY: check fmt clippy test vim-test vim-integration
 
-check: fmt clippy test vim-test
+check: fmt clippy test vim-test vim-integration
 
 fmt:
 	cargo fmt --all -- --check
@@ -13,3 +13,7 @@ test:
 
 vim-test:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_smoke.vim
+
+# Drives the real daemon; skips cleanly when lib/simplegit-daemon is absent.
+vim-integration:
+	vim -Nu NONE -n -i NONE -es -S tests/vim_integration.vim
