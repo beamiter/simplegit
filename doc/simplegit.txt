@@ -1,0 +1,148 @@
+*simplegit.txt* *simplegit*  Git superpowers for Vim 9 (blame, history, diff)
+
+===============================================================================
+CONTENTS                                                      *simplegit-contents*
+
+  1. Introduction ............... |simplegit-introduction|
+  2. Installation ............... |simplegit-installation|
+  3. Commands ................... |simplegit-commands|
+  4. Mappings ................... |simplegit-mappings|
+  5. Configuration .............. |simplegit-configuration|
+  6. Highlights ................. |simplegit-highlights|
+  7. Troubleshooting ............ |simplegit-troubleshooting|
+
+===============================================================================
+INTRODUCTION                                              *simplegit-introduction*
+
+Simplegit brings GitLens-style Git insight to Vim 9: an inline current-line
+blame annotation, a whole-file blame sidebar, file history, diff against any
+revision, commit inspection, and a repository status window.
+
+Rendering stays in Vim9script; every git invocation runs inside a small
+asynchronous Rust daemon over a JSON line protocol, so editing never waits on
+git. The core UI requires Vim 9.1 with +vim9script, +job and +channel. The
+inline annotation additionally needs the +textprop feature (virtual text,
+patch 9.0.0067 or later); popups need +popupwin; debouncing needs +timers.
+Neovim is not supported.
+
+===============================================================================
+INSTALLATION                                              *simplegit-installation*
+
+With vim-plug: >
+  Plug 'beamiter/simplegit', {'do': './install.sh'}
+<
+Or clone the plugin and run: >
+  ./install.sh
+<
+The installer performs a locked release build of the daemon, atomically
+installs `lib/simplegit-daemon`, and generates help tags. Building requires
+Rust/Cargo 1.78 or newer. Rerun it after every update.
+
+===============================================================================
+COMMANDS                                                      *simplegit-commands*
+
+:SimpleGitBlame                                                *:SimpleGitBlame*
+  Toggle a blame sidebar for the current file. The sidebar scrolls in sync
+  with the file. Inside it: <CR> opens the commit under the cursor, `p` shows
+  a popup with its details, `q` closes the sidebar.
+
+:SimpleGitBlameLine                                        *:SimpleGitBlameLine*
+  Show a popup with commit, author, date and summary for the current line.
+
+:SimpleGitToggleLineBlame                            *:SimpleGitToggleLineBlame*
+  Toggle the inline current-line blame annotation.
+
+:SimpleGitHistory                                            *:SimpleGitHistory*
+  Open the commit history of the current file. Inside the window: <CR> shows
+  the commit's changes to this file, `a` shows the whole commit, `q` closes.
+
+:SimpleGitDiff [rev]                                            *:SimpleGitDiff*
+  Diff the current file against [rev] (default HEAD) in a vertical split.
+  `q` in the revision buffer closes the diff.
+
+:SimpleGitShow [rev]                                            *:SimpleGitShow*
+  Show a commit (message, stats and patch). [rev] defaults to HEAD.
+
+:SimpleGitStatus                                              *:SimpleGitStatus*
+  Show the repository branch and changed files. Inside the window: <CR>
+  opens the file, `d` opens it and diffs it against HEAD, `q` closes.
+
+:SimpleGitEnable  :SimpleGitDisable  :SimpleGitToggle          *:SimpleGitEnable*
+  Control the whole plugin (daemon plus inline annotation).
+
+:SimpleGitHealth                                              *:SimpleGitHealth*
+  Print daemon path/version/protocol and feature support diagnostics.
+
+===============================================================================
+MAPPINGS                                                      *simplegit-mappings*
+
+<Plug> mappings (always defined): >
+  <Plug>(simplegit-blame)              :SimpleGitBlame
+  <Plug>(simplegit-blame-line)         :SimpleGitBlameLine
+  <Plug>(simplegit-history)            :SimpleGitHistory
+  <Plug>(simplegit-diff)               :SimpleGitDiff
+  <Plug>(simplegit-status)             :SimpleGitStatus
+  <Plug>(simplegit-toggle-line-blame)  :SimpleGitToggleLineBlame
+<
+Default mappings (only when the key is unmapped, disable with
+g:simplegit_enable_default_mappings = 0): >
+  <leader>gb   blame sidebar        <leader>gm   line blame popup
+  <leader>gh   file history         <leader>gd   diff against HEAD
+  <leader>gs   repository status
+<
+===============================================================================
+CONFIGURATION                                            *simplegit-configuration*
+
+g:simplegit_auto_enable (default 1)                     *g:simplegit_auto_enable*
+  Start the plugin on VimEnter.
+
+g:simplegit_line_blame (default 1)                       *g:simplegit_line_blame*
+  Show the inline current-line blame annotation.
+
+g:simplegit_blame_delay (default 350)                   *g:simplegit_blame_delay*
+  Milliseconds after the cursor stops before the annotation appears.
+
+g:simplegit_blame_width (default 34)                    *g:simplegit_blame_width*
+  Width of the :SimpleGitBlame sidebar.
+
+g:simplegit_history_limit (default 200)               *g:simplegit_history_limit*
+  Maximum commits fetched by :SimpleGitHistory.
+
+g:simplegit_history_height (default 15)              *g:simplegit_history_height*
+  Maximum height of the history window.
+
+g:simplegit_daemon_path (default '')                    *g:simplegit_daemon_path*
+  Absolute path of the daemon binary; overrides runtimepath discovery.
+
+g:simplegit_enable_default_mappings (default 1)
+                                            *g:simplegit_enable_default_mappings*
+  Install the <leader>g* default mappings.
+
+g:simplegit_debug (default 0)                                 *g:simplegit_debug*
+  Echo daemon/protocol diagnostics with :echomsg.
+
+===============================================================================
+HIGHLIGHTS                                                  *simplegit-highlights*
+
+  SimpleGitBlameVirtual      inline annotation text (links to NonText)
+  SimpleGitBlameSha          commit hashes in sidebar/history (Identifier)
+  SimpleGitBlameDate         dates in sidebar/history (Comment)
+  SimpleGitBlameUncommitted  uncommitted lines in the sidebar (Comment)
+  SimpleGitStatusBranch      branch header in the status window (Title)
+  SimpleGitStatusUntracked   untracked entries (Comment)
+  SimpleGitStatusConflict    conflicted entries (Error)
+
+===============================================================================
+TROUBLESHOOTING                                        *simplegit-troubleshooting*
+
+Run |:SimpleGitHealth|. "daemon binary: (not found)" means ./install.sh has
+not produced lib/simplegit-daemon (or set |g:simplegit_daemon_path|). A
+version of "unknown/0" that persists means the binary is outdated — rerun
+./install.sh. Inline annotations require Vim with virtual-text support
+(patch 9.0.0067+); the blame sidebar and popups work without it.
+
+The inline annotation intentionally disappears while the buffer is modified:
+blame data reflects the file on disk, and edited line numbers would no longer
+match. Save the buffer to refresh it.
+
+vim:tw=79:ts=8:noet:ft=help:norl:

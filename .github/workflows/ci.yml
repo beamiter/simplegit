@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Vim
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes vim
+
+      - name: Select stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Run quality gate
+        run: make check
+
+      - name: Verify installer and daemon handshake
+        run: |
+          ./install.sh
+          response="$(printf '%s\n' '{"type":"version","id":1}' | ./lib/simplegit-daemon)"
+          grep -F '"type":"version"' <<<"$response"
+          grep -F '"protocol":1' <<<"$response"
