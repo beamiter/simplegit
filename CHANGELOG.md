@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0 (2026-07-25)
+
+Toolchain modernization release.
+
+- Migrated to Rust edition 2024; minimum supported Rust is now 1.85.
+- Refreshed the dependency lockfile.
+- No behavior or protocol changes (protocol stays at 3). Rerun `./install.sh`.
+
 ## 0.3.0 (2026-07-25)
 
 Live diffs, status-window staging, and robustness (protocol 3).

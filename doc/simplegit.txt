@@ -37,7 +37,7 @@ Or clone the plugin and run: >
 <
 The installer performs a locked release build of the daemon, atomically
 installs `lib/simplegit-daemon`, and generates help tags. Building requires
-Rust/Cargo 1.78 or newer. Rerun it after every update.
+Rust/Cargo 1.85 or newer. Rerun it after every update.
 
 ===============================================================================
 COMMANDS                                                      *simplegit-commands*

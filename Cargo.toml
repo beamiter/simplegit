@@ -1,8 +1,8 @@
 [package]
 name = "simplegit"
-version = "0.3.0"
-edition = "2021"
-rust-version = "1.78"
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.85"
 description = "Asynchronous Git daemon powering the simplegit Vim plugin (blame, history, diff, status)"
 repository = "https://github.com/beamiter/simplegit"
 readme = "README.md"
