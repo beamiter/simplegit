@@ -12,11 +12,13 @@ use tokio::task::{JoinError, JoinSet};
 const GIT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CONCURRENT_GIT_REQUESTS: usize = 4;
 const MAX_REQUEST_PATH_BYTES: usize = 4096;
-// A valid path may expand sixfold when JSON escapes ASCII control bytes. Keep
-// enough headroom for the request envelope and a maximum-width u64 request ID.
-const MAX_REQUEST_LINE_BYTES: usize = MAX_REQUEST_PATH_BYTES * 6 + 1024;
+// Live hunk requests carry whole buffer contents.
+const MAX_CONTENT_BYTES: usize = 2 * 1024 * 1024;
+// A valid request may expand sixfold when JSON escapes ASCII control bytes.
+// Keep enough headroom for the envelope and a maximum-width u64 request ID.
+const MAX_REQUEST_LINE_BYTES: usize = (MAX_REQUEST_PATH_BYTES + MAX_CONTENT_BYTES) * 6 + 1024;
 const MAX_OUTPUT_LINES: usize = 200_000;
-const PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = 3;
 const GIT_REPOSITORY_ENV_VARS: [&str; 8] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -59,15 +61,30 @@ enum Request {
     /// Branch plus changed-file list for the repository containing `path`.
     #[serde(rename = "status")]
     Status { id: u64, path: String },
-    /// Working-tree-vs-index hunks for one file (`git diff -U0`).
+    /// Working-tree-vs-index hunks for one file (`git diff -U0`). With
+    /// `content` the buffer text is diffed against the index instead of the
+    /// file on disk, so signs can track unsaved edits.
     #[serde(rename = "hunks")]
-    Hunks { id: u64, path: String },
+    Hunks {
+        id: u64,
+        path: String,
+        #[serde(default)]
+        content: Option<String>,
+    },
     /// Stage the hunk covering line `lnum` (`git apply --cached`).
     #[serde(rename = "stage")]
     Stage { id: u64, path: String, lnum: u32 },
     /// Revert the hunk covering line `lnum` in the working tree.
     #[serde(rename = "undo")]
     Undo { id: u64, path: String, lnum: u32 },
+    /// Stage or unstage a whole file: op is "add" or "reset".
+    #[serde(rename = "file_op")]
+    FileOp {
+        id: u64,
+        path: String,
+        op: String,
+        file: String,
+    },
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
@@ -148,6 +165,8 @@ enum Event {
         action: &'static str,
         path: String,
     },
+    #[serde(rename = "file_op")]
+    FileOp { id: u64, op: String, path: String },
     #[serde(rename = "error")]
     Error { id: u64, message: String },
 }
@@ -208,7 +227,7 @@ fn git_command(dir: &Path, args: &[&str]) -> tokio::process::Command {
     command
 }
 
-async fn run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
+async fn run_git_coded(dir: &Path, args: &[&str], ok_codes: &[i32]) -> Result<String, String> {
     let output = tokio::time::timeout(GIT_TIMEOUT, git_command(dir, args).output())
         .await
         .map_err(|_| {
@@ -220,12 +239,21 @@ async fn run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
         })?
         .map_err(|error| format!("failed to run git: {error}"))?;
 
-    if !output.status.success() {
+    let accepted = output.status.success()
+        || output
+            .status
+            .code()
+            .is_some_and(|code| ok_codes.contains(&code));
+    if !accepted {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let first = stderr.lines().next().unwrap_or("git command failed");
         return Err(first.to_string());
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+async fn run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    run_git_coded(dir, args, &[]).await
 }
 
 async fn run_git_with_input(dir: &Path, args: &[&str], input: String) -> Result<String, String> {
@@ -730,15 +758,68 @@ fn extract_hunk_patch(stdout: &str, lnum: u32, revert: bool) -> Option<String> {
     Some(patch)
 }
 
-async fn handle_hunks(id: u64, path: String, tx: EventTx, _permit: OwnedSemaphorePermit) {
-    let dir = file_dir(&path);
-    let result = async {
-        let name = file_name(&path)?;
-        let mut args: Vec<&str> = DIFF_ARGS.to_vec();
-        args.extend(["--", name.as_str()]);
-        run_git(&dir, &args).await
+async fn disk_hunk_diff(path: &str) -> Result<String, String> {
+    let dir = file_dir(path);
+    let name = file_name(path)?;
+    let mut args: Vec<&str> = DIFF_ARGS.to_vec();
+    args.extend(["--", name.as_str()]);
+    run_git(&dir, &args).await
+}
+
+/// Diff unsaved buffer contents against the index: materialize both sides as
+/// temp files and let `git diff --no-index` produce the hunks. Exit code 1
+/// just means the files differ.
+async fn buffer_hunk_diff(id: u64, path: &str, content: &str) -> Result<String, String> {
+    if content.len() > MAX_CONTENT_BYTES {
+        return Err("buffer too large for a live diff".to_string());
+    }
+    let dir = file_dir(path);
+    let name = file_name(path)?;
+    let prefix = run_git(&dir, &["rev-parse", "--show-prefix"]).await?;
+    let spec = format!(":{}{}", prefix.trim_end_matches('\n'), name);
+    let index_text = run_git(&dir, &["show", &spec]).await?;
+
+    let stem = std::env::temp_dir().join(format!("simplegit-{}-{id}", std::process::id()));
+    let index_file = stem.with_extension("index");
+    let buffer_file = stem.with_extension("buffer");
+    let write = async {
+        tokio::fs::write(&index_file, &index_text)
+            .await
+            .map_err(|error| format!("failed to write temp file: {error}"))?;
+        tokio::fs::write(&buffer_file, content)
+            .await
+            .map_err(|error| format!("failed to write temp file: {error}"))
     }
     .await;
+    let diff = match write {
+        Ok(()) => {
+            let mut args: Vec<&str> = DIFF_ARGS.to_vec();
+            args.push("--no-index");
+            args.push("--");
+            let index_arg = index_file.to_string_lossy().into_owned();
+            let buffer_arg = buffer_file.to_string_lossy().into_owned();
+            args.push(&index_arg);
+            args.push(&buffer_arg);
+            run_git_coded(&dir, &args, &[1]).await
+        }
+        Err(message) => Err(message),
+    };
+    let _ = tokio::fs::remove_file(&index_file).await;
+    let _ = tokio::fs::remove_file(&buffer_file).await;
+    diff
+}
+
+async fn handle_hunks(
+    id: u64,
+    path: String,
+    content: Option<String>,
+    tx: EventTx,
+    _permit: OwnedSemaphorePermit,
+) {
+    let result = match content {
+        Some(text) => buffer_hunk_diff(id, &path, &text).await,
+        None => disk_hunk_diff(&path).await,
+    };
     match result {
         Ok(stdout) => {
             send_event(
@@ -751,6 +832,30 @@ async fn handle_hunks(id: u64, path: String, tx: EventTx, _permit: OwnedSemaphor
             )
             .await;
         }
+        Err(message) => send_event(&tx, &Event::Error { id, message }).await,
+    }
+}
+
+async fn handle_file_op(
+    id: u64,
+    path: String,
+    op: String,
+    file: String,
+    tx: EventTx,
+    _permit: OwnedSemaphorePermit,
+) {
+    let dir = file_dir(&path);
+    let result = async {
+        let args: Vec<&str> = match op.as_str() {
+            "add" => vec!["add", "--", file.as_str()],
+            "reset" => vec!["reset", "-q", "--", file.as_str()],
+            _ => return Err(format!("unsupported file operation: {op}")),
+        };
+        run_git(&dir, &args).await
+    }
+    .await;
+    match result {
+        Ok(_) => send_event(&tx, &Event::FileOp { id, op, path }).await,
         Err(message) => send_event(&tx, &Event::Error { id, message }).await,
     }
 }
@@ -895,9 +1000,10 @@ fn request_id_and_path(req: &Request) -> (u64, Option<&str>) {
         Request::Show { id, path, .. } => (*id, Some(path)),
         Request::Cat { id, path, .. } => (*id, Some(path)),
         Request::Status { id, path } => (*id, Some(path)),
-        Request::Hunks { id, path } => (*id, Some(path)),
+        Request::Hunks { id, path, .. } => (*id, Some(path)),
         Request::Stage { id, path, .. } => (*id, Some(path)),
         Request::Undo { id, path, .. } => (*id, Some(path)),
+        Request::FileOp { id, path, .. } => (*id, Some(path)),
     }
 }
 
@@ -994,10 +1100,10 @@ where
                 let permit = git_limiter.clone().acquire_owned().await.unwrap();
                 requests.spawn(handle_status(id, path, tx, permit));
             }
-            Request::Hunks { id, path } => {
+            Request::Hunks { id, path, content } => {
                 let tx = out_tx.clone();
                 let permit = git_limiter.clone().acquire_owned().await.unwrap();
-                requests.spawn(handle_hunks(id, path, tx, permit));
+                requests.spawn(handle_hunks(id, path, content, tx, permit));
             }
             Request::Stage { id, path, lnum } => {
                 let tx = out_tx.clone();
@@ -1008,6 +1114,15 @@ where
                 let tx = out_tx.clone();
                 let permit = git_limiter.clone().acquire_owned().await.unwrap();
                 requests.spawn(handle_hunk_op(id, path, lnum, true, tx, permit));
+            }
+            Request::FileOp { id, path, op, file } => {
+                if let Err(message) = validate_request_path(&file) {
+                    send_event(&out_tx, &Event::Error { id, message }).await;
+                    continue;
+                }
+                let tx = out_tx.clone();
+                let permit = git_limiter.clone().acquire_owned().await.unwrap();
+                requests.spawn(handle_file_op(id, path, op, file, tx, permit));
             }
         }
     }
@@ -1148,7 +1263,7 @@ u UU N... 100644 100644 100644 100644 aaaa bbbb cccc conflict.rs\n\
             .unwrap();
         daemon.await.unwrap().unwrap();
         assert!(response.contains("\"type\":\"version\""));
-        assert!(response.contains("\"protocol\":2"));
+        assert!(response.contains("\"protocol\":3"));
     }
 
     const DIFF_FIXTURE: &str = "\

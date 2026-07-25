@@ -4,7 +4,7 @@ if exists('g:loaded_simplegit')
   finish
 endif
 g:loaded_simplegit = 1
-g:simplegit_version = '0.2.0'
+g:simplegit_version = '0.3.0'
 
 def ConfigFlag(name: string, default_value: number): number
   var value = get(g:, name, default_value)
@@ -40,6 +40,10 @@ g:simplegit_sign_removed = get(g:, 'simplegit_sign_removed', '_')
 g:simplegit_sign_priority = get(g:, 'simplegit_sign_priority', 10)
 # Above this many signs in one buffer none are placed.
 g:simplegit_max_signs = get(g:, 'simplegit_max_signs', 500)
+# Debounce (ms) for the live buffer-vs-index diff while typing.
+g:simplegit_hunk_delay = get(g:, 'simplegit_hunk_delay', 300)
+# Buffers above this size fall back to the on-disk diff.
+g:simplegit_live_max_bytes = get(g:, 'simplegit_live_max_bytes', 1024 * 1024)
 g:simplegit_enable_default_mappings = ConfigFlag('simplegit_enable_default_mappings', 1)
 
 # =============================================================
@@ -138,6 +142,7 @@ augroup SimpleGit
   autocmd InsertLeave * simplegit#ScheduleLineBlame()
   autocmd BufWritePost * simplegit#OnBufWrite()
   autocmd BufReadPost,BufEnter * simplegit#RefreshHunks()
+  autocmd TextChanged,TextChangedI,TextChangedP * simplegit#ScheduleHunks()
   autocmd FocusGained,ShellCmdPost * simplegit#OnExternalChange()
   autocmd BufDelete * simplegit#OnBufClose(expand('<abuf>')->str2nr())
   autocmd VimLeavePre * try | simplegit#Stop() | catch | endtry

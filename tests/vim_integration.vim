@@ -186,6 +186,39 @@ if WaitFor(() => len(PlacedSigns()) > 0, 'hunk signs placed')
   simplegit#HunkUndo()
   WaitFor(() => getline(2) ==# 'two', 'hunk undo reverts buffer line')
   Check(readfile(sample)[1] ==# 'two', 'hunk undo reverts file on disk')
+
+  # Live diff: signs must track unsaved buffer edits.
+  setline(1, 'one live')
+  simplegit#ScheduleHunks()
+  WaitFor(() => SignAt(1) ==# 'SimpleGitChange', 'live diff marks unsaved edit')
+  silent edit!
+
+  # Status window: stage and unstage whole files in place.
+  simplegit#Status()
+  if WaitFor(() => OtherWindowName() ==# 'simplegit://status', 'status window opens')
+    for win in getwininfo()
+      if bufname(win.bufnr) ==# 'simplegit://status'
+        win_gotoid(win.winid)
+      endif
+    endfor
+    search('sample\.txt')
+    execute 'normal a'
+    WaitFor(() => Git(sandbox, 'diff') ==# '', 'status a stages the file')
+    search('sample\.txt')
+    execute 'normal u'
+    WaitFor(() => Git(sandbox, 'diff --cached') ==# '', 'status u unstages the file')
+    # A second :SimpleGitStatus reuses the window instead of stacking splits.
+    simplegit#Status()
+    sleep 200m
+    var status_wins = 0
+    for win in getwininfo()
+      if bufname(win.bufnr) ==# 'simplegit://status'
+        status_wins += 1
+      endif
+    endfor
+    Check(status_wins == 1, 'status window is reused (' .. status_wins .. ')')
+    close
+  endif
 endif
 
 bwipeout!

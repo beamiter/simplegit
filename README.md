@@ -11,9 +11,9 @@ Like the other `simple*` plugins, rendering stays in Vim9script and all git work
 - **File history** (`:SimpleGitHistory`): `git log --follow` for the current file; `<CR>` shows the commit's changes to this file, `a` the whole commit.
 - **Diff against a revision** (`:SimpleGitDiff [rev]`): vertical `diffthis` split of the working file against HEAD or any revision.
 - **Commit inspection** (`:SimpleGitShow [rev]`): message, stats and patch with `git` syntax highlighting.
-- **Repository status** (`:SimpleGitStatus`): branch plus changed files; `<CR>` opens a file, `d` opens and diffs it.
+- **Repository status** (`:SimpleGitStatus`): branch plus changed files; `<CR>` opens a file, `d` opens and diffs it, `a`/`u` stage/unstage it, `R` refreshes.
 - **Line blame popup** (`:SimpleGitBlameLine`): commit, author, date, and summary for the line under the cursor.
-- **Hunk handling** (GitGutter style): `+`/`~`/`_` signs for working-tree changes against the index, hunk navigation (`:SimpleGitHunkNext`/`Prev`), a diff preview popup, and per-hunk stage (`:SimpleGitHunkStage`) and undo (`:SimpleGitHunkUndo`).
+- **Hunk handling** (GitGutter style): `+`/`~`/`_` signs for changes against the index — updated live while you type, without saving — plus hunk navigation (`:SimpleGitHunkNext`/`Prev`), a diff preview popup, and per-hunk stage (`:SimpleGitHunkStage`) and undo (`:SimpleGitHunkUndo`).
 - Asynchronous daemon with a version handshake, request correlation, concurrency limiting and timeouts; `:SimpleGitHealth` diagnostics.
 
 ## Requirements
@@ -82,6 +82,8 @@ let g:simplegit_blame_width = 34       " sidebar width
 let g:simplegit_history_limit = 200    " max commits in :SimpleGitHistory
 let g:simplegit_signs = 1              " sign-column hunk markers
 let g:simplegit_max_signs = 500        " place no signs above this count
+let g:simplegit_hunk_delay = 300       " live-diff debounce while typing (ms)
+let g:simplegit_live_max_bytes = 1048576 " live-diff buffer size cap
 let g:simplegit_daemon_path = ''       " explicit daemon binary path
 ```
 

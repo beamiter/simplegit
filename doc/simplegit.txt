@@ -66,11 +66,14 @@ COMMANDS                                                      *simplegit-command
 
 :SimpleGitStatus                                              *:SimpleGitStatus*
   Show the repository branch and changed files. Inside the window: <CR>
-  opens the file, `d` opens it and diffs it against HEAD, `q` closes.
+  opens the file, `d` opens it and diffs it against HEAD, `a` stages it,
+  `u` unstages it, `R` refreshes the list, `q` closes.
 
 :SimpleGitHunkNext                                          *:SimpleGitHunkNext*
 :SimpleGitHunkPrev                                          *:SimpleGitHunkPrev*
   Jump to the next/previous hunk (working tree vs index) in the current file.
+  While the buffer is modified, hunks track the unsaved buffer contents,
+  debounced by |g:simplegit_hunk_delay|.
 
 :SimpleGitHunkPreview                                    *:SimpleGitHunkPreview*
   Show the diff of the hunk under the cursor in a popup.
@@ -150,6 +153,12 @@ g:simplegit_sign_priority (default 10)                *g:simplegit_sign_priority
 
 g:simplegit_max_signs (default 500)                       *g:simplegit_max_signs*
   Above this many signs in one buffer none are placed.
+
+g:simplegit_hunk_delay (default 300)                     *g:simplegit_hunk_delay*
+  Milliseconds of typing rest before the live buffer-vs-index diff runs.
+
+g:simplegit_live_max_bytes (default 1048576)         *g:simplegit_live_max_bytes*
+  Buffers larger than this fall back to the on-disk diff until saved.
 
 g:simplegit_daemon_path (default '')                    *g:simplegit_daemon_path*
   Absolute path of the daemon binary; overrides runtimepath discovery.

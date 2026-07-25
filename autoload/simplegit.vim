@@ -17,6 +17,10 @@ var s_daemon_version: string = ''
 var s_daemon_protocol: number = 0
 var s_daemon_ready: bool = false
 var s_daemon_incompatible: bool = false
+# Consecutive daemon starts without a completed handshake; a broken binary
+# must not be respawned on every request.
+var s_failed_starts: number = 0
+const MAX_FAILED_STARTS = 5
 
 # Correlate asynchronous replies: id -> {kind, ...context}
 var s_pending: dict<dict<any>> = {}
@@ -34,6 +38,9 @@ var s_line_blame_on: bool = true
 # bufnr (string) -> {failed: bool, hunks: list<dict<any>>}
 var s_hunk_cache: dict<dict<any>> = {}
 var s_hunk_inflight: dict<bool> = {}
+# Buffers that changed again while a hunks request was in flight.
+var s_hunk_stale: dict<bool> = {}
+var s_hunk_timer: number = 0
 var s_signs_on: bool = true
 var s_signs_defined: bool = false
 
@@ -81,8 +88,10 @@ def BufFilePath(bufnr: number): string
   if !bufexists(bufnr) || getbufvar(bufnr, '&buftype') !=# ''
     return ''
   endif
-  var name = fnamemodify(bufname(bufnr), ':p')
-  return filereadable(name) ? name : ''
+  # getbufinfo names are absolute, unlike bufname(), which would resolve
+  # relative to whatever the current directory happens to be by now.
+  var name = get(get(getbufinfo(bufnr), 0, {}), 'name', '')
+  return name !=# '' && filereadable(name) ? name : ''
 enddef
 
 def ShortSha(sha: string): string
@@ -174,6 +183,11 @@ def StartDaemon(): bool
     catch
     endtry
   endif
+  if s_failed_starts >= MAX_FAILED_STARTS
+    DebugLog('daemon failed ' .. s_failed_starts
+      .. ' times; run ./install.sh, then :SimpleGitEnable to retry')
+    return false
+  endif
   var cmd = FindDaemon()
   if cmd ==# '' || !executable(cmd)
     DebugLog('daemon not found; run ./install.sh or set g:simplegit_daemon_path')
@@ -198,6 +212,9 @@ def StartDaemon(): bool
       },
       exit_cb: (ch, code) => {
         if generation == s_job_generation
+          if !s_daemon_ready
+            s_failed_starts += 1
+          endif
           s_running = false
           s_job = v:null
           ClearPending()
@@ -319,6 +336,8 @@ def OnDaemonLine(line: string)
     OnHunks(ctx, ev)
   elseif ev.type ==# 'hunk_op'
     OnHunkOp(ctx, ev)
+  elseif ev.type ==# 'file_op'
+    OnFileOp(ctx, ev)
   endif
 enddef
 
@@ -330,7 +349,7 @@ def OnVersion(ev: dict<any>)
         \ && version !=# '' && type(protocol) == v:t_number
     s_daemon_version = version
     s_daemon_protocol = protocol
-    if protocol != 2
+    if protocol != 3
       s_daemon_ready = false
       s_daemon_incompatible = true
       s_wait_queue = []
@@ -338,6 +357,7 @@ def OnVersion(ev: dict<any>)
     else
       s_daemon_ready = true
       s_daemon_incompatible = false
+      s_failed_starts = 0
       s_last_error = ''
       FlushWaitQueue()
     endif
@@ -542,12 +562,22 @@ export def OnBufClose(bufnr: number)
   InvalidateHunks(bufnr)
 enddef
 
-# External git commands (commits, checkouts) invalidate hunks silently; a
-# focus regain or shell command is the cheapest signal we get.
+# External git commands (commits, checkouts) invalidate blame and hunks
+# silently; a focus regain or shell command is the cheapest signal we get.
+# Every visible file buffer refreshes, not only the current one.
 export def OnExternalChange()
-  var bufnr = bufnr('%')
-  InvalidateHunks(bufnr)
-  RefreshHunks()
+  if !s_enabled
+    return
+  endif
+  for win in getwininfo()
+    if getbufvar(win.bufnr, '&buftype') !=# ''
+      continue
+    endif
+    InvalidateBlame(win.bufnr)
+    InvalidateHunks(win.bufnr)
+    RequestHunks(win.bufnr, 'signs', false)
+  endfor
+  ScheduleLineBlame()
 enddef
 
 export def ToggleLineBlame()
@@ -801,6 +831,19 @@ enddef
 # Scratch windows (show / history / status)
 # =============================================================
 def OpenScratch(name: string, height: number): number
+  # Reuse an existing window for this name instead of stacking splits on
+  # every invocation.
+  for win in getwininfo()
+    if bufname(win.bufnr) ==# name
+      win_gotoid(win.winid)
+      setlocal modifiable
+      silent :%delete _
+      if height > 0
+        execute 'resize ' .. height
+      endif
+      return bufnr('%')
+    endif
+  endfor
   silent keepalt botright new
   if height > 0
     execute 'resize ' .. height
@@ -1023,6 +1066,9 @@ def InvalidateHunks(bufnr: number)
   if has_key(s_hunk_cache, key)
     remove(s_hunk_cache, key)
   endif
+  if has_key(s_hunk_stale, key)
+    remove(s_hunk_stale, key)
+  endif
 enddef
 
 # The buffer line a hunk anchors on: its first changed line, or for pure
@@ -1038,27 +1084,23 @@ def HunkCovers(hunk: dict<any>, lnum: number): bool
   return lnum >= hunk.new_start && lnum < hunk.new_start + hunk.new_count
 enddef
 
-def PlaceSigns(bufnr: number)
-  if !bufexists(bufnr) || !has('signs')
-    return
-  endif
-  sign_unplace(SIGN_GROUP, {buffer: bufnr})
+# The sign name wanted on each line, as a dict lnum -> name.
+def DesiredSigns(bufnr: number): dict<string>
+  var want: dict<string> = {}
   if !SignsEnabled()
-    return
+    return want
   endif
   var hunks = HunksFor(bufnr)
   if empty(hunks)
-    return
+    return want
   endif
-  EnsureSignDefs()
-  var priority = ConfNum('simplegit_sign_priority', 10)
   var max_signs = ConfNum('simplegit_max_signs', 500)
   var last = get(get(getbufinfo(bufnr), 0, {}), 'linecount', 0)
-  var placements: list<dict<any>> = []
+  var total = 0
   for hunk in hunks
     if hunk.new_count == 0
-      placements->add({buffer: bufnr, group: SIGN_GROUP, priority: priority,
-        name: 'SimpleGitDelete', lnum: min([HunkLine(hunk), max([last, 1])])})
+      want[string(min([HunkLine(hunk), max([last, 1])]))] = 'SimpleGitDelete'
+      total += 1
       continue
     endif
     var name = hunk.old_count == 0 ? 'SimpleGitAdd' : 'SimpleGitChange'
@@ -1066,17 +1108,57 @@ def PlaceSigns(bufnr: number)
       if lnum > last
         break
       endif
-      placements->add({buffer: bufnr, group: SIGN_GROUP, priority: priority,
-        name: name, lnum: lnum})
+      want[string(lnum)] = name
+      total += 1
     endfor
   endfor
-  if len(placements) > max_signs
-    DebugLog('not placing ' .. len(placements) .. ' signs (over simplegit_max_signs)')
+  if total > max_signs
+    DebugLog('not placing ' .. total .. ' signs (over simplegit_max_signs)')
+    return {}
+  endif
+  return want
+enddef
+
+# Update signs in place: unplacing everything and starting over makes the
+# whole column flicker on every live refresh.
+def PlaceSigns(bufnr: number)
+  if !bufexists(bufnr) || !has('signs')
     return
   endif
-  if !empty(placements)
-    sign_placelist(placements)
+  var want = DesiredSigns(bufnr)
+  var priority = ConfNum('simplegit_sign_priority', 10)
+  var keep: dict<bool> = {}
+  var to_remove: list<dict<any>> = []
+  for sign in get(get(sign_getplaced(bufnr, {group: SIGN_GROUP}), 0, {}), 'signs', [])
+    var key = string(sign.lnum)
+    if get(want, key, '') ==# sign.name && !has_key(keep, key)
+      keep[key] = true
+    else
+      to_remove->add({buffer: bufnr, group: SIGN_GROUP, id: sign.id})
+    endif
+  endfor
+  var to_add: list<dict<any>> = []
+  for [key, name] in items(want)
+    if !has_key(keep, key)
+      to_add->add({buffer: bufnr, group: SIGN_GROUP, priority: priority,
+        name: name, lnum: str2nr(key)})
+    endif
+  endfor
+  if !empty(to_remove)
+    sign_unplacelist(to_remove)
   endif
+  if !empty(to_add)
+    EnsureSignDefs()
+    sign_placelist(to_add)
+  endif
+enddef
+
+# Buffer text exactly as it would be written to disk, for the live diff.
+def BufferText(bufnr: number): string
+  var eol = getbufvar(bufnr, '&endofline') ? 1 : 0
+  var ff = getbufvar(bufnr, '&fileformat')
+  var sep = ff ==# 'dos' ? "\r\n" : ff ==# 'mac' ? "\r" : "\n"
+  return join(getbufline(bufnr, 1, '$'), sep) .. (eol == 1 ? sep : '')
 enddef
 
 def RequestHunks(bufnr: number, purpose: string, interactive: bool): bool
@@ -1086,9 +1168,19 @@ def RequestHunks(bufnr: number, purpose: string, interactive: bool): bool
   endif
   var key = string(bufnr)
   if has_key(s_hunk_inflight, key)
+    # Answer in flight already; rerun once it lands so the last edit wins.
+    s_hunk_stale[key] = true
     return true
   endif
-  var ok = Dispatch({type: 'hunks', path: path},
+  var req: dict<any> = {type: 'hunks', path: path}
+  if getbufvar(bufnr, '&modified')
+    var text = BufferText(bufnr)
+    if len(text) > ConfNum('simplegit_live_max_bytes', 1024 * 1024)
+      return false
+    endif
+    req.content = text
+  endif
+  var ok = Dispatch(req,
     {kind: 'hunks', bufnr: bufnr, purpose: purpose, interactive: interactive})
   if ok
     s_hunk_inflight[key] = true
@@ -1128,6 +1220,10 @@ def OnHunks(ctx: dict<any>, ev: dict<any>)
     JumpHunk(bufnr, 1)
   elseif purpose ==# 'prev'
     JumpHunk(bufnr, -1)
+  endif
+  if has_key(s_hunk_stale, key)
+    remove(s_hunk_stale, key)
+    RequestHunks(bufnr, 'signs', false)
   endif
 enddef
 
@@ -1310,6 +1406,26 @@ export def RefreshHunks()
   endif
 enddef
 
+# Debounced follow-up while typing: diff the unsaved buffer so the signs
+# track the edit instead of the file on disk.
+export def ScheduleHunks()
+  if !s_enabled || !SignsEnabled() || !has('timers')
+    return
+  endif
+  if s_hunk_timer != 0
+    timer_stop(s_hunk_timer)
+  endif
+  s_hunk_timer = timer_start(ConfNum('simplegit_hunk_delay', 300), (_) => {
+    s_hunk_timer = 0
+    var bufnr = bufnr('%')
+    if get(get(s_hunk_cache, string(bufnr), {}), 'failed', false)
+      # Outside a repository or untracked; do not hammer the daemon per edit.
+      return
+    endif
+    RequestHunks(bufnr, 'signs', false)
+  })
+enddef
+
 export def ToggleSigns()
   s_signs_on = !s_signs_on
   if s_signs_on
@@ -1372,7 +1488,44 @@ def OnStatus(ctx: dict<any>, ev: dict<any>)
 
   nnoremap <silent><buffer> <CR> <ScriptCmd>StatusOpen(false)<CR>
   nnoremap <silent><buffer> d <ScriptCmd>StatusOpen(true)<CR>
-  execute ':1'
+  nnoremap <silent><buffer> a <ScriptCmd>StatusFileOp('add')<CR>
+  nnoremap <silent><buffer> u <ScriptCmd>StatusFileOp('reset')<CR>
+  nnoremap <silent><buffer> R <ScriptCmd>StatusRefresh()<CR>
+  execute ':' .. min([max([get(ctx, 'lnum', 1), 1]), line('$')])
+enddef
+
+def StatusRefresh(lnum: number = 0)
+  var dir = get(b:, 'simplegit_dir', getcwd())
+  if !Dispatch({type: 'status', path: dir},
+      {kind: 'status', interactive: true, dir: dir,
+       lnum: lnum > 0 ? lnum : line('.')})
+    Warn('daemon unavailable')
+  endif
+enddef
+
+def StatusFileOp(op: string)
+  var paths = get(b:, 'simplegit_paths', [])
+  var dir = get(b:, 'simplegit_dir', getcwd())
+  var lnum = line('.')
+  if lnum > len(paths) || paths[lnum - 1] ==# ''
+    return
+  endif
+  if !Dispatch({type: 'file_op', path: dir, op: op, file: paths[lnum - 1]},
+      {kind: 'file_op', interactive: true, dir: dir, lnum: lnum})
+    Warn('daemon unavailable')
+  endif
+enddef
+
+def OnFileOp(ctx: dict<any>, ev: dict<any>)
+  # The index changed under every buffer of this repository; refresh what is
+  # visible, then re-render the status window it was triggered from.
+  OnExternalChange()
+  var dir = get(ctx, 'dir', '')
+  if dir ==# ''
+    return
+  endif
+  Dispatch({type: 'status', path: dir},
+    {kind: 'status', interactive: false, dir: dir, lnum: get(ctx, 'lnum', 1)})
 enddef
 
 def StatusRoot(dir: string): string
@@ -1420,6 +1573,8 @@ export def Enable()
   s_enabled = true
   s_line_blame_on = ConfBool('simplegit_line_blame', true)
   s_signs_on = ConfBool('simplegit_signs', true)
+  # Manual enable is the escape hatch after repeated daemon failures.
+  s_failed_starts = 0
   StartDaemon()
   ScheduleLineBlame()
   RefreshHunks()
@@ -1433,6 +1588,10 @@ export def Disable()
   if s_blame_timer != 0
     timer_stop(s_blame_timer)
     s_blame_timer = 0
+  endif
+  if s_hunk_timer != 0
+    timer_stop(s_hunk_timer)
+    s_hunk_timer = 0
   endif
   ClearLineBlame(bufnr('%'))
   if has('signs')
@@ -1476,8 +1635,11 @@ export def Health()
   echo '  popups:         ' .. (has('popupwin') ? 'supported' : 'unsupported')
   echo '  line blame:     ' .. (s_line_blame_on ? 'on' : 'off')
   echo '  hunk signs:     ' .. (SignsEnabled() ? 'on' : 'off')
+  echo '  live diff:      up to ' .. ConfNum('simplegit_live_max_bytes', 1024 * 1024) .. ' bytes, '
+        .. ConfNum('simplegit_hunk_delay', 300) .. 'ms debounce'
   echo '  cached buffers: ' .. len(s_blame_cache) .. ' blame, ' .. len(s_hunk_cache) .. ' hunks'
   echo '  pending:        ' .. len(s_pending)
+  echo '  failed starts:  ' .. s_failed_starts
   echo '  last message:   ' .. (s_last_error ==# '' ? '(none)' : s_last_error)
 enddef
 

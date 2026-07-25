@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.0 (2026-07-25)
+
+Live diffs, status-window staging, and robustness (protocol 3).
+
+- Hunk signs update while typing: modified buffers are diffed against the
+  index in the daemon (`hunks` request with buffer content, temp files plus
+  `git diff --no-index`), debounced by `g:simplegit_hunk_delay` and capped by
+  `g:simplegit_live_max_bytes`.
+- Status window: `a` stages the file under the cursor, `u` unstages it, `R`
+  refreshes; the list re-renders in place afterwards (`file_op` request).
+- Scratch windows (status/history/show) are reused instead of stacking a new
+  split per invocation.
+- Signs update incrementally instead of unplace-all/replace, removing sign
+  column flicker on every refresh.
+- Buffer paths are resolved from buffer info instead of the current working
+  directory, fixing "current buffer has no readable file" after `:cd`.
+- Blame and hunk caches invalidate for every visible buffer on FocusGained
+  and ShellCmdPost, so external commits/checkouts are picked up.
+- The daemon is no longer respawned per request after repeated startup
+  failures; `:SimpleGitEnable` retries explicitly.
+- Protocol version bumped to 3 — rerun `./install.sh`.
+
 ## 0.2.0 (2026-07-25)
 
 Hunk handling (protocol 2).
