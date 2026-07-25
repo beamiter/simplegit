@@ -31,7 +31,14 @@ Check(exists(':SimpleGitShow') == 2, ':SimpleGitShow exists')
 Check(exists(':SimpleGitStatus') == 2, ':SimpleGitStatus exists')
 Check(exists(':SimpleGitHealth') == 2, ':SimpleGitHealth exists')
 Check(exists(':SimpleGitToggleLineBlame') == 2, ':SimpleGitToggleLineBlame exists')
+Check(exists(':SimpleGitHunkNext') == 2, ':SimpleGitHunkNext exists')
+Check(exists(':SimpleGitHunkPrev') == 2, ':SimpleGitHunkPrev exists')
+Check(exists(':SimpleGitHunkPreview') == 2, ':SimpleGitHunkPreview exists')
+Check(exists(':SimpleGitHunkStage') == 2, ':SimpleGitHunkStage exists')
+Check(exists(':SimpleGitHunkUndo') == 2, ':SimpleGitHunkUndo exists')
+Check(exists(':SimpleGitToggleSigns') == 2, ':SimpleGitToggleSigns exists')
 Check(maparg('<Plug>(simplegit-blame)', 'n') !=# '', '<Plug>(simplegit-blame) mapped')
+Check(maparg('<Plug>(simplegit-hunk-stage)', 'n') !=# '', '<Plug>(simplegit-hunk-stage) mapped')
 
 # The autoload script must load and expose its entry points.
 try

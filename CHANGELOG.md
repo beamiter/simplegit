@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.0 (2026-07-25)
+
+Hunk handling (protocol 2).
+
+- Sign-column markers for working-tree changes against the index (`+`/`~`/`_`,
+  event-driven refresh, `:SimpleGitToggleSigns`, `g:simplegit_max_signs` cap).
+- Hunk navigation (`:SimpleGitHunkNext`/`:SimpleGitHunkPrev`, default `]g`/`[g`)
+  and a diff preview popup (`:SimpleGitHunkPreview`, `<leader>gp`).
+- Per-hunk stage into the index (`:SimpleGitHunkStage`, `<leader>ga`) and
+  working-tree undo with buffer reload (`:SimpleGitHunkUndo`, `<leader>gu`).
+- Daemon: `hunks`, `stage` and `undo` requests; extracted hunk headers are
+  rebased on the apply target so isolated `-U0` hunks land on the right lines;
+  protocol version bumped to 2 — rerun `./install.sh`.
+
 ## 0.1.0 (2026-07-25)
 
 Initial release.

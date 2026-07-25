@@ -4,7 +4,7 @@ if exists('g:loaded_simplegit')
   finish
 endif
 g:loaded_simplegit = 1
-g:simplegit_version = '0.1.0'
+g:simplegit_version = '0.2.0'
 
 def ConfigFlag(name: string, default_value: number): number
   var value = get(g:, name, default_value)
@@ -32,6 +32,14 @@ g:simplegit_blame_width = get(g:, 'simplegit_blame_width', 34)
 # Maximum commits shown by :SimpleGitHistory.
 g:simplegit_history_limit = get(g:, 'simplegit_history_limit', 200)
 g:simplegit_history_height = get(g:, 'simplegit_history_height', 15)
+# Hunk signs in the sign column (working tree vs index).
+g:simplegit_signs = ConfigFlag('simplegit_signs', 1)
+g:simplegit_sign_added = get(g:, 'simplegit_sign_added', '+')
+g:simplegit_sign_changed = get(g:, 'simplegit_sign_changed', '~')
+g:simplegit_sign_removed = get(g:, 'simplegit_sign_removed', '_')
+g:simplegit_sign_priority = get(g:, 'simplegit_sign_priority', 10)
+# Above this many signs in one buffer none are placed.
+g:simplegit_max_signs = get(g:, 'simplegit_max_signs', 500)
 g:simplegit_enable_default_mappings = ConfigFlag('simplegit_enable_default_mappings', 1)
 
 # =============================================================
@@ -44,6 +52,9 @@ highlight default link SimpleGitBlameUncommitted Comment
 highlight default link SimpleGitStatusBranch Title
 highlight default link SimpleGitStatusUntracked Comment
 highlight default link SimpleGitStatusConflict Error
+highlight default link SimpleGitSignAdd Added
+highlight default link SimpleGitSignChange Changed
+highlight default link SimpleGitSignDelete Removed
 
 # =============================================================
 # Commands
@@ -59,6 +70,12 @@ command! SimpleGitHistory simplegit#History()
 command! SimpleGitStatus simplegit#Status()
 command! -nargs=? SimpleGitDiff simplegit#Diff(<q-args>)
 command! -nargs=? SimpleGitShow simplegit#Show(<q-args>)
+command! SimpleGitHunkNext simplegit#HunkNext()
+command! SimpleGitHunkPrev simplegit#HunkPrev()
+command! SimpleGitHunkPreview simplegit#HunkPreview()
+command! SimpleGitHunkStage simplegit#HunkStage()
+command! SimpleGitHunkUndo simplegit#HunkUndo()
+command! SimpleGitToggleSigns simplegit#ToggleSigns()
 
 # =============================================================
 # Mappings
@@ -69,6 +86,11 @@ nnoremap <silent> <Plug>(simplegit-history) <Cmd>SimpleGitHistory<CR>
 nnoremap <silent> <Plug>(simplegit-diff) <Cmd>SimpleGitDiff<CR>
 nnoremap <silent> <Plug>(simplegit-status) <Cmd>SimpleGitStatus<CR>
 nnoremap <silent> <Plug>(simplegit-toggle-line-blame) <Cmd>SimpleGitToggleLineBlame<CR>
+nnoremap <silent> <Plug>(simplegit-hunk-next) <Cmd>SimpleGitHunkNext<CR>
+nnoremap <silent> <Plug>(simplegit-hunk-prev) <Cmd>SimpleGitHunkPrev<CR>
+nnoremap <silent> <Plug>(simplegit-hunk-preview) <Cmd>SimpleGitHunkPreview<CR>
+nnoremap <silent> <Plug>(simplegit-hunk-stage) <Cmd>SimpleGitHunkStage<CR>
+nnoremap <silent> <Plug>(simplegit-hunk-undo) <Cmd>SimpleGitHunkUndo<CR>
 
 # Defaults never replace a mapping owned by the user.
 if g:simplegit_enable_default_mappings
@@ -87,6 +109,21 @@ if g:simplegit_enable_default_mappings
   if maparg('<leader>gs', 'n') ==# ''
     nmap <silent> <leader>gs <Plug>(simplegit-status)
   endif
+  if maparg(']g', 'n') ==# ''
+    nmap <silent> ]g <Plug>(simplegit-hunk-next)
+  endif
+  if maparg('[g', 'n') ==# ''
+    nmap <silent> [g <Plug>(simplegit-hunk-prev)
+  endif
+  if maparg('<leader>gp', 'n') ==# ''
+    nmap <silent> <leader>gp <Plug>(simplegit-hunk-preview)
+  endif
+  if maparg('<leader>ga', 'n') ==# ''
+    nmap <silent> <leader>ga <Plug>(simplegit-hunk-stage)
+  endif
+  if maparg('<leader>gu', 'n') ==# ''
+    nmap <silent> <leader>gu <Plug>(simplegit-hunk-undo)
+  endif
 endif
 
 # =============================================================
@@ -100,6 +137,8 @@ augroup SimpleGit
   autocmd CursorMoved,BufEnter * simplegit#ScheduleLineBlame()
   autocmd InsertLeave * simplegit#ScheduleLineBlame()
   autocmd BufWritePost * simplegit#OnBufWrite()
+  autocmd BufReadPost,BufEnter * simplegit#RefreshHunks()
+  autocmd FocusGained,ShellCmdPost * simplegit#OnExternalChange()
   autocmd BufDelete * simplegit#OnBufClose(expand('<abuf>')->str2nr())
   autocmd VimLeavePre * try | simplegit#Stop() | catch | endtry
 augroup END

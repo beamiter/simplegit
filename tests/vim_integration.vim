@@ -123,6 +123,74 @@ endif
 diffoff!
 GotoSrc()
 
+# --- Hunks: signs, navigation, stage, undo ----------------------------------
+# A throwaway repository keeps stage/undo away from this checkout.
+var sandbox = tempname()
+mkdir(sandbox, 'p')
+def Git(dir: string, args: string): string
+  var out = system('git -C ' .. shellescape(dir) .. ' ' .. args)
+  if v:shell_error != 0
+    errors->add('FAIL: git ' .. args .. ': ' .. out)
+  endif
+  return out
+enddef
+Git(sandbox, 'init -q')
+Git(sandbox, 'config user.email test@example.com')
+Git(sandbox, 'config user.name Test')
+var sample = sandbox .. '/sample.txt'
+writefile(['one', 'two', 'three', 'four', 'five', 'six'], sample)
+Git(sandbox, 'add sample.txt')
+Git(sandbox, 'commit -q -m initial')
+writefile(['one', 'two changed', 'three', 'five', 'six', 'seven'], sample)
+
+execute 'edit ' .. fnameescape(sample)
+
+def PlacedSigns(): list<dict<any>>
+  return get(get(sign_getplaced(bufnr('%'), {group: 'simplegit'}), 0, {}), 'signs', [])
+enddef
+def SignAt(lnum: number): string
+  for sign in PlacedSigns()
+    if sign.lnum == lnum
+      return sign.name
+    endif
+  endfor
+  return ''
+enddef
+
+if WaitFor(() => len(PlacedSigns()) > 0, 'hunk signs placed')
+  Check(SignAt(2) ==# 'SimpleGitChange', 'change sign on line 2')
+  Check(SignAt(3) ==# 'SimpleGitDelete', 'delete sign on line 3')
+  Check(SignAt(6) ==# 'SimpleGitAdd', 'add sign on line 6')
+
+  cursor(1, 1)
+  simplegit#HunkNext()
+  Check(line('.') == 2, 'HunkNext jumps to first hunk')
+  simplegit#HunkNext()
+  Check(line('.') == 3, 'HunkNext jumps to deletion anchor')
+  simplegit#HunkNext()
+  Check(line('.') == 6, 'HunkNext jumps to added line')
+  simplegit#HunkPrev()
+  Check(line('.') == 3, 'HunkPrev jumps back')
+
+  cursor(2, 1)
+  simplegit#HunkPreview()
+  Check(len(popup_list()) > 0, 'hunk preview popup opens')
+  popup_clear()
+
+  cursor(6, 1)
+  simplegit#HunkStage()
+  WaitFor(() => Git(sandbox, 'diff --cached') =~# '+seven', 'hunk staged into index')
+  WaitFor(() => SignAt(6) ==# '', 'stage refreshes signs')
+
+  cursor(2, 1)
+  simplegit#HunkUndo()
+  WaitFor(() => getline(2) ==# 'two', 'hunk undo reverts buffer line')
+  Check(readfile(sample)[1] ==# 'two', 'hunk undo reverts file on disk')
+endif
+
+bwipeout!
+delete(sandbox, 'rf')
+
 simplegit#Disable()
 
 if len(errors) > 0

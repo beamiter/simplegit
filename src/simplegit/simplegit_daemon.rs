@@ -16,7 +16,7 @@ const MAX_REQUEST_PATH_BYTES: usize = 4096;
 // enough headroom for the request envelope and a maximum-width u64 request ID.
 const MAX_REQUEST_LINE_BYTES: usize = MAX_REQUEST_PATH_BYTES * 6 + 1024;
 const MAX_OUTPUT_LINES: usize = 200_000;
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 const GIT_REPOSITORY_ENV_VARS: [&str; 8] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -59,6 +59,15 @@ enum Request {
     /// Branch plus changed-file list for the repository containing `path`.
     #[serde(rename = "status")]
     Status { id: u64, path: String },
+    /// Working-tree-vs-index hunks for one file (`git diff -U0`).
+    #[serde(rename = "hunks")]
+    Hunks { id: u64, path: String },
+    /// Stage the hunk covering line `lnum` (`git apply --cached`).
+    #[serde(rename = "stage")]
+    Stage { id: u64, path: String, lnum: u32 },
+    /// Revert the hunk covering line `lnum` in the working tree.
+    #[serde(rename = "undo")]
+    Undo { id: u64, path: String, lnum: u32 },
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
@@ -74,6 +83,16 @@ struct LogEntry {
     author: String,
     time: i64,
     subject: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct Hunk {
+    old_start: u32,
+    old_count: u32,
+    new_start: u32,
+    new_count: u32,
+    /// The `@@` header plus the hunk body, for previews.
+    lines: Vec<String>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -116,6 +135,18 @@ enum Event {
         path: String,
         branch: String,
         entries: Vec<StatusEntry>,
+    },
+    #[serde(rename = "hunks")]
+    Hunks {
+        id: u64,
+        path: String,
+        hunks: Vec<Hunk>,
+    },
+    #[serde(rename = "hunk_op")]
+    HunkOp {
+        id: u64,
+        action: &'static str,
+        path: String,
     },
     #[serde(rename = "error")]
     Error { id: u64, message: String },
@@ -188,6 +219,46 @@ async fn run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
             )
         })?
         .map_err(|error| format!("failed to run git: {error}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let first = stderr.lines().next().unwrap_or("git command failed");
+        return Err(first.to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+async fn run_git_with_input(dir: &Path, args: &[&str], input: String) -> Result<String, String> {
+    let mut command = git_command(dir, args);
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let run = async {
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("failed to run git: {error}"))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "failed to open git stdin".to_string())?;
+        stdin
+            .write_all(input.as_bytes())
+            .await
+            .map_err(|error| format!("failed to write git stdin: {error}"))?;
+        drop(stdin);
+        child
+            .wait_with_output()
+            .await
+            .map_err(|error| format!("failed to run git: {error}"))
+    };
+    let output = tokio::time::timeout(GIT_TIMEOUT, run).await.map_err(|_| {
+        format!(
+            "git {} timed out after {} seconds",
+            args.first().copied().unwrap_or(""),
+            GIT_TIMEOUT.as_secs()
+        )
+    })??;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -535,6 +606,205 @@ async fn handle_status(id: u64, path: String, tx: EventTx, _permit: OwnedSemapho
 }
 
 // ---------------------------------------------------------------------------
+// Hunks (working tree vs index) and hunk staging / reverting
+// ---------------------------------------------------------------------------
+
+const DIFF_ARGS: [&str; 4] = ["diff", "--no-color", "--no-ext-diff", "--unified=0"];
+
+/// Parse one `@@ -old_start[,old_count] +new_start[,new_count] @@` header.
+fn parse_hunk_header(line: &str) -> Option<(u32, u32, u32, u32)> {
+    let parse_range = |text: &str| -> Option<(u32, u32)> {
+        match text.split_once(',') {
+            Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
+            None => Some((text.parse().ok()?, 1)),
+        }
+    };
+    let rest = line.strip_prefix("@@ -")?;
+    let (old_part, rest) = rest.split_once(" +")?;
+    let (new_part, _) = rest.split_once(" @@")?;
+    let (old_start, old_count) = parse_range(old_part)?;
+    let (new_start, new_count) = parse_range(new_part)?;
+    Some((old_start, old_count, new_start, new_count))
+}
+
+/// Parse `git diff -U0` output for one file into hunks. File header lines are
+/// dropped; each hunk keeps its `@@` header plus body for previews.
+fn parse_hunks(stdout: &str) -> Vec<Hunk> {
+    let mut hunks: Vec<Hunk> = Vec::new();
+    for line in stdout.lines() {
+        if line.starts_with("@@ ") {
+            if let Some((old_start, old_count, new_start, new_count)) = parse_hunk_header(line) {
+                hunks.push(Hunk {
+                    old_start,
+                    old_count,
+                    new_start,
+                    new_count,
+                    lines: vec![line.to_string()],
+                });
+            }
+        } else if let Some(hunk) = hunks.last_mut() {
+            if line.starts_with('-') || line.starts_with('+') || line.starts_with('\\') {
+                hunk.lines.push(line.to_string());
+            }
+        }
+    }
+    hunks
+}
+
+/// Whether the hunk's post-image covers `lnum`. Pure deletions anchor on the
+/// line the sign sits on (`new_start`, clamped to 1).
+fn hunk_covers(new_start: u32, new_count: u32, lnum: u32) -> bool {
+    if new_count == 0 {
+        lnum == new_start.max(1)
+    } else {
+        lnum >= new_start && lnum < new_start + new_count
+    }
+}
+
+/// Rewrite a hunk header so the hunk applies standalone. In a multi-hunk diff
+/// each range is only absolute for its own side; `git apply` derives insertion
+/// points from the *target* side, so rebase the other range onto it. Forward
+/// application targets the index (old side), reverse the working tree (new
+/// side).
+fn lone_hunk_header(
+    old_start: u32,
+    old_count: u32,
+    new_start: u32,
+    new_count: u32,
+    revert: bool,
+) -> String {
+    if revert {
+        let old_start = if new_count == 0 {
+            new_start + 1
+        } else if old_count == 0 {
+            new_start.saturating_sub(1)
+        } else {
+            new_start
+        };
+        format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@")
+    } else {
+        let new_start = if old_count == 0 {
+            old_start + 1
+        } else if new_count == 0 {
+            old_start.saturating_sub(1)
+        } else {
+            old_start
+        };
+        format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@")
+    }
+}
+
+/// Build a minimal patch (file header plus the single hunk covering `lnum`)
+/// from `git diff -U0` output.
+fn extract_hunk_patch(stdout: &str, lnum: u32, revert: bool) -> Option<String> {
+    let mut header: Vec<&str> = Vec::new();
+    let mut hunk: Vec<String> = Vec::new();
+    let mut in_header = true;
+    let mut keep = false;
+    for line in stdout.lines() {
+        if line.starts_with("@@ ") {
+            in_header = false;
+            if keep {
+                break;
+            }
+            hunk.clear();
+            if let Some((old_start, old_count, new_start, new_count)) = parse_hunk_header(line) {
+                keep = hunk_covers(new_start, new_count, lnum);
+                hunk.push(lone_hunk_header(
+                    old_start, old_count, new_start, new_count, revert,
+                ));
+            }
+        } else if in_header {
+            header.push(line);
+        } else {
+            hunk.push(line.to_string());
+        }
+    }
+    if !keep || header.is_empty() {
+        return None;
+    }
+    let mut patch = header.join("\n");
+    patch.push('\n');
+    patch.push_str(&hunk.join("\n"));
+    patch.push('\n');
+    Some(patch)
+}
+
+async fn handle_hunks(id: u64, path: String, tx: EventTx, _permit: OwnedSemaphorePermit) {
+    let dir = file_dir(&path);
+    let result = async {
+        let name = file_name(&path)?;
+        let mut args: Vec<&str> = DIFF_ARGS.to_vec();
+        args.extend(["--", name.as_str()]);
+        run_git(&dir, &args).await
+    }
+    .await;
+    match result {
+        Ok(stdout) => {
+            send_event(
+                &tx,
+                &Event::Hunks {
+                    id,
+                    path,
+                    hunks: parse_hunks(&stdout),
+                },
+            )
+            .await;
+        }
+        Err(message) => send_event(&tx, &Event::Error { id, message }).await,
+    }
+}
+
+async fn handle_hunk_op(
+    id: u64,
+    path: String,
+    lnum: u32,
+    revert: bool,
+    tx: EventTx,
+    _permit: OwnedSemaphorePermit,
+) {
+    let dir = file_dir(&path);
+    let result = async {
+        let name = file_name(&path)?;
+        let mut args: Vec<&str> = DIFF_ARGS.to_vec();
+        args.extend(["--", name.as_str()]);
+        let diff = run_git(&dir, &args).await?;
+        let patch = extract_hunk_patch(&diff, lnum, revert)
+            .ok_or_else(|| "no hunk under cursor".to_string())?;
+        // Patch paths are repository-relative; apply from the root so hunks in
+        // any subdirectory resolve.
+        let root = run_git(&dir, &["rev-parse", "--show-toplevel"]).await?;
+        let root = PathBuf::from(root.trim_end_matches('\n'));
+        let apply: &[&str] = if revert {
+            &[
+                "apply",
+                "--reverse",
+                "--unidiff-zero",
+                "--whitespace=nowarn",
+            ]
+        } else {
+            &["apply", "--cached", "--unidiff-zero", "--whitespace=nowarn"]
+        };
+        run_git_with_input(&root, apply, patch).await
+    }
+    .await;
+    match result {
+        Ok(_) => {
+            send_event(
+                &tx,
+                &Event::HunkOp {
+                    id,
+                    action: if revert { "undo" } else { "stage" },
+                    path,
+                },
+            )
+            .await;
+        }
+        Err(message) => send_event(&tx, &Event::Error { id, message }).await,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Request loop
 // ---------------------------------------------------------------------------
 
@@ -625,6 +895,9 @@ fn request_id_and_path(req: &Request) -> (u64, Option<&str>) {
         Request::Show { id, path, .. } => (*id, Some(path)),
         Request::Cat { id, path, .. } => (*id, Some(path)),
         Request::Status { id, path } => (*id, Some(path)),
+        Request::Hunks { id, path } => (*id, Some(path)),
+        Request::Stage { id, path, .. } => (*id, Some(path)),
+        Request::Undo { id, path, .. } => (*id, Some(path)),
     }
 }
 
@@ -720,6 +993,21 @@ where
                 let tx = out_tx.clone();
                 let permit = git_limiter.clone().acquire_owned().await.unwrap();
                 requests.spawn(handle_status(id, path, tx, permit));
+            }
+            Request::Hunks { id, path } => {
+                let tx = out_tx.clone();
+                let permit = git_limiter.clone().acquire_owned().await.unwrap();
+                requests.spawn(handle_hunks(id, path, tx, permit));
+            }
+            Request::Stage { id, path, lnum } => {
+                let tx = out_tx.clone();
+                let permit = git_limiter.clone().acquire_owned().await.unwrap();
+                requests.spawn(handle_hunk_op(id, path, lnum, false, tx, permit));
+            }
+            Request::Undo { id, path, lnum } => {
+                let tx = out_tx.clone();
+                let permit = git_limiter.clone().acquire_owned().await.unwrap();
+                requests.spawn(handle_hunk_op(id, path, lnum, true, tx, permit));
             }
         }
     }
@@ -860,6 +1148,86 @@ u UU N... 100644 100644 100644 100644 aaaa bbbb cccc conflict.rs\n\
             .unwrap();
         daemon.await.unwrap().unwrap();
         assert!(response.contains("\"type\":\"version\""));
-        assert!(response.contains("\"protocol\":1"));
+        assert!(response.contains("\"protocol\":2"));
+    }
+
+    const DIFF_FIXTURE: &str = "\
+diff --git a/src/lib.rs b/src/lib.rs\n\
+index aaaa111..bbbb222 100644\n\
+--- a/src/lib.rs\n\
++++ b/src/lib.rs\n\
+@@ -3 +3 @@ fn top()\n\
+-old line\n\
++new line\n\
+@@ -10,0 +11,2 @@ fn mid()\n\
++added one\n\
++added two\n\
+@@ -20,3 +22,0 @@ fn tail()\n\
+-gone one\n\
+-gone two\n\
+-gone three\n";
+
+    #[test]
+    fn hunk_headers_are_parsed() {
+        assert_eq!(parse_hunk_header("@@ -3 +3 @@ fn x()"), Some((3, 1, 3, 1)));
+        assert_eq!(parse_hunk_header("@@ -10,0 +11,2 @@"), Some((10, 0, 11, 2)));
+        assert_eq!(parse_hunk_header("@@ -20,3 +22,0 @@"), Some((20, 3, 22, 0)));
+        assert_eq!(parse_hunk_header("@@ garbage"), None);
+        assert_eq!(parse_hunk_header("not a header"), None);
+    }
+
+    #[test]
+    fn diff_hunks_are_parsed() {
+        let hunks = parse_hunks(DIFF_FIXTURE);
+        assert_eq!(hunks.len(), 3);
+        assert_eq!((hunks[0].old_start, hunks[0].old_count), (3, 1));
+        assert_eq!((hunks[0].new_start, hunks[0].new_count), (3, 1));
+        assert_eq!(hunks[0].lines.len(), 3);
+        assert_eq!(
+            hunks[1].lines,
+            vec!["@@ -10,0 +11,2 @@ fn mid()", "+added one", "+added two"]
+        );
+        assert_eq!((hunks[2].new_start, hunks[2].new_count), (22, 0));
+    }
+
+    #[test]
+    fn hunk_coverage_handles_deletions() {
+        assert!(hunk_covers(3, 1, 3));
+        assert!(!hunk_covers(3, 1, 4));
+        assert!(hunk_covers(11, 2, 12));
+        assert!(!hunk_covers(11, 2, 13));
+        // Pure deletion anchors on new_start, clamped to line 1.
+        assert!(hunk_covers(22, 0, 22));
+        assert!(!hunk_covers(22, 0, 21));
+        assert!(hunk_covers(0, 0, 1));
+    }
+
+    #[test]
+    fn hunk_patch_is_extracted_with_file_header() {
+        let patch = extract_hunk_patch(DIFF_FIXTURE, 11, false).unwrap();
+        assert!(patch.starts_with("diff --git a/src/lib.rs b/src/lib.rs\n"));
+        assert!(patch.contains("+++ b/src/lib.rs\n"));
+        assert!(patch.contains("@@ -10,0 +11,2 @@"));
+        assert!(patch.contains("+added one\n+added two\n"));
+        assert!(!patch.contains("old line"));
+        assert!(!patch.contains("gone one"));
+        assert!(extract_hunk_patch(DIFF_FIXTURE, 5, false).is_none());
+        assert!(extract_hunk_patch("", 1, false).is_none());
+    }
+
+    #[test]
+    fn lone_hunk_headers_rebase_on_the_target_side() {
+        // Forward (stage): the old range is absolute for the index.
+        assert_eq!(lone_hunk_header(3, 1, 5, 1, false), "@@ -3,1 +3,1 @@");
+        assert_eq!(lone_hunk_header(10, 0, 11, 2, false), "@@ -10,0 +11,2 @@");
+        assert_eq!(lone_hunk_header(20, 3, 22, 0, false), "@@ -20,3 +19,0 @@");
+        assert_eq!(lone_hunk_header(0, 0, 1, 2, false), "@@ -0,0 +1,2 @@");
+        // Reverse (undo): the new range is absolute for the working tree.
+        assert_eq!(lone_hunk_header(3, 1, 5, 1, true), "@@ -5,1 +5,1 @@");
+        assert_eq!(lone_hunk_header(10, 0, 11, 2, true), "@@ -10,0 +11,2 @@");
+        assert_eq!(lone_hunk_header(20, 3, 22, 0, true), "@@ -23,3 +22,0 @@");
+        // The staged '+seven' regression: insertion extracted after a net -1
+        // earlier hunk must land after old line 6, not before it.
+        assert_eq!(lone_hunk_header(6, 0, 6, 1, false), "@@ -6,0 +7,1 @@");
     }
 }

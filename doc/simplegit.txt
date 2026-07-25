@@ -16,7 +16,8 @@ INTRODUCTION                                              *simplegit-introductio
 
 Simplegit brings GitLens-style Git insight to Vim 9: an inline current-line
 blame annotation, a whole-file blame sidebar, file history, diff against any
-revision, commit inspection, and a repository status window.
+revision, commit inspection, a repository status window, and hunk handling —
+sign-column change markers with navigation, preview, stage and undo.
 
 Rendering stays in Vim9script; every git invocation runs inside a small
 asynchronous Rust daemon over a JSON line protocol, so editing never waits on
@@ -67,6 +68,24 @@ COMMANDS                                                      *simplegit-command
   Show the repository branch and changed files. Inside the window: <CR>
   opens the file, `d` opens it and diffs it against HEAD, `q` closes.
 
+:SimpleGitHunkNext                                          *:SimpleGitHunkNext*
+:SimpleGitHunkPrev                                          *:SimpleGitHunkPrev*
+  Jump to the next/previous hunk (working tree vs index) in the current file.
+
+:SimpleGitHunkPreview                                    *:SimpleGitHunkPreview*
+  Show the diff of the hunk under the cursor in a popup.
+
+:SimpleGitHunkStage                                        *:SimpleGitHunkStage*
+  Stage the hunk under the cursor into the index (like git add -p for one
+  hunk). The buffer must be saved first; hunks reflect the file on disk.
+
+:SimpleGitHunkUndo                                          *:SimpleGitHunkUndo*
+  Revert the hunk under the cursor in the working tree and reload the
+  buffer. This discards the change; it is not confirmed.
+
+:SimpleGitToggleSigns                                    *:SimpleGitToggleSigns*
+  Toggle the sign-column hunk markers.
+
 :SimpleGitEnable  :SimpleGitDisable  :SimpleGitToggle          *:SimpleGitEnable*
   Control the whole plugin (daemon plus inline annotation).
 
@@ -83,12 +102,19 @@ MAPPINGS                                                      *simplegit-mapping
   <Plug>(simplegit-diff)               :SimpleGitDiff
   <Plug>(simplegit-status)             :SimpleGitStatus
   <Plug>(simplegit-toggle-line-blame)  :SimpleGitToggleLineBlame
+  <Plug>(simplegit-hunk-next)          :SimpleGitHunkNext
+  <Plug>(simplegit-hunk-prev)          :SimpleGitHunkPrev
+  <Plug>(simplegit-hunk-preview)       :SimpleGitHunkPreview
+  <Plug>(simplegit-hunk-stage)         :SimpleGitHunkStage
+  <Plug>(simplegit-hunk-undo)          :SimpleGitHunkUndo
 <
 Default mappings (only when the key is unmapped, disable with
 g:simplegit_enable_default_mappings = 0): >
   <leader>gb   blame sidebar        <leader>gm   line blame popup
   <leader>gh   file history         <leader>gd   diff against HEAD
   <leader>gs   repository status
+  ]g / [g      next/previous hunk   <leader>gp   preview hunk
+  <leader>ga   stage hunk           <leader>gu   undo hunk
 <
 ===============================================================================
 CONFIGURATION                                            *simplegit-configuration*
@@ -111,6 +137,20 @@ g:simplegit_history_limit (default 200)               *g:simplegit_history_limit
 g:simplegit_history_height (default 15)              *g:simplegit_history_height*
   Maximum height of the history window.
 
+g:simplegit_signs (default 1)                                 *g:simplegit_signs*
+  Show hunk markers in the sign column.
+
+g:simplegit_sign_added (default '+')                     *g:simplegit_sign_added*
+g:simplegit_sign_changed (default '~')                 *g:simplegit_sign_changed*
+g:simplegit_sign_removed (default '_')                 *g:simplegit_sign_removed*
+  Sign-column text for added, changed and removed lines.
+
+g:simplegit_sign_priority (default 10)                *g:simplegit_sign_priority*
+  Priority of the hunk signs.
+
+g:simplegit_max_signs (default 500)                       *g:simplegit_max_signs*
+  Above this many signs in one buffer none are placed.
+
 g:simplegit_daemon_path (default '')                    *g:simplegit_daemon_path*
   Absolute path of the daemon binary; overrides runtimepath discovery.
 
@@ -131,6 +171,9 @@ HIGHLIGHTS                                                  *simplegit-highlight
   SimpleGitStatusBranch      branch header in the status window (Title)
   SimpleGitStatusUntracked   untracked entries (Comment)
   SimpleGitStatusConflict    conflicted entries (Error)
+  SimpleGitSignAdd           added-line sign (Added)
+  SimpleGitSignChange        changed-line sign (Changed)
+  SimpleGitSignDelete        removed-line sign (Removed)
 
 ===============================================================================
 TROUBLESHOOTING                                        *simplegit-troubleshooting*

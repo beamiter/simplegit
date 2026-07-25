@@ -1,6 +1,6 @@
 # Simplegit
 
-Simplegit brings GitLens-style Git insight to Vim 9: an inline current-line blame annotation, a whole-file blame sidebar, file history, diff against any revision, commit inspection, and a repository status window.
+Simplegit brings GitLens-style Git insight to Vim 9: an inline current-line blame annotation, a whole-file blame sidebar, file history, diff against any revision, commit inspection, a repository status window, and hunk handling: sign-column change markers with navigation, preview, stage and undo.
 
 Like the other `simple*` plugins, rendering stays in Vim9script and all git work runs in a small asynchronous Rust daemon over a JSON line protocol — editing never waits on `git`.
 
@@ -13,6 +13,7 @@ Like the other `simple*` plugins, rendering stays in Vim9script and all git work
 - **Commit inspection** (`:SimpleGitShow [rev]`): message, stats and patch with `git` syntax highlighting.
 - **Repository status** (`:SimpleGitStatus`): branch plus changed files; `<CR>` opens a file, `d` opens and diffs it.
 - **Line blame popup** (`:SimpleGitBlameLine`): commit, author, date, and summary for the line under the cursor.
+- **Hunk handling** (GitGutter style): `+`/`~`/`_` signs for working-tree changes against the index, hunk navigation (`:SimpleGitHunkNext`/`Prev`), a diff preview popup, and per-hunk stage (`:SimpleGitHunkStage`) and undo (`:SimpleGitHunkUndo`).
 - Asynchronous daemon with a version handshake, request correlation, concurrency limiting and timeouts; `:SimpleGitHealth` diagnostics.
 
 ## Requirements
@@ -50,6 +51,11 @@ The installer performs a locked release build, atomically installs `lib/simplegi
 | `:SimpleGitShow [rev]` | Show a commit |
 | `:SimpleGitStatus` | Repository status window |
 | `:SimpleGitToggleLineBlame` | Toggle the inline annotation |
+| `:SimpleGitHunkNext` / `:SimpleGitHunkPrev` | Jump to the next/previous hunk |
+| `:SimpleGitHunkPreview` | Popup diff of the hunk under the cursor |
+| `:SimpleGitHunkStage` | Stage the hunk under the cursor |
+| `:SimpleGitHunkUndo` | Revert the hunk under the cursor |
+| `:SimpleGitToggleSigns` | Toggle the sign-column markers |
 | `:SimpleGitHealth` | Diagnostics |
 
 Default mappings (only installed when the keys are free; disable with `let g:simplegit_enable_default_mappings = 0`):
@@ -61,6 +67,10 @@ Default mappings (only installed when the keys are free; disable with `let g:sim
 | `<leader>gh` | File history |
 | `<leader>gd` | Diff against HEAD |
 | `<leader>gs` | Repository status |
+| `]g` / `[g` | Next / previous hunk |
+| `<leader>gp` | Preview hunk |
+| `<leader>ga` | Stage hunk |
+| `<leader>gu` | Undo hunk |
 
 ## Configuration
 
@@ -70,6 +80,8 @@ let g:simplegit_line_blame = 1         " inline current-line annotation
 let g:simplegit_blame_delay = 350      " ms of cursor rest before it appears
 let g:simplegit_blame_width = 34       " sidebar width
 let g:simplegit_history_limit = 200    " max commits in :SimpleGitHistory
+let g:simplegit_signs = 1              " sign-column hunk markers
+let g:simplegit_max_signs = 500        " place no signs above this count
 let g:simplegit_daemon_path = ''       " explicit daemon binary path
 ```
 

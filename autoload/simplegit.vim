@@ -30,8 +30,16 @@ var s_blame_inflight: dict<bool> = {}
 var s_blame_timer: number = 0
 var s_line_blame_on: bool = true
 
+# ----------- Hunk state -----------
+# bufnr (string) -> {failed: bool, hunks: list<dict<any>>}
+var s_hunk_cache: dict<dict<any>> = {}
+var s_hunk_inflight: dict<bool> = {}
+var s_signs_on: bool = true
+var s_signs_defined: bool = false
+
 const UNCOMMITTED = '0000000000000000000000000000000000000000'
 const PROP_TYPE = 'simplegit_line_blame'
+const SIGN_GROUP = 'simplegit'
 
 # =============================================================
 # Small helpers
@@ -154,6 +162,7 @@ def ClearPending()
   s_pending = {}
   s_wait_queue = []
   s_blame_inflight = {}
+  s_hunk_inflight = {}
 enddef
 
 def StartDaemon(): bool
@@ -306,6 +315,10 @@ def OnDaemonLine(line: string)
     OnCat(ctx, ev)
   elseif ev.type ==# 'status'
     OnStatus(ctx, ev)
+  elseif ev.type ==# 'hunks'
+    OnHunks(ctx, ev)
+  elseif ev.type ==# 'hunk_op'
+    OnHunkOp(ctx, ev)
   endif
 enddef
 
@@ -317,7 +330,7 @@ def OnVersion(ev: dict<any>)
         \ && version !=# '' && type(protocol) == v:t_number
     s_daemon_version = version
     s_daemon_protocol = protocol
-    if protocol != 1
+    if protocol != 2
       s_daemon_ready = false
       s_daemon_incompatible = true
       s_wait_queue = []
@@ -346,6 +359,12 @@ def OnRequestError(ctx: dict<any>, message: any)
     # Remember the failure so cursor movement does not hammer the daemon
     # with requests for files outside any repository.
     s_blame_cache[key] = {failed: true, lines: [], commits: {}}
+  elseif get(ctx, 'kind', '') ==# 'hunks'
+    var key = string(get(ctx, 'bufnr', -1))
+    if has_key(s_hunk_inflight, key)
+      remove(s_hunk_inflight, key)
+    endif
+    s_hunk_cache[key] = {failed: true, hunks: []}
   endif
   if get(ctx, 'interactive', false)
     Warn(text)
@@ -514,10 +533,21 @@ export def OnBufWrite()
   var bufnr = bufnr('%')
   InvalidateBlame(bufnr)
   ScheduleLineBlame()
+  InvalidateHunks(bufnr)
+  RefreshHunks()
 enddef
 
 export def OnBufClose(bufnr: number)
   InvalidateBlame(bufnr)
+  InvalidateHunks(bufnr)
+enddef
+
+# External git commands (commits, checkouts) invalidate hunks silently; a
+# focus regain or shell command is the cheapest signal we get.
+export def OnExternalChange()
+  var bufnr = bufnr('%')
+  InvalidateHunks(bufnr)
+  RefreshHunks()
 enddef
 
 export def ToggleLineBlame()
@@ -946,6 +976,354 @@ export def Diff(rev: string)
 enddef
 
 # =============================================================
+# Hunks — signs, navigation, preview, stage and undo
+# =============================================================
+def SignsEnabled(): bool
+  return s_signs_on && ConfBool('simplegit_signs', true) && has('signs')
+enddef
+
+def EnsureSignDefs()
+  if s_signs_defined
+    return
+  endif
+  sign_define('SimpleGitAdd', {
+    text: get(g:, 'simplegit_sign_added', '+'),
+    texthl: 'SimpleGitSignAdd',
+  })
+  sign_define('SimpleGitChange', {
+    text: get(g:, 'simplegit_sign_changed', '~'),
+    texthl: 'SimpleGitSignChange',
+  })
+  sign_define('SimpleGitDelete', {
+    text: get(g:, 'simplegit_sign_removed', '_'),
+    texthl: 'SimpleGitSignDelete',
+  })
+  s_signs_defined = true
+enddef
+
+def ValidHunk(entry: any): bool
+  return type(entry) == v:t_dict
+        \ && type(get(entry, 'old_start', v:null)) == v:t_number
+        \ && type(get(entry, 'old_count', v:null)) == v:t_number
+        \ && type(get(entry, 'new_start', v:null)) == v:t_number
+        \ && type(get(entry, 'new_count', v:null)) == v:t_number
+        \ && type(get(entry, 'lines', v:null)) == v:t_list
+enddef
+
+def HunksFor(bufnr: number): list<dict<any>>
+  var cached = get(s_hunk_cache, string(bufnr), {})
+  if empty(cached) || get(cached, 'failed', false)
+    return []
+  endif
+  return get(cached, 'hunks', [])
+enddef
+
+def InvalidateHunks(bufnr: number)
+  var key = string(bufnr)
+  if has_key(s_hunk_cache, key)
+    remove(s_hunk_cache, key)
+  endif
+enddef
+
+# The buffer line a hunk anchors on: its first changed line, or for pure
+# deletions the line the change happened after.
+def HunkLine(hunk: dict<any>): number
+  return max([hunk.new_start, 1])
+enddef
+
+def HunkCovers(hunk: dict<any>, lnum: number): bool
+  if hunk.new_count == 0
+    return lnum == HunkLine(hunk)
+  endif
+  return lnum >= hunk.new_start && lnum < hunk.new_start + hunk.new_count
+enddef
+
+def PlaceSigns(bufnr: number)
+  if !bufexists(bufnr) || !has('signs')
+    return
+  endif
+  sign_unplace(SIGN_GROUP, {buffer: bufnr})
+  if !SignsEnabled()
+    return
+  endif
+  var hunks = HunksFor(bufnr)
+  if empty(hunks)
+    return
+  endif
+  EnsureSignDefs()
+  var priority = ConfNum('simplegit_sign_priority', 10)
+  var max_signs = ConfNum('simplegit_max_signs', 500)
+  var last = get(get(getbufinfo(bufnr), 0, {}), 'linecount', 0)
+  var placements: list<dict<any>> = []
+  for hunk in hunks
+    if hunk.new_count == 0
+      placements->add({buffer: bufnr, group: SIGN_GROUP, priority: priority,
+        name: 'SimpleGitDelete', lnum: min([HunkLine(hunk), max([last, 1])])})
+      continue
+    endif
+    var name = hunk.old_count == 0 ? 'SimpleGitAdd' : 'SimpleGitChange'
+    for lnum in range(hunk.new_start, hunk.new_start + hunk.new_count - 1)
+      if lnum > last
+        break
+      endif
+      placements->add({buffer: bufnr, group: SIGN_GROUP, priority: priority,
+        name: name, lnum: lnum})
+    endfor
+  endfor
+  if len(placements) > max_signs
+    DebugLog('not placing ' .. len(placements) .. ' signs (over simplegit_max_signs)')
+    return
+  endif
+  if !empty(placements)
+    sign_placelist(placements)
+  endif
+enddef
+
+def RequestHunks(bufnr: number, purpose: string, interactive: bool): bool
+  var path = BufFilePath(bufnr)
+  if path ==# ''
+    return false
+  endif
+  var key = string(bufnr)
+  if has_key(s_hunk_inflight, key)
+    return true
+  endif
+  var ok = Dispatch({type: 'hunks', path: path},
+    {kind: 'hunks', bufnr: bufnr, purpose: purpose, interactive: interactive})
+  if ok
+    s_hunk_inflight[key] = true
+  endif
+  return ok
+enddef
+
+def OnHunks(ctx: dict<any>, ev: dict<any>)
+  var bufnr = get(ctx, 'bufnr', -1)
+  var key = string(bufnr)
+  if has_key(s_hunk_inflight, key)
+    remove(s_hunk_inflight, key)
+  endif
+  var hunks = get(ev, 'hunks', v:null)
+  if type(hunks) != v:t_list
+    DebugLog('ignored malformed hunks response')
+    return
+  endif
+  if !bufexists(bufnr)
+    return
+  endif
+  var valid: list<dict<any>> = []
+  for entry in hunks
+    if ValidHunk(entry)
+      valid->add(entry)
+    endif
+  endfor
+  if len(s_hunk_cache) >= 64 && !has_key(s_hunk_cache, key)
+    remove(s_hunk_cache, keys(s_hunk_cache)[0])
+  endif
+  s_hunk_cache[key] = {failed: false, hunks: valid}
+  PlaceSigns(bufnr)
+  var purpose = get(ctx, 'purpose', 'signs')
+  if purpose ==# 'preview'
+    ShowHunkPreview(bufnr)
+  elseif purpose ==# 'next'
+    JumpHunk(bufnr, 1)
+  elseif purpose ==# 'prev'
+    JumpHunk(bufnr, -1)
+  endif
+enddef
+
+def OnHunkOp(ctx: dict<any>, ev: dict<any>)
+  var bufnr = get(ctx, 'bufnr', -1)
+  var action = get(ev, 'action', '')
+  if !bufexists(bufnr)
+    return
+  endif
+  if action ==# 'undo'
+    # The daemon rewrote the file on disk; pick the change up. A plain
+    # checktime only reloads with 'autoread', so re-edit when it is safe.
+    if bufnr == bufnr('%') && !getbufvar(bufnr, '&modified')
+      var view = winsaveview()
+      silent! execute 'edit!'
+      winrestview(view)
+    else
+      silent! execute 'checktime ' .. bufnr
+    endif
+    InvalidateBlame(bufnr)
+    ScheduleLineBlame()
+  endif
+  InvalidateHunks(bufnr)
+  RequestHunks(bufnr, 'signs', false)
+  echo '[SimpleGit] ' .. (action ==# 'undo' ? 'hunk reverted' : 'hunk staged')
+enddef
+
+def JumpHunk(bufnr: number, direction: number)
+  if bufnr != bufnr('%')
+    return
+  endif
+  var hunks = HunksFor(bufnr)
+  if empty(hunks)
+    Warn('no hunks in this buffer')
+    return
+  endif
+  var lnum = line('.')
+  var target = 0
+  if direction > 0
+    for hunk in hunks
+      if HunkLine(hunk) > lnum
+        target = HunkLine(hunk)
+        break
+      endif
+    endfor
+  else
+    for hunk in reverse(copy(hunks))
+      if HunkLine(hunk) < lnum
+        target = HunkLine(hunk)
+        break
+      endif
+    endfor
+  endif
+  if target == 0
+    Warn(direction > 0 ? 'no next hunk' : 'no previous hunk')
+    return
+  endif
+  normal! m'
+  cursor(target, 1)
+enddef
+
+def ShowHunkPreview(bufnr: number)
+  if bufnr != bufnr('%')
+    return
+  endif
+  var lnum = line('.')
+  for hunk in HunksFor(bufnr)
+    if !HunkCovers(hunk, lnum)
+      continue
+    endif
+    if has('popupwin')
+      var winid = popup_atcursor(hunk.lines, {
+        padding: [0, 1, 0, 1],
+        border: [1, 1, 1, 1],
+        borderchars: ['─', '│', '─', '│', '┌', '┐', '┘', '└'],
+        moved: 'any',
+        maxheight: 20,
+      })
+      win_execute(winid, 'setlocal filetype=diff')
+    else
+      echo join(hunk.lines, "\n")
+    endif
+    return
+  endfor
+  Warn('no hunk under cursor')
+enddef
+
+# Shared entry guard: hunk features need a readable, unmodified file.
+def HunkTarget(need_saved: bool): number
+  var bufnr = bufnr('%')
+  if BufFilePath(bufnr) ==# ''
+    Warn('current buffer has no readable file')
+    return -1
+  endif
+  if need_saved && getbufvar(bufnr, '&modified')
+    Warn('save the buffer first; hunks reflect the file on disk')
+    return -1
+  endif
+  return bufnr
+enddef
+
+export def HunkNext()
+  var bufnr = HunkTarget(false)
+  if bufnr < 0
+    return
+  endif
+  if empty(get(s_hunk_cache, string(bufnr), {}))
+    if !RequestHunks(bufnr, 'next', true)
+      Warn('daemon unavailable; run ./install.sh')
+    endif
+    return
+  endif
+  JumpHunk(bufnr, 1)
+enddef
+
+export def HunkPrev()
+  var bufnr = HunkTarget(false)
+  if bufnr < 0
+    return
+  endif
+  if empty(get(s_hunk_cache, string(bufnr), {}))
+    if !RequestHunks(bufnr, 'prev', true)
+      Warn('daemon unavailable; run ./install.sh')
+    endif
+    return
+  endif
+  JumpHunk(bufnr, -1)
+enddef
+
+export def HunkPreview()
+  var bufnr = HunkTarget(false)
+  if bufnr < 0
+    return
+  endif
+  if empty(get(s_hunk_cache, string(bufnr), {}))
+    if !RequestHunks(bufnr, 'preview', true)
+      Warn('daemon unavailable; run ./install.sh')
+    endif
+    return
+  endif
+  ShowHunkPreview(bufnr)
+enddef
+
+def HunkOperate(op: string)
+  var bufnr = HunkTarget(true)
+  if bufnr < 0
+    return
+  endif
+  var hunks = HunksFor(bufnr)
+  if !empty(get(s_hunk_cache, string(bufnr), {})) && empty(hunks)
+    Warn('no hunks in this buffer')
+    return
+  endif
+  if !Dispatch({type: op, path: BufFilePath(bufnr), lnum: line('.')},
+      {kind: 'hunk_op', bufnr: bufnr, interactive: true})
+    Warn('daemon unavailable; run ./install.sh')
+  endif
+enddef
+
+export def HunkStage()
+  HunkOperate('stage')
+enddef
+
+export def HunkUndo()
+  HunkOperate('undo')
+enddef
+
+export def RefreshHunks()
+  if !s_enabled || !SignsEnabled()
+    return
+  endif
+  var bufnr = bufnr('%')
+  if BufFilePath(bufnr) ==# ''
+    return
+  endif
+  if empty(get(s_hunk_cache, string(bufnr), {}))
+    RequestHunks(bufnr, 'signs', false)
+  else
+    PlaceSigns(bufnr)
+  endif
+enddef
+
+export def ToggleSigns()
+  s_signs_on = !s_signs_on
+  if s_signs_on
+    RefreshHunks()
+    echo '[SimpleGit] signs on'
+  else
+    if has('signs')
+      sign_unplace(SIGN_GROUP)
+    endif
+    echo '[SimpleGit] signs off'
+  endif
+enddef
+
+# =============================================================
 # Repository status
 # =============================================================
 def ValidStatusEntry(entry: any): bool
@@ -1041,8 +1419,10 @@ export def Enable()
   endif
   s_enabled = true
   s_line_blame_on = ConfBool('simplegit_line_blame', true)
+  s_signs_on = ConfBool('simplegit_signs', true)
   StartDaemon()
   ScheduleLineBlame()
+  RefreshHunks()
 enddef
 
 export def Disable()
@@ -1055,6 +1435,9 @@ export def Disable()
     s_blame_timer = 0
   endif
   ClearLineBlame(bufnr('%'))
+  if has('signs')
+    sign_unplace(SIGN_GROUP)
+  endif
   Stop()
 enddef
 
@@ -1070,6 +1453,7 @@ export def Stop()
   s_daemon_ready = false
   ClearPending()
   s_blame_cache = {}
+  s_hunk_cache = {}
 enddef
 
 export def Toggle()
@@ -1091,7 +1475,8 @@ export def Health()
   echo '  virtual text:   ' .. (VirtualTextSupported() ? 'supported' : 'unsupported (needs Vim 9.0.0067+)')
   echo '  popups:         ' .. (has('popupwin') ? 'supported' : 'unsupported')
   echo '  line blame:     ' .. (s_line_blame_on ? 'on' : 'off')
-  echo '  cached buffers: ' .. len(s_blame_cache)
+  echo '  hunk signs:     ' .. (SignsEnabled() ? 'on' : 'off')
+  echo '  cached buffers: ' .. len(s_blame_cache) .. ' blame, ' .. len(s_hunk_cache) .. ' hunks'
   echo '  pending:        ' .. len(s_pending)
   echo '  last message:   ' .. (s_last_error ==# '' ? '(none)' : s_last_error)
 enddef
