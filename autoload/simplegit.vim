@@ -1,5 +1,6 @@
 vim9script
 
+
 # =============================================================
 # Simplegit — Git superpowers for Vim 9 (blame, history, diff)
 # Rendering stays in Vim9script; every git invocation runs in an
@@ -8,9 +9,6 @@ vim9script
 
 # ----------- Daemon state -----------
 var s_enabled: bool = false
-var s_job: any = v:null
-var s_running: bool = false
-var s_job_generation: number = 0
 var s_next_id: number = 0
 var s_last_error: string = ''
 var s_daemon_version: string = ''
@@ -19,8 +17,6 @@ var s_daemon_ready: bool = false
 var s_daemon_incompatible: bool = false
 # Consecutive daemon starts without a completed handshake; a broken binary
 # must not be respawned on every request.
-var s_failed_starts: number = 0
-const MAX_FAILED_STARTS = 5
 
 # Correlate asynchronous replies: id -> {kind, ...context}
 var s_pending: dict<dict<any>> = {}
@@ -133,33 +129,33 @@ enddef
 # Daemon lifecycle (JSON lines over stdin/stdout)
 # =============================================================
 def FindDaemon(): string
-  var override = get(g:, 'simplegit_daemon_path', '')
-  if type(override) == v:t_string && override !=# '' && executable(override)
-    return override
+  SetupCore()
+  return simplegit#core#FindExe()
+enddef
+
+# The supervisor owns the process: liveness via job_status, generation-guarded
+# callbacks, exponential-backoff restarts and a crash-loop breaker.  This file
+# keeps only the protocol handshake and the request bookkeeping.
+var s_core_ready: bool = false
+
+def SetupCore()
+  if s_core_ready
+    return
   endif
-  var names = IsWin() ? ['lib/simplegit-daemon.exe', 'lib/simplegit-daemon']
-        \ : ['lib/simplegit-daemon']
-  for name in names
-    for p in globpath(&runtimepath, name, false, true)
-      if executable(p)
-        return p
-      endif
-    endfor
-  endfor
-  return ''
+  s_core_ready = true
+  simplegit#core#Setup({
+    name: 'SimpleGit',
+    exe: 'simplegit-daemon',
+    path_var: 'simplegit_daemon_path',
+    debug_var: 'simplegit_debug',
+    handshake: {request: {type: 'version'}, reply_type: 'version', proto_key: 'protocol'},
+    OnEvent: OnDaemonEvent,
+    OnExit: OnDaemonExit,
+  })
 enddef
 
 def SendRaw(req: dict<any>): bool
-  if !s_running || s_job == v:null
-    return false
-  endif
-  try
-    ch_sendraw(s_job, json_encode(req) .. "\n")
-    return true
-  catch
-    DebugLog('failed to send daemon request: ' .. v:exception)
-    return false
-  endtry
+  return simplegit#core#Send(req)
 enddef
 
 def NextId(): number
@@ -174,77 +170,28 @@ def ClearPending()
   s_hunk_inflight = {}
 enddef
 
+def OnDaemonExit(code: number, restarting: bool)
+  s_daemon_ready = false
+  s_daemon_protocol = 0
+  s_daemon_version = ''
+  ClearPending()
+enddef
+
 def StartDaemon(): bool
-  if s_running && s_job != v:null
-    try
-      if job_status(s_job) ==# 'run'
-        return true
-      endif
-    catch
-    endtry
+  SetupCore()
+  if simplegit#core#IsRunning()
+    return true
   endif
-  if s_failed_starts >= MAX_FAILED_STARTS
-    DebugLog('daemon failed ' .. s_failed_starts
-      .. ' times; run ./install.sh, then :SimpleGitEnable to retry')
-    return false
-  endif
-  var cmd = FindDaemon()
-  if cmd ==# '' || !executable(cmd)
-    DebugLog('daemon not found; run ./install.sh or set g:simplegit_daemon_path')
-    return false
-  endif
-  s_job_generation += 1
-  var generation = s_job_generation
-  try
-    s_job = job_start([cmd], {
-      in_io: 'pipe',
-      out_mode: 'nl',
-      out_cb: (ch, line) => {
-        if generation == s_job_generation
-          OnDaemonLine(line)
-        endif
-      },
-      err_mode: 'nl',
-      err_cb: (ch, line) => {
-        if generation == s_job_generation && line !=# ''
-          DebugLog('daemon stderr: ' .. line)
-        endif
-      },
-      exit_cb: (ch, code) => {
-        if generation == s_job_generation
-          if !s_daemon_ready
-            s_failed_starts += 1
-          endif
-          s_running = false
-          s_job = v:null
-          ClearPending()
-          if code != 0
-            DebugLog('daemon exited with code ' .. code)
-          endif
-        endif
-      },
-      stoponexit: 'term'
-    })
-    s_running = s_job != v:null && job_status(s_job) ==# 'run'
-    if s_running
-      s_last_error = ''
-      s_daemon_version = ''
-      s_daemon_protocol = 0
-      s_daemon_ready = false
-      s_daemon_incompatible = false
-      SendRaw({type: 'version', id: 0})
-    endif
-  catch
-    s_job = v:null
-    s_running = false
-    DebugLog('failed to start daemon: ' .. v:exception)
-  endtry
-  return s_running
+  s_daemon_ready = false
+  s_daemon_incompatible = false
+  s_daemon_version = ''
+  s_daemon_protocol = 0
+  return simplegit#core#Ensure()
 enddef
 
 # Send a request; queue it while the handshake is still in flight.
 def Dispatch(req: dict<any>, ctx: dict<any>): bool
-  if !s_running && !StartDaemon()
+  if !simplegit#core#IsRunning() && !StartDaemon()
     return false
   endif
   if s_daemon_incompatible
@@ -285,18 +232,8 @@ def TakePending(id: number): dict<any>
   return remove(s_pending, key)
 enddef
 
-def OnDaemonLine(line: string)
-  if line ==# ''
-    return
-  endif
-  var ev: any
-  try
-    ev = json_decode(line)
-  catch
-    DebugLog('invalid daemon response: ' .. line)
-    return
-  endtry
-  if type(ev) != v:t_dict || type(get(ev, 'type', v:null)) != v:t_string
+def OnDaemonEvent(ev: dict<any>)
+  if type(get(ev, 'type', v:null)) != v:t_string
     DebugLog('malformed daemon response')
     return
   endif
@@ -344,11 +281,11 @@ def OnDaemonLine(line: string)
 enddef
 
 def OnVersion(ev: dict<any>)
-  var id = get(ev, 'id', -1)
+  # The id is assigned by the supervisor, which has already correlated this
+  # reply to its handshake request; only the payload still needs validating.
   var version = get(ev, 'version', '')
   var protocol = get(ev, 'protocol', 0)
-  if type(id) == v:t_number && id == 0 && type(version) == v:t_string
-        \ && version !=# '' && type(protocol) == v:t_number
+  if type(version) == v:t_string && version !=# '' && type(protocol) == v:t_number
     s_daemon_version = version
     s_daemon_protocol = protocol
     if protocol != 4
@@ -359,7 +296,6 @@ def OnVersion(ev: dict<any>)
     else
       s_daemon_ready = true
       s_daemon_incompatible = false
-      s_failed_starts = 0
       s_last_error = ''
       FlushWaitQueue()
     endif
@@ -1704,7 +1640,8 @@ export def Enable()
   s_line_blame_on = ConfBool('simplegit_line_blame', true)
   s_signs_on = ConfBool('simplegit_signs', true)
   # Manual enable is the escape hatch after repeated daemon failures.
-  s_failed_starts = 0
+  SetupCore()
+  simplegit#core#ClearBreaker()
   StartDaemon()
   ScheduleLineBlame()
   RefreshHunks()
@@ -1731,18 +1668,26 @@ export def Disable()
 enddef
 
 export def Stop()
-  if s_job != v:null
-    try
-      job_stop(s_job)
-    catch
-    endtry
-  endif
-  s_job = v:null
-  s_running = false
+  SetupCore()
+  simplegit#core#Stop()
   s_daemon_ready = false
   ClearPending()
   s_blame_cache = {}
   s_hunk_cache = {}
+enddef
+
+export def Restart()
+  SetupCore()
+  s_daemon_ready = false
+  s_daemon_incompatible = false
+  ClearPending()
+  if simplegit#core#Restart()
+    echom '[SimpleGit] daemon restarted'
+  endif
+enddef
+
+export def ShowLog()
+  simplegit#core#ShowLog()
 enddef
 
 export def Toggle()
@@ -1754,13 +1699,15 @@ export def Toggle()
 enddef
 
 export def Health()
-  var daemon = FindDaemon()
+  SetupCore()
+  var h = simplegit#core#Health()
   echo '[SimpleGit] health'
   echo '  enabled:        ' .. (s_enabled ? 'yes' : 'no')
-  echo '  daemon binary:  ' .. (daemon ==# '' ? '(not found — run ./install.sh)' : daemon)
-  echo '  daemon running: ' .. (s_running ? 'yes' : 'no')
+  echo '  daemon binary:  ' .. (h.exe_path ==# '' ? '(not found — run ./install.sh)' : h.exe_path)
+  echo '  daemon running: ' .. (h.running ? 'yes' : 'no')
   echo '  daemon version: ' .. (s_daemon_version ==# '' ? 'unknown' : s_daemon_version)
         .. '/' .. s_daemon_protocol
+        .. (s_daemon_incompatible ? ' (INCOMPATIBLE — rerun ./install.sh)' : '')
   echo '  virtual text:   ' .. (VirtualTextSupported() ? 'supported' : 'unsupported (needs Vim 9.0.0067+)')
   echo '  popups:         ' .. (has('popupwin') ? 'supported' : 'unsupported')
   echo '  line blame:     ' .. (s_line_blame_on ? 'on' : 'off')
@@ -1769,7 +1716,8 @@ export def Health()
         .. ConfNum('simplegit_hunk_delay', 300) .. 'ms debounce'
   echo '  cached buffers: ' .. len(s_blame_cache) .. ' blame, ' .. len(s_hunk_cache) .. ' hunks'
   echo '  pending:        ' .. len(s_pending)
-  echo '  failed starts:  ' .. s_failed_starts
+  echo '  crashes:        ' .. h.crashes .. ' (restarts: ' .. h.restarts .. ')'
+        .. (h.breaker_open ? ' — auto-restart disabled, run :SimpleGitRestart' : '')
   echo '  last message:   ' .. (s_last_error ==# '' ? '(none)' : s_last_error)
 enddef
 

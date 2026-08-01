@@ -1,3 +1,8 @@
 /target
 /lib
 /doc/tags
+
+# Artifacts written by the vendored simplecore test suite on failure.
+tests/*-errors.log
+tests/*divergence.log
+tests/core-not-executable

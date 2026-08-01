@@ -81,6 +81,8 @@ command! SimpleGitHunkPreview simplegit#HunkPreview()
 command! SimpleGitHunkStage simplegit#HunkStage()
 command! SimpleGitHunkUndo simplegit#HunkUndo()
 command! SimpleGitToggleSigns simplegit#ToggleSigns()
+command! SimpleGitRestart simplegit#Restart()
+command! SimpleGitDaemonLog simplegit#ShowLog()
 
 # =============================================================
 # Mappings

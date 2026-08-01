@@ -32,7 +32,13 @@ jobs:
           ./install.sh
           response="$(printf '%s\n' '{"type":"version","id":1}' | ./lib/simplegit-daemon)"
           grep -F '"type":"version"' <<<"$response"
-          grep -F '"protocol":1' <<<"$response"
+          grep -F '"protocol":4' <<<"$response"
 
       - name: Run Vim integration test against the built daemon
         run: make vim-integration
+
+      - name: Compile every Vim9 def (lazy compilation hides cold-branch errors)
+        run: make defcompile
+
+      - name: simplecore supervisor regression suite
+        run: make vim-core
