@@ -233,7 +233,6 @@ What it guarantees:
 - Requests are correlated to replies by id and can time out, so a wedged
   daemon never leaves a callback hanging.
 
-                                                      *:SimpleGitHealth*
 :SimpleGitHealth
         Report daemon path, run state, negotiated protocol and capabilities,
         uptime, crash and restart counts, and whether the crash-loop breaker

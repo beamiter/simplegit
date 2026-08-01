@@ -2,6 +2,11 @@
 
 ## Unreleased - 2026-08-01
 
+### 构建与 CI 修复
+
+- 修复 `doc/simplegit.txt` 中重复的 help tag(`:SimpleGitHealth`),`helptags` 会因此报错并让 `install.sh` 失败。
+- 新增 CI 的 MSRV 作业。
+
 ### 修复
 
 - CI 仍在断言 `"protocol":1`,而 0.5.0 起 daemon 报告的是 4——这条流水线自协议
