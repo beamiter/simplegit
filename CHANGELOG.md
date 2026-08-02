@@ -2,6 +2,29 @@
 
 ## Unreleased - 2026-08-01
 
+### 新增:提交
+
+- `:SimpleGitCommit` / `:SimpleGitCommit!`(amend):在 scratch buffer 里写提交信息,
+  `:w` 提交、`q` 放弃;以 `#` 开头的行会被剥掉,底部的帮助文字不会混进 message。
+- 提交信息走 daemon 的 stdin 而不是命令行参数,空行、引号、非 ASCII 都原样保留。
+- `--amend` 会先取回上一条 message 预填,是"编辑"而不是"悄悄替换"。
+- 状态窗口内 `c` 提交、`C` amend。
+- 协议升到 5:新增 `commit` 与 `commit_message` 请求。升级后请重新运行
+  `./install.sh`,让 Vim 侧与 daemon 保持一致。
+
+### 修复
+
+- daemon 现在接受数字形式的布尔值。Vim 的 `<bang>0` 与多数选项读出来都是 0/1,
+  `json_encode()` 会原样写成 `0`,而 serde 的 `bool` 直接拒收整个请求。
+- 从 scratch 窗口(状态视图)发起提交会认错仓库:那些窗口没有文件名,
+  `expand('%:p:h')` 不是目录,于是回退到 `getcwd()`——提交会落到 Vim 启动时所在的
+  仓库,而不是状态视图正在显示的那个。而 `c` 正是提交的主要入口。现在优先使用
+  buffer 自己记录的仓库目录。
+- 新增 `tests/vim_commit.vim`:在临时仓库里跑真实的 `git commit`,覆盖带正文的
+  message、注释剥离、空 message 不提交且不丢内容、amend 预填与不新增提交,以及
+  从状态窗口提交必须落在正确的仓库。测试全程 `cd` 到一个诱饵仓库,既能真正暴露
+  "回退到 getcwd()" 的错误,又保证插件出错时也伤不到被测仓库本身。
+
 ### 构建与 CI 修复
 
 - 修复 `doc/simplegit.txt` 中重复的 help tag(`:SimpleGitHealth`),`helptags` 会因此报错并让 `install.sh` 失败。

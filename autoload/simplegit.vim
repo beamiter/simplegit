@@ -277,6 +277,10 @@ def OnDaemonEvent(ev: dict<any>)
     OnHunkOp(ctx, ev)
   elseif ev.type ==# 'file_op'
     OnFileOp(ctx, ev)
+  elseif ev.type ==# 'commit'
+    OnCommit(ctx, ev)
+  elseif ev.type ==# 'commit_message'
+    OnCommitMessage(ctx, ev)
   endif
 enddef
 
@@ -288,7 +292,7 @@ def OnVersion(ev: dict<any>)
   if type(version) == v:t_string && version !=# '' && type(protocol) == v:t_number
     s_daemon_version = version
     s_daemon_protocol = protocol
-    if protocol != 4
+    if protocol != 5
       s_daemon_ready = false
       s_daemon_incompatible = true
       s_wait_queue = []
@@ -1557,6 +1561,8 @@ def OnStatus(ctx: dict<any>, ev: dict<any>)
   nnoremap <silent><buffer> a <ScriptCmd>StatusFileOp('add')<CR>
   nnoremap <silent><buffer> u <ScriptCmd>StatusFileOp('reset')<CR>
   nnoremap <silent><buffer> R <ScriptCmd>StatusRefresh()<CR>
+  nnoremap <silent><buffer> c <ScriptCmd>Commit(false)<CR>
+  nnoremap <silent><buffer> C <ScriptCmd>Commit(true)<CR>
   execute ':' .. min([max([get(ctx, 'lnum', 1), 1]), line('$')])
 enddef
 
@@ -1579,6 +1585,159 @@ def StatusFileOp(op: string)
   if !Dispatch({type: 'file_op', path: dir, op: op, file: paths[lnum - 1]},
       {kind: 'file_op', interactive: true, dir: dir, lnum: lnum})
     Warn('daemon unavailable')
+  endif
+enddef
+
+# =============================================================
+# Commit
+#
+# The message is composed in a scratch buffer and sent over the daemon's stdin,
+# so it may contain anything -- newlines, quotes, non-ASCII -- without shell
+# quoting. Comment lines are stripped by `git commit --cleanup=strip`, matching
+# what git's own editor flow does.
+# =============================================================
+
+const COMMIT_BUF = 'simplegit://commit'
+
+# Which repository a commit belongs to.  The scratch windows this plugin opens
+# (status, commit) have no file name, so expand('%:p:h') on them is not a
+# directory and would silently fall through to getcwd() -- committing in
+# whatever repository Vim happens to be started in rather than the one the
+# status view is showing.  Those buffers record their own directory, so prefer
+# it; :SimpleGitCommit bound to `c` in the status window depends on this.
+def CommitRepoDir(): string
+  var owned = get(b:, 'simplegit_dir', '')
+  if type(owned) == v:t_string && owned !=# '' && isdirectory(owned)
+    return owned
+  endif
+  var dir = expand('%:p:h')
+  if dir ==# '' || !isdirectory(dir)
+    dir = getcwd()
+  endif
+  return dir
+enddef
+
+def CommitHelpLines(dir: string, amend: bool): list<string>
+  var lines = [
+    '',
+    '# Write the commit message above, then :w to commit or :q to abort.',
+    '#',
+    '# Lines starting with # are ignored.',
+  ]
+  if amend
+    lines->add('# This REWRITES the previous commit (git commit --amend).')
+  endif
+  lines->add('#')
+  return lines
+enddef
+
+export def Commit(amend: bool = false)
+  var dir = CommitRepoDir()
+  if !StartDaemon()
+    Warn('daemon unavailable; run ./install.sh')
+    return
+  endif
+
+  OpenScratch(COMMIT_BUF, 12)
+  setlocal buftype=acwrite modifiable
+  setlocal filetype=gitcommit
+
+  var body = CommitHelpLines(dir, amend)
+  # Amending starts from the existing message so it can be edited rather than
+  # retyped; it is fetched asynchronously and prepended when it arrives.
+  setline(1, body)
+  b:simplegit_dir = dir
+  b:simplegit_amend = amend
+  normal! gg
+
+  # :w commits. This is the muscle memory from git's own editor, and it keeps
+  # the buffer from ever being written to disk.
+  augroup SimpleGitCommitBuf
+    autocmd! * <buffer>
+    autocmd BufWriteCmd <buffer> CommitFinish()
+  augroup END
+  nnoremap <silent><buffer> q <Cmd>call <SID>CommitAbort()<CR>
+
+  if amend
+    # Fetched asynchronously and prepended when it arrives, so amending edits
+    # the existing message instead of silently replacing it.
+    Dispatch({type: 'commit_message', path: dir},
+      {kind: 'commit_message', interactive: false, dir: dir})
+  endif
+  startinsert
+enddef
+
+def CommitAbort()
+  setlocal nomodified
+  close
+  echo '[SimpleGit] commit aborted'
+enddef
+
+def CommitFinish()
+  var dir = get(b:, 'simplegit_dir', getcwd())
+  var amend = get(b:, 'simplegit_amend', false)
+  var message: list<string> = []
+  for line in getline(1, '$')
+    if line !~# '^#'
+      message->add(line)
+    endif
+  endfor
+  var text = trim(join(message, "\n"))
+  if text ==# ''
+    Warn('empty commit message; nothing committed')
+    return
+  endif
+  setlocal nomodified
+  # Force a real boolean: the command passes <bang>0, which is a number, and
+  # json_encode() would put 0 on the wire where the daemon expects false.
+  if !Dispatch({type: 'commit', path: dir, message: text, amend: amend ? true : false},
+      {kind: 'commit', interactive: true, dir: dir})
+    Warn('daemon unavailable')
+  endif
+enddef
+
+def OnCommitMessage(ctx: dict<any>, ev: dict<any>)
+  var lines = get(ev, 'lines', [])
+  if type(lines) != v:t_list || empty(lines)
+    return
+  endif
+  # The buffer may have been closed, or the user may already have started
+  # typing; in either case leave what is there alone.
+  var bufnr = bufnr(COMMIT_BUF)
+  if bufnr <= 0 || !bufexists(bufnr)
+    return
+  endif
+  var existing = getbufline(bufnr, 1, '$')
+  var typed = filter(copy(existing), (_, l) => l !~# '^#' && trim(l) !=# '')
+  if !empty(typed)
+    return
+  endif
+  var body: list<string> = []
+  for l in lines
+    body->add(type(l) == v:t_string ? l : string(l))
+  endfor
+  setbufline(bufnr, 1, body + existing)
+enddef
+
+def OnCommit(ctx: dict<any>, ev: dict<any>)
+  var sha = get(ev, 'sha', '')
+  var subject = get(ev, 'subject', '')
+  # Close the message buffer only once git has actually accepted the commit,
+  # so a rejected message is never lost.
+  for win in getwininfo()
+    if bufname(win.bufnr) ==# COMMIT_BUF
+      win_gotoid(win.winid)
+      setlocal nomodified
+      close
+      break
+    endif
+  endfor
+  OnExternalChange()
+  echo printf('[SimpleGit] committed %s %s', sha, subject)
+  var dir = get(ctx, 'dir', '')
+  if dir !=# ''
+    Dispatch({type: 'status', path: dir},
+      {kind: 'status', interactive: false, dir: dir, lnum: 1})
   endif
 enddef
 

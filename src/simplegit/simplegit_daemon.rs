@@ -18,7 +18,7 @@ const MAX_CONTENT_BYTES: usize = 2 * 1024 * 1024;
 // Keep enough headroom for the envelope and a maximum-width u64 request ID.
 const MAX_REQUEST_LINE_BYTES: usize = (MAX_REQUEST_PATH_BYTES + MAX_CONTENT_BYTES) * 6 + 1024;
 const MAX_OUTPUT_LINES: usize = 200_000;
-const PROTOCOL_VERSION: u32 = 4;
+const PROTOCOL_VERSION: u32 = 5;
 const GIT_REPOSITORY_ENV_VARS: [&str; 8] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -94,6 +94,23 @@ enum Request {
         path: String,
         op: String,
         file: String,
+    },
+    /// The full message of HEAD, used to pre-fill an amend so the user edits
+    /// the existing message instead of retyping it.
+    #[serde(rename = "commit_message")]
+    CommitMessage { id: u64, path: String },
+    /// Commit what is staged. The message arrives over stdin rather than as an
+    /// argv entry, so it can contain newlines and needs no shell quoting.
+    #[serde(rename = "commit")]
+    Commit {
+        id: u64,
+        path: String,
+        message: String,
+        /// Vim has no distinct boolean in many contexts -- `<bang>0` and most
+        /// option reads produce 0 or 1 -- so accept a number here as well as a
+        /// JSON boolean rather than rejecting the whole request.
+        #[serde(default, deserialize_with = "lenient_bool")]
+        amend: bool,
     },
 }
 
@@ -196,6 +213,23 @@ enum Event {
     },
     #[serde(rename = "file_op")]
     FileOp { id: u64, op: String, path: String },
+    #[serde(rename = "commit_message")]
+    CommitMessage {
+        id: u64,
+        path: String,
+        lines: Vec<String>,
+    },
+    #[serde(rename = "commit")]
+    Commit {
+        id: u64,
+        path: String,
+        /// Short sha of the new commit.
+        sha: String,
+        subject: String,
+        /// git's own summary line, shown verbatim so the user sees exactly
+        /// what git reported.
+        summary: String,
+    },
     #[serde(rename = "error")]
     Error { id: u64, message: String },
 }
@@ -223,6 +257,22 @@ async fn send_event(out: &EventTx, evt: &Event) {
 // ---------------------------------------------------------------------------
 // Git plumbing
 // ---------------------------------------------------------------------------
+
+/// Accept `true`/`false`, `0`/`1`, or a missing field. The Vim side routinely
+/// has numeric booleans, and a type error there would fail an entire request
+/// for a flag that is merely off.
+fn lenient_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Bool(value) => value,
+        serde_json::Value::Number(value) => value.as_i64().unwrap_or(0) != 0,
+        serde_json::Value::Null => false,
+        _ => false,
+    })
+}
 
 fn file_dir(path: &str) -> PathBuf {
     let path = Path::new(path);
@@ -966,6 +1016,75 @@ async fn handle_file_op(
     }
 }
 
+async fn handle_commit_message(id: u64, path: String, tx: EventTx, _permit: OwnedSemaphorePermit) {
+    let dir = file_dir(&path);
+    match run_git(&dir, &["log", "-1", "--pretty=%B"]).await {
+        Ok(text) => {
+            let lines = text
+                .trim_end()
+                .lines()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>();
+            send_event(&tx, &Event::CommitMessage { id, path, lines }).await
+        }
+        Err(message) => send_event(&tx, &Event::Error { id, message }).await,
+    }
+}
+
+async fn handle_commit(
+    id: u64,
+    path: String,
+    message: String,
+    amend: bool,
+    tx: EventTx,
+    _permit: OwnedSemaphorePermit,
+) {
+    let dir = file_dir(&path);
+    let result = async {
+        if message.trim().is_empty() {
+            return Err("empty commit message; nothing committed".to_string());
+        }
+        // -F - reads the message from stdin, so newlines and quotes survive
+        // untouched. --cleanup=strip drops comment lines and trailing blanks
+        // the same way git's own editor flow does.
+        let mut args: Vec<&str> = vec!["commit", "--cleanup=strip", "-F", "-"];
+        if amend {
+            args.push("--amend");
+        }
+        let summary = run_git_with_input(&dir, &args, message).await?;
+
+        // Report what actually landed rather than echoing back the request.
+        let sha = run_git(&dir, &["rev-parse", "--short", "HEAD"])
+            .await
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let subject = run_git(&dir, &["log", "-1", "--pretty=%s"])
+            .await
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        Ok((sha, subject, summary.trim().to_string()))
+    }
+    .await;
+    match result {
+        Ok((sha, subject, summary)) => {
+            send_event(
+                &tx,
+                &Event::Commit {
+                    id,
+                    path,
+                    sha,
+                    subject,
+                    summary,
+                },
+            )
+            .await
+        }
+        Err(message) => send_event(&tx, &Event::Error { id, message }).await,
+    }
+}
+
 async fn handle_hunk_op(
     id: u64,
     path: String,
@@ -1111,6 +1230,8 @@ fn request_id_and_path(req: &Request) -> (u64, Option<&str>) {
         Request::Stage { id, path, .. } => (*id, Some(path)),
         Request::Undo { id, path, .. } => (*id, Some(path)),
         Request::FileOp { id, path, .. } => (*id, Some(path)),
+        Request::Commit { id, path, .. } => (*id, Some(path)),
+        Request::CommitMessage { id, path } => (*id, Some(path)),
     }
 }
 
@@ -1240,6 +1361,21 @@ where
                 let tx = out_tx.clone();
                 let permit = git_limiter.clone().acquire_owned().await.unwrap();
                 requests.spawn(handle_file_op(id, path, op, file, tx, permit));
+            }
+            Request::CommitMessage { id, path } => {
+                let tx = out_tx.clone();
+                let permit = git_limiter.clone().acquire_owned().await.unwrap();
+                requests.spawn(handle_commit_message(id, path, tx, permit));
+            }
+            Request::Commit {
+                id,
+                path,
+                message,
+                amend,
+            } => {
+                let tx = out_tx.clone();
+                let permit = git_limiter.clone().acquire_owned().await.unwrap();
+                requests.spawn(handle_commit(id, path, message, amend, tx, permit));
             }
         }
     }
@@ -1380,7 +1516,7 @@ u UU N... 100644 100644 100644 100644 aaaa bbbb cccc conflict.rs\n\
             .unwrap();
         daemon.await.unwrap().unwrap();
         assert!(response.contains("\"type\":\"version\""));
-        assert!(response.contains("\"protocol\":4"));
+        assert!(response.contains("\"protocol\":5"));
     }
 
     const DIFF_FIXTURE: &str = "\

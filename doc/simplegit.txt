@@ -73,7 +73,18 @@ COMMANDS                                                      *simplegit-command
 :SimpleGitStatus                                              *:SimpleGitStatus*
   Show the repository branch and changed files. Inside the window: <CR>
   opens the file, `d` opens it and diffs it against HEAD, `a` stages it,
-  `u` unstages it, `R` refreshes the list, `q` closes.
+  `u` unstages it, `c` commits, `C` amends, `R` refreshes the list, `q`
+  closes. A commit started here uses the repository the status view is
+  showing, not the current working directory.
+
+:SimpleGitCommit[!]                                           *:SimpleGitCommit*
+  Commit what is staged. Opens a scratch buffer for the message; `:w`
+  commits and `q` aborts. Lines starting with # are stripped, so the help
+  text at the bottom never reaches the message. The message travels over the
+  daemon's stdin rather than as a command-line argument, so blank lines,
+  quotes and non-ASCII survive intact.
+  With [!] the previous commit is amended; its existing message is fetched
+  and pre-filled, so amending edits the message rather than replacing it.
 
 :SimpleGitHunkNext                                          *:SimpleGitHunkNext*
 :SimpleGitHunkPrev                                          *:SimpleGitHunkPrev*

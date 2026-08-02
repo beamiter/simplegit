@@ -81,6 +81,7 @@ command! SimpleGitHunkPreview simplegit#HunkPreview()
 command! SimpleGitHunkStage simplegit#HunkStage()
 command! SimpleGitHunkUndo simplegit#HunkUndo()
 command! SimpleGitToggleSigns simplegit#ToggleSigns()
+command! -bang SimpleGitCommit simplegit#Commit(<bang>0)
 command! SimpleGitRestart simplegit#Restart()
 command! SimpleGitDaemonLog simplegit#ShowLog()
 

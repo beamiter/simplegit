@@ -50,6 +50,12 @@ jobs:
       - name: Run Vim integration test against the built daemon
         run: make vim-integration
 
+      - name: Commit flow end to end
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name CI
+          make vim-commit
+
       - name: Compile every Vim9 def (lazy compilation hides cold-branch errors)
         run: make defcompile
 
