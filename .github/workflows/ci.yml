@@ -45,7 +45,12 @@ jobs:
           ./install.sh
           response="$(printf '%s\n' '{"type":"version","id":1}' | ./lib/simplegit-daemon)"
           grep -F '"type":"version"' <<<"$response"
-          grep -F '"protocol":4' <<<"$response"
+          # Read the expected version from the source rather than hardcoding it;
+          # this assertion has silently drifted behind two protocol bumps.
+          expected="$(sed -n 's/^const PROTOCOL_VERSION: u32 = \([0-9]*\);/\1/p' \
+            src/simplegit/simplegit_daemon.rs)"
+          test -n "$expected"
+          grep -F "\"protocol\":$expected" <<<"$response"
 
       - name: Run Vim integration test against the built daemon
         run: make vim-integration
