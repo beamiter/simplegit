@@ -2,7 +2,7 @@
 name = "simplegit"
 version = "0.5.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Asynchronous Git daemon powering the simplegit Vim plugin (blame, history, diff, status)"
 repository = "https://github.com/beamiter/simplegit"
 readme = "README.md"

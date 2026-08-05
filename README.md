@@ -21,7 +21,7 @@ Like the other `simple*` plugins, rendering stays in Vim9script and all git work
 
 - Vim 9.1 with `+vim9script`, `+job`, `+channel`.
 - Virtual text (patch 9.0.0067+) for the inline annotation; `+popupwin` for popups; `+timers` for debouncing. Everything else degrades gracefully.
-- Git, and Rust/Cargo 1.85 or newer to build the daemon.
+- Git, and Rust/Cargo 1.88 or newer to build the daemon.
 
 Simplegit is Vim9-only. Neovim does not implement Vim9script or Vim's job/channel API, so it is not supported by this plugin.
 
