@@ -40,6 +40,10 @@ var s_hunk_inflight: dict<bool> = {}
 # Buffers that changed again while a hunks request was in flight.
 var s_hunk_stale: dict<bool> = {}
 var s_hunk_timer: number = 0
+var s_status_refresh_timer: number = 0
+var s_status_refresh_forced: bool = false
+var s_status_refresh_repo_filter: string = ''
+var s_status_refresh_excluded_repos: dict<bool> = {}
 var s_signs_on: bool = true
 var s_signs_defined: bool = false
 var s_commit_generation: number = 0
@@ -553,10 +557,10 @@ export def OnBufClose(bufnr: number)
   InvalidateHunks(bufnr)
 enddef
 
-# External git commands (commits, checkouts) invalidate blame and hunks
-# silently; a focus regain or shell command is the cheapest signal we get.
-# Every visible file buffer refreshes, not only the current one.
-export def OnExternalChange()
+# Refresh every visible file buffer after Git changes, not only the current
+# one. Mutation callbacks share this without inheriting FocusGained's status
+# auto-refresh policy.
+def RefreshVisibleGitState()
   if !s_enabled
     return
   endif
@@ -569,6 +573,22 @@ export def OnExternalChange()
     RequestHunks(win.bufnr, 'signs', false)
   endfor
   ScheduleLineBlame()
+enddef
+
+# External git commands (commits, checkouts) invalidate blame and hunks
+# silently; a focus regain or shell command is the cheapest signal we get.
+export def OnExternalChange()
+  # Disable is a hard lifecycle boundary: a leftover status scratch must not
+  # restart the daemon on the next FocusGained.
+  if !s_enabled
+    return
+  endif
+  if ConfBool('simplegit_status_auto_refresh', true) && HasOpenStatus()
+    ScheduleStatusRefresh()
+  elseif !s_status_refresh_forced
+    CancelStatusRefresh()
+  endif
+  RefreshVisibleGitState()
 enddef
 
 export def ToggleLineBlame()
@@ -1583,10 +1603,34 @@ enddef
 # Repository status
 # =============================================================
 def RepoToken(dir: string): string
-  # Keep repository identity independent of a later :cd.  Resolving the true
-  # Git root would itself require a synchronous git process, so the absolute
-  # directory sent to the daemon is the intentionally conservative token.
-  return fnamemodify(dir, ':p')
+  # Match git -C's physical-path semantics without spawning Git on every UI
+  # callback.  The nearest .git directory or gitfile distinguishes ordinary
+  # worktrees, linked worktrees and submodules; a marker-less path keeps the
+  # previous conservative absolute-directory identity.
+  var full = fnamemodify(dir, ':p')
+  if full ==# ''
+    return ''
+  endif
+  var resolved = resolve(full)
+  if !isdirectory(resolved)
+    return fnamemodify(resolved ==# '' ? full : resolved, ':p')
+  endif
+  # :p preserves a trailing separator for directories.  :p:h removes exactly
+  # that separator (while retaining /), so repeated :h calls walk ancestors.
+  var current = fnamemodify(resolved, ':p:h')
+  var fallback = fnamemodify(current, ':p')
+  while current !=# ''
+    var marker = current .. '/.git'
+    if isdirectory(marker) || filereadable(marker)
+      return fnamemodify(current, ':p')
+    endif
+    var parent = fnamemodify(current, ':h')
+    if parent ==# current
+      break
+    endif
+    current = parent
+  endwhile
+  return fallback
 enddef
 
 def RequestContext(kind: string, dir: string, lnum: number): dict<any>
@@ -1621,6 +1665,15 @@ enddef
 
 def InitialStatusContext(dir: string): dict<any>
   var ctx = RequestContext('status', dir, 1)
+  # Explicit opens and in-place refreshes share the target buffer's generation
+  # clock. Reserve the explicit request before it goes on the wire, so any
+  # already-in-flight refresh becomes stale; a later refresh will in turn
+  # advance the same clock and supersede this initial response.
+  var existing = bufnr(STATUS_BUF)
+  if existing > 0 && bufexists(existing)
+    ctx.status_generation_bufnr = existing
+    ctx.status_generation = NextStatusGeneration(existing)
+  endif
   s_status_request_generation += 1
   var request_key = string(ctx.origin_winid) .. ':' .. string(ctx.origin_bufnr)
         .. ':' .. ctx.repo_token
@@ -1682,6 +1735,130 @@ def StatusRefreshContext(source: dict<any>, dir: string, lnum: number): dict<any
     status_generation: NextStatusGeneration(bufnr),
   }
   return ctx
+enddef
+
+def CancelStatusRefresh()
+  if s_status_refresh_timer != 0
+    timer_stop(s_status_refresh_timer)
+    s_status_refresh_timer = 0
+  endif
+  s_status_refresh_forced = false
+  s_status_refresh_repo_filter = ''
+  s_status_refresh_excluded_repos = {}
+enddef
+
+def RefreshOpenStatus(repo_filter: string = '', excluded_repos: dict<bool> = {})
+  var seen: dict<bool> = {}
+  for win in getwininfo()
+    if bufname(win.bufnr) !=# STATUS_BUF || has_key(seen, string(win.bufnr))
+      continue
+    endif
+    var dir = getbufvar(win.bufnr, 'simplegit_dir', '')
+    var repo = getbufvar(win.bufnr, 'simplegit_repo_token', '')
+    if type(dir) != v:t_string || dir ==# ''
+          || type(repo) != v:t_string || repo ==# ''
+      continue
+    endif
+    if (repo_filter !=# '' && repo !=# repo_filter)
+          || has_key(excluded_repos, repo)
+      continue
+    endif
+    var source: dict<any> = {
+      origin_tabnr: win.tabnr,
+      origin_winid: win.winid,
+      origin_bufnr: win.bufnr,
+      status_tabnr: win.tabnr,
+      status_winid: win.winid,
+      status_bufnr: win.bufnr,
+      repo_token: repo,
+    }
+    if !ValidStatusTarget(source, dir)
+      continue
+    endif
+    var cursor_pos = getcurpos(win.winid)
+    var refresh_ctx = StatusRefreshContext(source, dir,
+      len(cursor_pos) > 1 ? cursor_pos[1] : 1)
+    if !Dispatch({type: 'status', path: dir}, refresh_ctx)
+      DebugLog('automatic status refresh could not reach daemon')
+    endif
+    seen[string(win.bufnr)] = true
+  endfor
+enddef
+
+# A targeted mutation supersedes a pending refresh only for its own
+# repository.  In particular, keep a global FocusGained/ShellCmdPost timer
+# alive for other open repositories instead of swallowing their invalidation.
+def ExcludePendingStatusRepo(repo: string)
+  if s_status_refresh_timer == 0 || repo ==# ''
+    return
+  endif
+  if s_status_refresh_repo_filter ==# repo
+    # A repository-filtered timer has nothing left to do.
+    CancelStatusRefresh()
+  elseif s_status_refresh_repo_filter ==# ''
+    s_status_refresh_excluded_repos[repo] = true
+  endif
+enddef
+
+def RunScheduledStatusRefresh(force: bool, repo_filter: string, timer: number)
+  # A stopped/replaced timer must not clear the replacement's state.
+  if timer != s_status_refresh_timer
+    return
+  endif
+  var excluded_repos = copy(s_status_refresh_excluded_repos)
+  s_status_refresh_timer = 0
+  s_status_refresh_forced = false
+  s_status_refresh_repo_filter = ''
+  s_status_refresh_excluded_repos = {}
+  if force || (s_enabled && ConfBool('simplegit_status_auto_refresh', true))
+    RefreshOpenStatus(repo_filter, excluded_repos)
+  endif
+enddef
+
+def ScheduleStatusRefresh(force: bool = false, repo_filter: string = '')
+  CancelStatusRefresh()
+  if !force && (!s_enabled || !ConfBool('simplegit_status_auto_refresh', true))
+    return
+  endif
+  if !has('timers')
+    RefreshOpenStatus(repo_filter)
+    return
+  endif
+  s_status_refresh_forced = force
+  s_status_refresh_repo_filter = repo_filter
+  s_status_refresh_excluded_repos = {}
+  s_status_refresh_timer = timer_start(
+    ConfNum('simplegit_status_refresh_delay', 150),
+    (timer) => RunScheduledStatusRefresh(force, repo_filter, timer))
+enddef
+
+def HasOpenStatus(repo_filter: string = ''): bool
+  for win in getwininfo()
+    if bufname(win.bufnr) ==# STATUS_BUF
+          && (repo_filter ==# ''
+            || getbufvar(win.bufnr, 'simplegit_repo_token', '') ==# repo_filter)
+      return true
+    endif
+  endfor
+  return false
+enddef
+
+# Plugin mutations refresh their exact initiating status view immediately.
+# Commands issued from a normal/commit buffer have no such target, but an
+# independently open status view should still converge once, through the
+# debounced same-repository path.
+def RefreshStatusAfterMutation(ctx: dict<any>, dir: string, lnum: number)
+  if dir !=# '' && ValidStatusTarget(ctx, dir)
+    var refresh_ctx = StatusRefreshContext(ctx, dir, lnum)
+    if Dispatch({type: 'status', path: dir}, refresh_ctx)
+      ExcludePendingStatusRepo(get(ctx, 'repo_token', RepoToken(dir)))
+    endif
+  else
+    var repo = dir ==# '' ? '' : RepoToken(dir)
+    if repo !=# '' && HasOpenStatus(repo)
+      ScheduleStatusRefresh(true, repo)
+    endif
+  endif
 enddef
 
 def ValidStatusEntry(entry: any): bool
@@ -1758,7 +1935,29 @@ def OnStatus(ctx: dict<any>, ev: dict<any>)
     return
   endif
 
-  OpenStatusScratch(height)
+  # Initial and refresh-only requests compete on one buffer generation.  Do
+  # this before OpenStatusScratch(), which may clear or retire the old buffer.
+  var existing_status = bufnr(STATUS_BUF)
+  if existing_status > 0 && bufexists(existing_status)
+    var reserved_bufnr = get(ctx, 'status_generation_bufnr', 0)
+    var response_generation = get(ctx, 'status_generation', 0)
+    if reserved_bufnr != existing_status || response_generation <= 0
+          || getbufvar(existing_status, 'simplegit_status_generation', 0)
+            != response_generation
+      DebugLog('discarded stale initial status response for ' .. dir)
+      return
+    endif
+  endif
+
+  var target_bufnr = OpenStatusScratch(height)
+  var landed_generation = get(ctx, 'status_generation', 0)
+  if landed_generation > 0
+    # Cross-tab replacement may have retired the buffer on which this
+    # generation was reserved. Carry the reservation to its new target.
+    setbufvar(target_bufnr, 'simplegit_status_generation', landed_generation)
+  else
+    NextStatusGeneration(target_bufnr)
+  endif
   setline(1, display)
   setlocal nomodifiable nowrap
   b:simplegit_paths = paths
@@ -1782,6 +1981,7 @@ def OnStatus(ctx: dict<any>, ev: dict<any>)
 enddef
 
 def StatusRefresh(lnum: number = 0)
+  CancelStatusRefresh()
   var dir = get(b:, 'simplegit_dir', getcwd())
   var ctx = RequestContext('status', dir, lnum > 0 ? lnum : line('.'))
   if !has_key(ctx, 'status_winid')
@@ -2034,15 +2234,11 @@ def OnCommit(ctx: dict<any>, ev: dict<any>)
       endtry
     endif
   endfor
-  OnExternalChange()
+  RefreshVisibleGitState()
   echo printf('[SimpleGit] committed %s %s%s', sha, subject,
     message_changed ? ' — newer message text kept open' : '')
   var dir = get(ctx, 'dir', '')
-  if dir !=# '' && ValidStatusTarget(ctx, dir)
-    var refresh_ctx = StatusRefreshContext(ctx, dir, 1)
-    Dispatch({type: 'status', path: dir},
-      refresh_ctx)
-  endif
+  RefreshStatusAfterMutation(ctx, dir, 1)
 enddef
 
 def OnFileOp(ctx: dict<any>, ev: dict<any>)
@@ -2050,14 +2246,9 @@ def OnFileOp(ctx: dict<any>, ev: dict<any>)
   # visible, then re-render only the exact status window it was triggered
   # from.  A top-level command issued in a normal buffer has no status target
   # and therefore never opens one as an asynchronous side effect.
-  OnExternalChange()
+  RefreshVisibleGitState()
   var dir = get(ctx, 'dir', '')
-  if dir ==# '' || !ValidStatusTarget(ctx, dir)
-    return
-  endif
-  var refresh_ctx = StatusRefreshContext(ctx, dir, get(ctx, 'lnum', 1))
-  Dispatch({type: 'status', path: dir},
-    refresh_ctx)
+  RefreshStatusAfterMutation(ctx, dir, get(ctx, 'lnum', 1))
 enddef
 
 def StatusRoot(dir: string): string
@@ -2085,6 +2276,7 @@ def StatusOpen(diff_it: bool)
 enddef
 
 export def Status()
+  CancelStatusRefresh()
   if bufname('%') ==# STATUS_BUF
     StatusRefresh()
     return
@@ -2138,6 +2330,7 @@ export def Disable()
 enddef
 
 export def Stop()
+  CancelStatusRefresh()
   SetupCore()
   simplegit#core#Stop()
   s_daemon_ready = false
@@ -2147,6 +2340,7 @@ export def Stop()
 enddef
 
 export def Restart()
+  CancelStatusRefresh()
   SetupCore()
   s_daemon_ready = false
   s_daemon_incompatible = false
@@ -2188,6 +2382,10 @@ export def Health()
   echo '  hunk signs:     ' .. (SignsEnabled() ? 'on' : 'off')
   echo '  live diff:      up to ' .. ConfNum('simplegit_live_max_bytes', 1024 * 1024) .. ' bytes, '
         .. ConfNum('simplegit_hunk_delay', 300) .. 'ms debounce'
+  echo '  status refresh: ' .. ConfNum('simplegit_status_refresh_delay', 150)
+        .. 'ms debounce, '
+        .. (ConfBool('simplegit_status_auto_refresh', true) ? 'on' : 'off')
+        .. (s_status_refresh_timer != 0 ? ' (pending)' : '')
   echo '  cached buffers: ' .. len(s_blame_cache) .. ' blame, ' .. len(s_hunk_cache) .. ' hunks'
   echo '  pending:        ' .. len(s_pending)
   echo '  crashes:        ' .. h.crashes .. ' (restarts: ' .. h.restarts .. ')'

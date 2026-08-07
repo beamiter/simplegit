@@ -2,6 +2,26 @@
 
 ## Unreleased - 2026-08-05
 
+### Status 自动保鲜
+
+- 已打开的 status view 现在会在 `FocusGained` / `ShellCmdPost` 后自动刷新;
+  `g:simplegit_status_auto_refresh` 默认 1、可显式关闭;
+  `g:simplegit_status_refresh_delay` 默认 150 ms,连续事件合并为一次请求。
+- 自动请求只针对仍存在的 status winid+bufnr+repository,沿用 generation
+  latest-wins;跨 tab 回复只原地更新目标,不会抢走当前 tab/window/buffer。目标在
+  timer 到期前关闭时不发请求、更不会复活窗口。
+- 显式 `:SimpleGitStatus` 与原地 automatic refresh 现在共用 status buffer 的
+  generation:显式请求派发时即预留代际,所以 old-auto→explicit 与
+  explicit→new-auto 两个方向的迟到回复都不能覆盖新结果。repository identity
+  会 resolve symlink 并向上寻找最近的 `.git` directory/gitfile,同 worktree 的
+  sibling 目录可正确汇合,不同仓库仍严格隔离。
+- `R` 立即刷新;有有效 status target 的 file-op/commit 也立即刷新,并只从挂起的
+  全局 timer 排除自己的 repository,不会吞掉其他仓库的外部变更。普通 buffer
+  发起、没有 target 的 mutation 则让同仓库已打开 status 走一次去抖刷新,不会漏更
+  也不会重复查询。`:SimpleGitDisable` 后残留 scratch 不能借 Focus 事件重启 daemon。
+  `:SimpleGitHealth` 显示开关、debounce 与 pending 状态;fake-daemon 回归覆盖 burst、
+  跨 tab、两类 mutation、关闭目标与 Disable 生命周期。
+
 ### 全套统一
 
 - `.simplecore/` 回来了。10 个仓库里的 supervisor(`autoload/<plugin>/core.vim`

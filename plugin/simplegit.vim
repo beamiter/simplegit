@@ -42,6 +42,9 @@ g:simplegit_sign_priority = get(g:, 'simplegit_sign_priority', 10)
 g:simplegit_max_signs = get(g:, 'simplegit_max_signs', 500)
 # Debounce (ms) for the live buffer-vs-index diff while typing.
 g:simplegit_hunk_delay = get(g:, 'simplegit_hunk_delay', 300)
+# Debounce status refreshes triggered by FocusGained/ShellCmdPost.
+g:simplegit_status_auto_refresh = ConfigFlag('simplegit_status_auto_refresh', 1)
+g:simplegit_status_refresh_delay = get(g:, 'simplegit_status_refresh_delay', 150)
 # Buffers above this size fall back to the on-disk diff.
 g:simplegit_live_max_bytes = get(g:, 'simplegit_live_max_bytes', 1024 * 1024)
 g:simplegit_enable_default_mappings = ConfigFlag('simplegit_enable_default_mappings', 1)

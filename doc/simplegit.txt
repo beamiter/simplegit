@@ -77,6 +77,15 @@ COMMANDS                                                   *simplegit-commands*
   whole repository, `c` commits, `C` amends, `R` refreshes the list, `q`
   closes. A commit started here uses the repository the status view is
   showing, not the current working directory.
+  With |g:simplegit_status_auto_refresh| enabled, FocusGained and ShellCmdPost
+  changes are coalesced and refreshed in place after
+  |g:simplegit_status_refresh_delay|. The reply validates the same window,
+  buffer, repository, and generation and never changes the user's current
+  tab/window/buffer. Explicit opens and in-place refreshes advance the same
+  buffer generation, so a late reply of either kind cannot overwrite a newer
+  one. Repository matching resolves symlinks and discovers the nearest `.git`
+  directory or gitfile; sibling directories in one worktree therefore share
+  refreshes, while distinct repositories do not. `R` refreshes immediately.
 
 :SimpleGitStageAll                                   *:SimpleGitStageAll*
 :SimpleGitUnstageAll                               *:SimpleGitUnstageAll*
@@ -195,6 +204,21 @@ g:simplegit_max_signs (default 500)                     *g:simplegit_max_signs*
 
 g:simplegit_hunk_delay (default 300)                   *g:simplegit_hunk_delay*
   Milliseconds of typing rest before the live buffer-vs-index diff runs.
+
+g:simplegit_status_refresh_delay (default 150)
+                                    *g:simplegit_status_refresh_delay*
+  Milliseconds to coalesce FocusGained and ShellCmdPost before refreshing an
+  already-open status view. `R` and repository mutations issued from that
+  status view refresh their exact target immediately and exclude only that
+  repository from a pending global debounce; other repositories retain their
+  scheduled refresh. Same-repository mutations without a target coalesce once.
+
+g:simplegit_status_auto_refresh (default 1)
+                                      *g:simplegit_status_auto_refresh*
+  Refresh an existing status view after FocusGained and ShellCmdPost. Set to
+  0 to disable those automatic reads. Explicit status commands and targeted
+  refreshes after SimpleGit's own mutations remain available; disabling the
+  plugin is always a hard boundary and cannot restart the daemon.
 
 g:simplegit_live_max_bytes (default 1048576)       *g:simplegit_live_max_bytes*
   Buffers larger than this fall back to the on-disk diff until saved.

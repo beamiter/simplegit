@@ -70,6 +70,16 @@ Status is latest-request-wins, including the first asynchronous open. A
 commit message is likewise generation-guarded: a second `:write` is refused
 while the commit is pending, and text typed after the first `:write` is kept
 open for a deliberate follow-up instead of being discarded by the reply.
+While a status view is open, `FocusGained` and `ShellCmdPost` refresh it
+automatically after a 150 ms debounce. Bursts coalesce, only the existing
+window/repository is updated, and an asynchronous reply never changes the
+current tab, window, or buffer. Set `g:simplegit_status_auto_refresh = 0` to
+disable Focus/Shell-driven refreshes, or tune the debounce with
+`g:simplegit_status_refresh_delay`; `R` remains an immediate manual refresh.
+Explicit status opens and in-place refreshes share one buffer generation, so
+their replies are latest-request-wins even when the two kinds race. Repository
+matching resolves symlinks and uses the nearest `.git` directory or gitfile,
+so a mutation from a sibling directory refreshes the same worktree view.
 
 Default mappings (only installed when the keys are free; disable with `let g:simplegit_enable_default_mappings = 0`):
 
@@ -97,6 +107,8 @@ let g:simplegit_log_limit = 200        " commits per :SimpleGitLog page
 let g:simplegit_signs = 1              " sign-column hunk markers
 let g:simplegit_max_signs = 500        " place no signs above this count
 let g:simplegit_hunk_delay = 300       " live-diff debounce while typing (ms)
+let g:simplegit_status_auto_refresh = 1 " refresh open status after Focus/Shell
+let g:simplegit_status_refresh_delay = 150 " external status refresh debounce
 let g:simplegit_live_max_bytes = 1048576 " live-diff buffer size cap
 let g:simplegit_daemon_path = ''       " explicit daemon binary path
 ```
