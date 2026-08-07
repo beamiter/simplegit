@@ -227,6 +227,19 @@ if WaitFor(() => len(PlacedSigns()) > 0, 'hunk signs placed')
     search('sample\.txt')
     execute 'normal u'
     WaitFor(() => Git(sandbox, 'diff --cached') ==# '', 'status u unstages the file')
+
+    # Upper-case actions operate on the whole repository, not only the row or
+    # the subdirectory from which the status view was opened.
+    mkdir(sandbox .. '/nested', 'p')
+    writefile(['top level'], sandbox .. '/bulk-top.txt')
+    writefile(['nested'], sandbox .. '/nested/bulk-nested.txt')
+    execute 'normal A'
+    WaitFor(() => Git(sandbox, 'diff --cached --name-only') =~# 'bulk-top\.txt'
+      && Git(sandbox, 'diff --cached --name-only') =~# 'nested/bulk-nested\.txt',
+      'status A stages the whole repository')
+    execute 'normal U'
+    WaitFor(() => Git(sandbox, 'diff --cached') ==# '',
+      'status U unstages the whole repository')
     # A second :SimpleGitStatus reuses the window instead of stacking splits.
     simplegit#Status()
     sleep 200m

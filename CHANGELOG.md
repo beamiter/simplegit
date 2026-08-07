@@ -35,6 +35,23 @@
 
 - `--version`/`--help`/`--self-test`:此前 daemon 完全忽略命令行参数。
   `--self-test` 用内存管道把一条真实请求走完 parse → dispatch → reply。
+- 状态窗口新增 `A` / `U`,可一次暂存/取消暂存整个仓库;对应命令为
+  `:SimpleGitStageAll` / `:SimpleGitUnstageAll`,并且从子目录调用时范围仍是仓库根。
+- 整仓操作现在通过 protocol 5 的增量 capability `repository_file_ops` 协商。
+  新 Vim 遇到同为 protocol 5、但未声明该能力的旧 daemon 时只拒绝这两个命令并
+  提示重跑 `./install.sh`,不会把未知 op 发上 wire;其他旧功能继续可用。
+- 所有依赖 Git index 的写操作(hunk stage/undo、文件与整仓 stage/reset、commit)
+  进入 daemon 的单一 FIFO 通道,严格按请求顺序完成,不再互相争抢 `index.lock`;
+  blame/log/status 等只读请求仍保持并发。
+- status、file-op 与 commit 的异步结果会记录发起 tab/window/buffer/repository,
+  只定向刷新仍存活且仍属于同一仓库的 status view。用户已切 tab、关掉窗口或把
+  同一窗口用于别的仓库时不会被拉回;初次打开与定向刷新都按代际号 latest-wins。
+- commit message 同样带代际与 changedtick:一次 `:write` 尚未返回时拒绝重复提交;
+  若用户在回复前继续输入,成功回调会保留这段新文字并保持 modified,不会清空/关窗。
+  daemon 输入 I/O 失败时也会先 drain 已排队的 index 操作与输出再返回错误。
+- 新增插件专用 fake daemon 与 Vim 回归测试,覆盖握手前排队到旧 protocol-5 端的
+  fail-closed、跨 tab 不抢焦点、关闭/换仓目标不复活、初次/刷新 status 乱序、
+  commit 后续编辑保留,以及 Rust 端 burst `add`→`reset` 与输入错误 drain。
 
 ### 新增:提交
 

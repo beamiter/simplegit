@@ -82,8 +82,8 @@ function! s:CommitBufWin() abort
   return 0
 endfunction
 
-" A successful commit refreshes the status view, which takes focus. Always
-" re-focus the commit window before touching it rather than assuming.
+" Locate the message view across tabs; asynchronous replies are required to
+" close it in place without changing whatever window is currently focused.
 function! s:FocusCommit() abort
   let l:win = s:CommitBufWin()
   if l:win > 0
@@ -111,10 +111,20 @@ stopinsert
 " second paragraph, which argv-based quoting tends to mangle.
 call setline(1, ['Add tracked file', '', 'The body survives the round trip.'])
 write
+" Move away before the daemon replies. Closing the accepted message in its
+" originating tab must not pull focus back from this new tab.
+tabnew
+let s:away_tab = tabpagenr()
+let s:away_win = win_getid()
+let s:away_buf = bufnr('%')
 " The buffer closing is the completion signal: git records the commit before
 " the daemon's reply reaches Vim, so polling git log alone would race ahead of
 " the reply and leave a pending close to fire during the next section.
 call assert_true(s:Wait('s:CommitBufWin() == 0', 5000), 'the commit completes')
+call assert_equal(s:away_tab, tabpagenr(), 'commit completion preserves the current tab')
+call assert_equal(s:away_win, win_getid(), 'commit completion preserves the current window')
+call assert_equal(s:away_buf, bufnr('%'), 'commit completion preserves the current buffer')
+tabclose
 call assert_true(s:LogCount() >= 1, 'the commit lands')
 
 let s:body = s:Git('log -1 --pretty=%B')

@@ -73,6 +73,8 @@ command! SimpleGitToggleLineBlame simplegit#ToggleLineBlame()
 command! SimpleGitHistory simplegit#History()
 command! SimpleGitLog simplegit#Log()
 command! SimpleGitStatus simplegit#Status()
+command! SimpleGitStageAll simplegit#StageAll()
+command! SimpleGitUnstageAll simplegit#UnstageAll()
 command! -nargs=? SimpleGitDiff simplegit#Diff(<q-args>)
 command! -nargs=? SimpleGitShow simplegit#Show(<q-args>)
 command! SimpleGitHunkNext simplegit#HunkNext()
@@ -94,6 +96,8 @@ nnoremap <silent> <Plug>(simplegit-history) <Cmd>SimpleGitHistory<CR>
 nnoremap <silent> <Plug>(simplegit-log) <Cmd>SimpleGitLog<CR>
 nnoremap <silent> <Plug>(simplegit-diff) <Cmd>SimpleGitDiff<CR>
 nnoremap <silent> <Plug>(simplegit-status) <Cmd>SimpleGitStatus<CR>
+nnoremap <silent> <Plug>(simplegit-stage-all) <Cmd>SimpleGitStageAll<CR>
+nnoremap <silent> <Plug>(simplegit-unstage-all) <Cmd>SimpleGitUnstageAll<CR>
 nnoremap <silent> <Plug>(simplegit-toggle-line-blame) <Cmd>SimpleGitToggleLineBlame<CR>
 nnoremap <silent> <Plug>(simplegit-hunk-next) <Cmd>SimpleGitHunkNext<CR>
 nnoremap <silent> <Plug>(simplegit-hunk-prev) <Cmd>SimpleGitHunkPrev<CR>

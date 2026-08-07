@@ -1,6 +1,6 @@
-.PHONY: check fmt clippy test vim-test vim-integration vim-commit vim-core defcompile core-verify
+.PHONY: check fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-core defcompile core-verify
 
-check: core-verify fmt clippy test vim-test vim-integration vim-commit defcompile vim-core
+check: core-verify fmt clippy test vim-test vim-integration vim-commit vim-file-ops defcompile vim-core
 
 fmt:
 	cargo fmt --all -- --check
@@ -21,6 +21,10 @@ vim-integration:
 # Drives real `git commit` inside throwaway repositories.
 vim-commit:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_commit.vim
+
+# Protocol capability fallback plus tab/window/status generation races.
+vim-file-ops:
+	vim -Nu NONE -n -i NONE -es -S tests/vim_file_ops.vim
 
 # ---------------------------------------------------------------------------
 # simplecore: the vendored daemon supervisor shared by the simple* suite.

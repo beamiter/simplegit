@@ -12,10 +12,10 @@ Like the other `simple*` plugins, rendering stays in Vim9script and all git work
 - **Commit graph** (`:SimpleGitLog`): repository-wide `git log --graph` with branch topology, refs and dates; `<CR>` shows the commit under the cursor, `m` loads more commits.
 - **Diff against a revision** (`:SimpleGitDiff [rev]`): vertical `diffthis` split of the working file against HEAD or any revision.
 - **Commit inspection** (`:SimpleGitShow [rev]`): message, stats and patch with `git` syntax highlighting.
-- **Repository status** (`:SimpleGitStatus`): branch plus changed files; `<CR>` opens a file, `d` opens and diffs it, `a`/`u` stage/unstage it, `R` refreshes.
+- **Repository status** (`:SimpleGitStatus`): branch plus changed files; `<CR>` opens a file, `d` opens and diffs it, `a`/`u` stage/unstage it, `A`/`U` stage/unstage the whole repository, `R` refreshes.
 - **Line blame popup** (`:SimpleGitBlameLine`): commit, author, date, and summary for the line under the cursor.
 - **Hunk handling** (GitGutter style): `+`/`~`/`_` signs for changes against the index — updated live while you type, without saving — plus hunk navigation (`:SimpleGitHunkNext`/`Prev`), a diff preview popup, and per-hunk stage (`:SimpleGitHunkStage`) and undo (`:SimpleGitHunkUndo`).
-- Asynchronous daemon with a version handshake, request correlation, concurrency limiting and timeouts; `:SimpleGitHealth` diagnostics.
+- Asynchronous daemon with a version/capability handshake, request correlation, concurrency limiting and timeouts; index-changing requests run through a FIFO lane, while UI replies are tied to their initiating tab/window/repository and never pull focus back after you move on. `:SimpleGitHealth` exposes the negotiated support.
 
 ## Requirements
 
@@ -52,6 +52,7 @@ The installer performs a locked release build, atomically installs `lib/simplegi
 | `:SimpleGitDiff [rev]` | Diff file against `rev` (default `HEAD`) |
 | `:SimpleGitShow [rev]` | Show a commit |
 | `:SimpleGitStatus` | Repository status window |
+| `:SimpleGitStageAll` / `:SimpleGitUnstageAll` | Stage / unstage the whole repository |
 | `:SimpleGitToggleLineBlame` | Toggle the inline annotation |
 | `:SimpleGitHunkNext` / `:SimpleGitHunkPrev` | Jump to the next/previous hunk |
 | `:SimpleGitHunkPreview` | Popup diff of the hunk under the cursor |
@@ -59,6 +60,16 @@ The installer performs a locked release build, atomically installs `lib/simplegi
 | `:SimpleGitHunkUndo` | Revert the hunk under the cursor |
 | `:SimpleGitToggleSigns` | Toggle the sign-column markers |
 | `:SimpleGitHealth` | Diagnostics |
+
+Whole-repository stage/unstage is an additive protocol-5 capability. If Vim
+finds an older protocol-5 daemon, these two commands fail closed with an
+upgrade message instead of sending an operation the daemon may misinterpret;
+the rest of Simplegit continues to work. Rerun `./install.sh` after updating.
+
+Status is latest-request-wins, including the first asynchronous open. A
+commit message is likewise generation-guarded: a second `:write` is refused
+while the commit is pending, and text typed after the first `:write` is kept
+open for a deliberate follow-up instead of being discarded by the reply.
 
 Default mappings (only installed when the keys are free; disable with `let g:simplegit_enable_default_mappings = 0`):
 
@@ -94,7 +105,7 @@ See `:help simplegit` for the full reference, highlight groups, and troubleshoot
 
 ## Development
 
-`make check` runs the quality gate: `cargo fmt --check`, `cargo clippy -D warnings`, the Rust protocol/parser tests, and a headless Vim smoke test. CI runs the same gate plus an installer/handshake verification.
+`make check` runs the quality gate: `cargo fmt --check`, `cargo clippy -D warnings`, Rust protocol/parser/FIFO tests, and headless Vim smoke, real-Git, old-daemon capability and asynchronous UI-race tests. CI runs the same gate plus an installer/handshake verification.
 
 ## License
 

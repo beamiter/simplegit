@@ -22,6 +22,9 @@ var s_daemon_incompatible: bool = false
 var s_pending: dict<dict<any>> = {}
 # Requests issued before the version handshake completed.
 var s_wait_queue: list<dict<any>> = []
+# Latest initial status request for each origin window/buffer/repository.
+var s_status_request_generation: number = 0
+var s_status_latest: dict<number> = {}
 
 # ----------- Blame state -----------
 # bufnr (string) -> {lines: list<string>, commits: dict<any>, failed: bool}
@@ -39,10 +42,14 @@ var s_hunk_stale: dict<bool> = {}
 var s_hunk_timer: number = 0
 var s_signs_on: bool = true
 var s_signs_defined: bool = false
+var s_commit_generation: number = 0
 
 const UNCOMMITTED = '0000000000000000000000000000000000000000'
 const PROP_TYPE = 'simplegit_line_blame'
 const SIGN_GROUP = 'simplegit'
+const STATUS_BUF = 'simplegit://status'
+const COMMIT_BUF = 'simplegit://commit'
+const CAP_REPOSITORY_FILE_OPS = 'repository_file_ops'
 
 # =============================================================
 # Small helpers
@@ -164,8 +171,15 @@ def NextId(): number
 enddef
 
 def ClearPending()
+  var commit_bufnr = bufnr(COMMIT_BUF)
+  if commit_bufnr > 0 && bufexists(commit_bufnr)
+        && getbufvar(commit_bufnr, 'simplegit_commit_pending', false)
+    setbufvar(commit_bufnr, 'simplegit_commit_pending', false)
+    setbufvar(commit_bufnr, '&modified', 1)
+  endif
   s_pending = {}
   s_wait_queue = []
+  s_status_latest = {}
   s_blame_inflight = {}
   s_hunk_inflight = {}
 enddef
@@ -201,6 +215,26 @@ def Dispatch(req: dict<any>, ctx: dict<any>): bool
     if len(s_wait_queue) < 32
       s_wait_queue->add({req: req, ctx: ctx})
     endif
+    return true
+  endif
+  # Capabilities are known only after the handshake.  Keeping this gate here
+  # (rather than in :SimpleGitStageAll) also covers requests that were queued
+  # while a freshly started daemon was still negotiating protocol 5.
+  var required = get(ctx, 'requires_capability', '')
+  if type(required) == v:t_string && required !=# ''
+        && !simplegit#core#HasCap(required)
+    var message = required ==# CAP_REPOSITORY_FILE_OPS
+      ? 'whole-repository stage/unstage requires a newer daemon; rerun ./install.sh'
+      : 'daemon capability unavailable: ' .. required
+    s_last_error = message
+    if get(ctx, 'interactive', false)
+      Warn(message)
+    else
+      DebugLog(message)
+    endif
+    # The request was deliberately handled without putting an unsupported
+    # operation on the wire.  Returning true avoids a second, misleading
+    # "daemon unavailable" warning at the call site.
     return true
   endif
   var id = NextId()
@@ -295,7 +329,7 @@ def OnVersion(ev: dict<any>)
     if protocol != 5
       s_daemon_ready = false
       s_daemon_incompatible = true
-      s_wait_queue = []
+      ClearPending()
       DebugLog('unsupported daemon protocol ' .. protocol .. '; rerun ./install.sh')
     else
       s_daemon_ready = true
@@ -306,7 +340,7 @@ def OnVersion(ev: dict<any>)
   else
     s_daemon_ready = false
     s_daemon_incompatible = true
-    s_wait_queue = []
+    ClearPending()
     DebugLog('malformed daemon version response; rerun ./install.sh')
   endif
 enddef
@@ -327,6 +361,21 @@ def OnRequestError(ctx: dict<any>, message: any)
       remove(s_hunk_inflight, key)
     endif
     s_hunk_cache[key] = {failed: true, hunks: []}
+  elseif get(ctx, 'kind', '') ==# 'status'
+    var request_key = get(ctx, 'status_request_key', '')
+    if request_key !=# ''
+          && get(s_status_latest, request_key, -1)
+            == get(ctx, 'status_request_generation', -2)
+      remove(s_status_latest, request_key)
+    endif
+  elseif get(ctx, 'kind', '') ==# 'commit'
+    var commit_bufnr = get(ctx, 'commit_bufnr', -1)
+    if commit_bufnr > 0 && bufexists(commit_bufnr)
+          && getbufvar(commit_bufnr, 'simplegit_commit_generation', 0)
+            == get(ctx, 'commit_generation', -1)
+      setbufvar(commit_bufnr, 'simplegit_commit_pending', false)
+      setbufvar(commit_bufnr, '&modified', 1)
+    endif
   endif
   if get(ctx, 'interactive', false)
     Warn(text)
@@ -795,6 +844,27 @@ def OpenScratch(name: string, height: number): number
   setlocal nonumber norelativenumber nofoldenable foldcolumn=0 signcolumn=no
   nnoremap <silent><buffer> q <Cmd>close<CR>
   return bufnr('%')
+enddef
+
+def OpenStatusScratch(height: number): number
+  # The status URI is intentionally stable, so only one such buffer can
+  # exist. Reuse it inside the requesting tab, but never follow an old status
+  # window into a different tab. If another tab owns it, retire that scratch
+  # buffer in place and create the requested view beside the origin instead.
+  var existing = bufnr(STATUS_BUF)
+  if existing > 0 && bufexists(existing)
+    for win in getwininfo()
+      if win.bufnr == existing && win.tabnr == tabpagenr()
+        win_gotoid(win.winid)
+        setlocal modifiable
+        silent :%delete _
+        execute 'resize ' .. height
+        return existing
+      endif
+    endfor
+    silent execute 'bwipeout! ' .. existing
+  endif
+  return OpenScratch(STATUS_BUF, height)
 enddef
 
 def OnShow(ctx: dict<any>, ev: dict<any>)
@@ -1512,6 +1582,108 @@ enddef
 # =============================================================
 # Repository status
 # =============================================================
+def RepoToken(dir: string): string
+  # Keep repository identity independent of a later :cd.  Resolving the true
+  # Git root would itself require a synchronous git process, so the absolute
+  # directory sent to the daemon is the intentionally conservative token.
+  return fnamemodify(dir, ':p')
+enddef
+
+def RequestContext(kind: string, dir: string, lnum: number): dict<any>
+  var repo = RepoToken(dir)
+  var ctx: dict<any> = {
+    kind: kind,
+    interactive: true,
+    dir: dir,
+    repo_token: repo,
+    lnum: lnum,
+    origin_tabnr: tabpagenr(),
+    origin_winid: win_getid(),
+    origin_bufnr: bufnr('%'),
+  }
+  # A completion may refresh only the exact status view that initiated it.
+  # Commands issued from ordinary file buffers deliberately carry no target,
+  # so their eventual reply can never open a surprise status split.
+  if bufname('%') ==# STATUS_BUF
+        && get(b:, 'simplegit_repo_token', RepoToken(get(b:, 'simplegit_dir', ''))) ==# repo
+    ctx.status_tabnr = tabpagenr()
+    ctx.status_winid = win_getid()
+    ctx.status_bufnr = bufnr('%')
+  endif
+  return ctx
+enddef
+
+def OriginStillCurrent(ctx: dict<any>): bool
+  return tabpagenr() == get(ctx, 'origin_tabnr', tabpagenr())
+        && win_getid() == get(ctx, 'origin_winid', win_getid())
+        && bufnr('%') == get(ctx, 'origin_bufnr', bufnr('%'))
+enddef
+
+def InitialStatusContext(dir: string): dict<any>
+  var ctx = RequestContext('status', dir, 1)
+  s_status_request_generation += 1
+  var request_key = string(ctx.origin_winid) .. ':' .. string(ctx.origin_bufnr)
+        .. ':' .. ctx.repo_token
+  ctx.status_request_key = request_key
+  ctx.status_request_generation = s_status_request_generation
+  if len(s_status_latest) >= 128 && !has_key(s_status_latest, request_key)
+    remove(s_status_latest, keys(s_status_latest)[0])
+  endif
+  s_status_latest[request_key] = s_status_request_generation
+  return ctx
+enddef
+
+def NextStatusGeneration(bufnr: number): number
+  var old = getbufvar(bufnr, 'simplegit_status_generation', 0)
+  var generation = type(old) == v:t_number ? old + 1 : 1
+  setbufvar(bufnr, 'simplegit_status_generation', generation)
+  return generation
+enddef
+
+def ValidStatusTarget(ctx: dict<any>, dir: string): bool
+  var winid = get(ctx, 'status_winid', 0)
+  var bufnr = get(ctx, 'status_bufnr', 0)
+  if type(winid) != v:t_number || type(bufnr) != v:t_number
+        || winid <= 0 || bufnr <= 0 || !bufexists(bufnr)
+    return false
+  endif
+  var infos = getwininfo(winid)
+  if len(infos) != 1 || get(infos[0], 'bufnr', -1) != bufnr
+        || bufname(bufnr) !=# STATUS_BUF
+    return false
+  endif
+  # winid/bufnr are stable identities. tabnr is retained for diagnostics but
+  # must not participate here: closing an earlier tab renumbers a still-live
+  # target, while winid continues to identify it exactly.
+  var repo = get(ctx, 'repo_token', RepoToken(dir))
+  if getbufvar(bufnr, 'simplegit_repo_token', '') !=# repo
+    return false
+  endif
+  var generation = get(ctx, 'status_generation', 0)
+  return generation <= 0
+        || getbufvar(bufnr, 'simplegit_status_generation', 0) == generation
+enddef
+
+def StatusRefreshContext(source: dict<any>, dir: string, lnum: number): dict<any>
+  var bufnr = get(source, 'status_bufnr', 0)
+  var ctx: dict<any> = {
+    kind: 'status',
+    interactive: false,
+    refresh_only: true,
+    dir: dir,
+    repo_token: get(source, 'repo_token', RepoToken(dir)),
+    lnum: lnum,
+    origin_tabnr: get(source, 'origin_tabnr', 0),
+    origin_winid: get(source, 'origin_winid', 0),
+    origin_bufnr: get(source, 'origin_bufnr', 0),
+    status_tabnr: get(source, 'status_tabnr', 0),
+    status_winid: get(source, 'status_winid', 0),
+    status_bufnr: bufnr,
+    status_generation: NextStatusGeneration(bufnr),
+  }
+  return ctx
+enddef
+
 def ValidStatusEntry(entry: any): bool
   return type(entry) == v:t_dict
         \ && type(get(entry, 'xy', v:null)) == v:t_string
@@ -1546,11 +1718,52 @@ def OnStatus(ctx: dict<any>, ev: dict<any>)
     paths->add('')
   endif
   var height = min([max([len(display), 5]), 15])
-  OpenScratch('simplegit://status', height)
+  if get(ctx, 'refresh_only', false)
+    if !ValidStatusTarget(ctx, dir)
+      DebugLog('discarded stale status refresh for ' .. dir)
+      return
+    endif
+    var target_bufnr = get(ctx, 'status_bufnr', 0)
+    var old_count = len(getbufline(target_bufnr, 1, '$'))
+    setbufvar(target_bufnr, '&modifiable', 1)
+    setbufline(target_bufnr, 1, display)
+    if old_count > len(display)
+      deletebufline(target_bufnr, len(display) + 1, old_count)
+    endif
+    setbufvar(target_bufnr, 'simplegit_paths', paths)
+    setbufvar(target_bufnr, 'simplegit_dir', dir)
+    setbufvar(target_bufnr, 'simplegit_repo_token', RepoToken(dir))
+    setbufvar(target_bufnr, '&modifiable', 0)
+    var target_winid = get(ctx, 'status_winid', 0)
+    win_execute(target_winid, 'setlocal nowrap nomodifiable')
+    win_execute(target_winid, 'resize ' .. height)
+    var target_line = min([max([get(ctx, 'lnum', 1), 1]), len(display)])
+    win_execute(target_winid, 'call cursor(' .. target_line .. ', 1)')
+    return
+  endif
+
+  # :SimpleGitStatus is intentionally interactive, but its reply can arrive
+  # after the user has moved on.  In that case opening/reusing a split would
+  # yank focus back to the initiating tab, so discard the obsolete UI result.
+  var request_key = get(ctx, 'status_request_key', '')
+  var request_generation = get(ctx, 'status_request_generation', -1)
+  if request_key ==# ''
+        || get(s_status_latest, request_key, -2) != request_generation
+    DebugLog('discarded superseded status reply')
+    return
+  endif
+  remove(s_status_latest, request_key)
+  if !OriginStillCurrent(ctx)
+    DebugLog('discarded status reply after its origin changed')
+    return
+  endif
+
+  OpenStatusScratch(height)
   setline(1, display)
   setlocal nomodifiable nowrap
   b:simplegit_paths = paths
   b:simplegit_dir = dir
+  b:simplegit_repo_token = RepoToken(dir)
 
   syntax match SimpleGitStatusBranch /^##.*/
   syntax match SimpleGitStatusUntracked /^??.*/
@@ -1560,6 +1773,8 @@ def OnStatus(ctx: dict<any>, ev: dict<any>)
   nnoremap <silent><buffer> d <ScriptCmd>StatusOpen(true)<CR>
   nnoremap <silent><buffer> a <ScriptCmd>StatusFileOp('add')<CR>
   nnoremap <silent><buffer> u <ScriptCmd>StatusFileOp('reset')<CR>
+  nnoremap <silent><buffer> A <ScriptCmd>StatusAllOp('add_all')<CR>
+  nnoremap <silent><buffer> U <ScriptCmd>StatusAllOp('reset_all')<CR>
   nnoremap <silent><buffer> R <ScriptCmd>StatusRefresh()<CR>
   nnoremap <silent><buffer> c <ScriptCmd>Commit(false)<CR>
   nnoremap <silent><buffer> C <ScriptCmd>Commit(true)<CR>
@@ -1568,9 +1783,14 @@ enddef
 
 def StatusRefresh(lnum: number = 0)
   var dir = get(b:, 'simplegit_dir', getcwd())
+  var ctx = RequestContext('status', dir, lnum > 0 ? lnum : line('.'))
+  if !has_key(ctx, 'status_winid')
+    return
+  endif
+  ctx.refresh_only = true
+  ctx.status_generation = NextStatusGeneration(ctx.status_bufnr)
   if !Dispatch({type: 'status', path: dir},
-      {kind: 'status', interactive: true, dir: dir,
-       lnum: lnum > 0 ? lnum : line('.')})
+      ctx)
     Warn('daemon unavailable')
   endif
 enddef
@@ -1583,9 +1803,40 @@ def StatusFileOp(op: string)
     return
   endif
   if !Dispatch({type: 'file_op', path: dir, op: op, file: paths[lnum - 1]},
-      {kind: 'file_op', interactive: true, dir: dir, lnum: lnum})
+      RequestContext('file_op', dir, lnum))
     Warn('daemon unavailable')
   endif
+enddef
+
+# Stage or unstage the entire repository represented by the status buffer.
+# The placeholder file keeps this request readable by protocol-5 daemons; the
+# daemon ignores it for the two repository-wide operation names.
+def StatusAllOp(op: string)
+  var dir = get(b:, 'simplegit_dir', getcwd())
+  var ctx = RequestContext('file_op', dir, 1)
+  ctx.requires_capability = CAP_REPOSITORY_FILE_OPS
+  if !Dispatch({type: 'file_op', path: dir, op: op, file: '.'},
+      ctx)
+    Warn('daemon unavailable')
+  endif
+enddef
+
+def RepositoryAllOp(op: string)
+  var dir = CommitRepoDir()
+  var ctx = RequestContext('file_op', dir, 1)
+  ctx.requires_capability = CAP_REPOSITORY_FILE_OPS
+  if !Dispatch({type: 'file_op', path: dir, op: op, file: '.'},
+      ctx)
+    Warn('daemon unavailable; run ./install.sh')
+  endif
+enddef
+
+export def StageAll()
+  RepositoryAllOp('add_all')
+enddef
+
+export def UnstageAll()
+  RepositoryAllOp('reset_all')
 enddef
 
 # =============================================================
@@ -1596,8 +1847,6 @@ enddef
 # quoting. Comment lines are stripped by `git commit --cleanup=strip`, matching
 # what git's own editor flow does.
 # =============================================================
-
-const COMMIT_BUF = 'simplegit://commit'
 
 # Which repository a commit belongs to.  The scratch windows this plugin opens
 # (status, commit) have no file name, so expand('%:p:h') on them is not a
@@ -1632,7 +1881,16 @@ def CommitHelpLines(dir: string, amend: bool): list<string>
 enddef
 
 export def Commit(amend: bool = false)
+  var existing = bufnr(COMMIT_BUF)
+  if existing > 0 && bufexists(existing)
+        && getbufvar(existing, 'simplegit_commit_pending', false)
+    Warn('a commit is already in progress')
+    return
+  endif
   var dir = CommitRepoDir()
+  var request_ctx = RequestContext('commit', dir, 1)
+  s_commit_generation += 1
+  request_ctx.commit_generation = s_commit_generation
   if !StartDaemon()
     Warn('daemon unavailable; run ./install.sh')
     return
@@ -1648,6 +1906,9 @@ export def Commit(amend: bool = false)
   setline(1, body)
   b:simplegit_dir = dir
   b:simplegit_amend = amend
+  b:simplegit_commit_generation = s_commit_generation
+  b:simplegit_commit_pending = false
+  b:simplegit_request_context = request_ctx
   normal! gg
 
   # :w commits. This is the muscle memory from git's own editor, and it keeps
@@ -1662,7 +1923,9 @@ export def Commit(amend: bool = false)
     # Fetched asynchronously and prepended when it arrives, so amending edits
     # the existing message instead of silently replacing it.
     Dispatch({type: 'commit_message', path: dir},
-      {kind: 'commit_message', interactive: false, dir: dir})
+      {kind: 'commit_message', interactive: false, dir: dir,
+       repo_token: RepoToken(dir), commit_bufnr: bufnr('%'),
+       commit_generation: s_commit_generation})
   endif
   startinsert
 enddef
@@ -1674,6 +1937,10 @@ def CommitAbort()
 enddef
 
 def CommitFinish()
+  if get(b:, 'simplegit_commit_pending', false)
+    Warn('a commit is already in progress; wait for its result')
+    return
+  endif
   var dir = get(b:, 'simplegit_dir', getcwd())
   var amend = get(b:, 'simplegit_amend', false)
   var message: list<string> = []
@@ -1684,14 +1951,30 @@ def CommitFinish()
   endfor
   var text = trim(join(message, "\n"))
   if text ==# ''
+    # BufWriteCmd handlers must clear 'modified' themselves.  The message
+    # remains visible for correction, but a handled empty :write must not
+    # strand the scratch buffer in a permanently dirty state.
+    setlocal nomodified
     Warn('empty commit message; nothing committed')
     return
   endif
-  setlocal nomodified
+  var stored = get(b:, 'simplegit_request_context', {})
+  var ctx: dict<any> = type(stored) == v:t_dict ? extend({}, stored) : {}
+  ctx.kind = 'commit'
+  ctx.interactive = true
+  ctx.dir = dir
+  ctx.repo_token = get(ctx, 'repo_token', RepoToken(dir))
+  ctx.commit_tabnr = tabpagenr()
+  ctx.commit_winid = win_getid()
+  ctx.commit_bufnr = bufnr('%')
+  ctx.commit_changedtick = b:changedtick
   # Force a real boolean: the command passes <bang>0, which is a number, and
   # json_encode() would put 0 on the wire where the daemon expects false.
-  if !Dispatch({type: 'commit', path: dir, message: text, amend: amend ? true : false},
-      {kind: 'commit', interactive: true, dir: dir})
+  if Dispatch({type: 'commit', path: dir, message: text, amend: amend ? true : false},
+      ctx)
+    b:simplegit_commit_pending = true
+    setlocal nomodified
+  else
     Warn('daemon unavailable')
   endif
 enddef
@@ -1703,8 +1986,12 @@ def OnCommitMessage(ctx: dict<any>, ev: dict<any>)
   endif
   # The buffer may have been closed, or the user may already have started
   # typing; in either case leave what is there alone.
-  var bufnr = bufnr(COMMIT_BUF)
-  if bufnr <= 0 || !bufexists(bufnr)
+  var bufnr = get(ctx, 'commit_bufnr', -1)
+  if bufnr <= 0 || !bufexists(bufnr) || bufname(bufnr) !=# COMMIT_BUF
+        || getbufvar(bufnr, 'simplegit_commit_generation', 0)
+          != get(ctx, 'commit_generation', -1)
+        || RepoToken(getbufvar(bufnr, 'simplegit_dir', ''))
+          !=# get(ctx, 'repo_token', '')
     return
   endif
   var existing = getbufline(bufnr, 1, '$')
@@ -1722,35 +2009,55 @@ enddef
 def OnCommit(ctx: dict<any>, ev: dict<any>)
   var sha = get(ev, 'sha', '')
   var subject = get(ev, 'subject', '')
-  # Close the message buffer only once git has actually accepted the commit,
-  # so a rejected message is never lost.
+  # Close the exact message buffer only once git has accepted the commit.  Use
+  # win_execute() so a completion landing after a tab switch cannot drag the
+  # user back to the commit window merely to close it.
+  var commit_bufnr = get(ctx, 'commit_bufnr', -1)
+  var message_changed = false
+  if commit_bufnr > 0 && bufexists(commit_bufnr)
+        && getbufvar(commit_bufnr, 'simplegit_commit_generation', 0)
+          == get(ctx, 'commit_generation', -1)
+    setbufvar(commit_bufnr, 'simplegit_commit_pending', false)
+    message_changed = getbufvar(commit_bufnr, 'changedtick', -1)
+      != get(ctx, 'commit_changedtick', -2)
+  endif
   for win in getwininfo()
-    if bufname(win.bufnr) ==# COMMIT_BUF
-      win_gotoid(win.winid)
-      setlocal nomodified
-      close
-      break
+    if win.bufnr == commit_bufnr && bufname(win.bufnr) ==# COMMIT_BUF
+          && getbufvar(commit_bufnr, 'simplegit_commit_generation', 0)
+            == get(ctx, 'commit_generation', -1)
+          && !message_changed
+      setbufvar(commit_bufnr, '&modified', 0)
+      try
+        win_execute(win.winid, 'close')
+      catch
+        DebugLog('could not close completed commit buffer: ' .. v:exception)
+      endtry
     endif
   endfor
   OnExternalChange()
-  echo printf('[SimpleGit] committed %s %s', sha, subject)
+  echo printf('[SimpleGit] committed %s %s%s', sha, subject,
+    message_changed ? ' — newer message text kept open' : '')
   var dir = get(ctx, 'dir', '')
-  if dir !=# ''
+  if dir !=# '' && ValidStatusTarget(ctx, dir)
+    var refresh_ctx = StatusRefreshContext(ctx, dir, 1)
     Dispatch({type: 'status', path: dir},
-      {kind: 'status', interactive: false, dir: dir, lnum: 1})
+      refresh_ctx)
   endif
 enddef
 
 def OnFileOp(ctx: dict<any>, ev: dict<any>)
   # The index changed under every buffer of this repository; refresh what is
-  # visible, then re-render the status window it was triggered from.
+  # visible, then re-render only the exact status window it was triggered
+  # from.  A top-level command issued in a normal buffer has no status target
+  # and therefore never opens one as an asynchronous side effect.
   OnExternalChange()
   var dir = get(ctx, 'dir', '')
-  if dir ==# ''
+  if dir ==# '' || !ValidStatusTarget(ctx, dir)
     return
   endif
+  var refresh_ctx = StatusRefreshContext(ctx, dir, get(ctx, 'lnum', 1))
   Dispatch({type: 'status', path: dir},
-    {kind: 'status', interactive: false, dir: dir, lnum: get(ctx, 'lnum', 1)})
+    refresh_ctx)
 enddef
 
 def StatusRoot(dir: string): string
@@ -1778,12 +2085,16 @@ def StatusOpen(diff_it: bool)
 enddef
 
 export def Status()
+  if bufname('%') ==# STATUS_BUF
+    StatusRefresh()
+    return
+  endif
   var dir = expand('%:p:h')
   if dir ==# '' || !isdirectory(dir)
     dir = getcwd()
   endif
   if !Dispatch({type: 'status', path: dir},
-      {kind: 'status', interactive: true, dir: dir})
+      InitialStatusContext(dir))
     Warn('daemon unavailable; run ./install.sh')
   endif
 enddef
@@ -1867,6 +2178,10 @@ export def Health()
   echo '  daemon version: ' .. (s_daemon_version ==# '' ? 'unknown' : s_daemon_version)
         .. '/' .. s_daemon_protocol
         .. (s_daemon_incompatible ? ' (INCOMPATIBLE — rerun ./install.sh)' : '')
+  echo '  whole-repo ops: '
+        .. (!s_daemon_ready ? 'unknown (handshake pending)'
+          : simplegit#core#HasCap(CAP_REPOSITORY_FILE_OPS) ? 'supported'
+          : 'unavailable (rerun ./install.sh)')
   echo '  virtual text:   ' .. (VirtualTextSupported() ? 'supported' : 'unsupported (needs Vim 9.0.0067+)')
   echo '  popups:         ' .. (has('popupwin') ? 'supported' : 'unsupported')
   echo '  line blame:     ' .. (s_line_blame_on ? 'on' : 'off')

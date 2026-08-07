@@ -18,7 +18,9 @@ const MAX_CONTENT_BYTES: usize = 2 * 1024 * 1024;
 // Keep enough headroom for the envelope and a maximum-width u64 request ID.
 const MAX_REQUEST_LINE_BYTES: usize = (MAX_REQUEST_PATH_BYTES + MAX_CONTENT_BYTES) * 6 + 1024;
 const MAX_OUTPUT_LINES: usize = 200_000;
+const MAX_PENDING_INDEX_MUTATIONS: usize = 1024;
 const PROTOCOL_VERSION: u32 = 5;
+const CAP_REPOSITORY_FILE_OPS: &str = "repository_file_ops";
 const GIT_REPOSITORY_ENV_VARS: [&str; 8] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -87,7 +89,8 @@ enum Request {
     /// Revert the hunk covering line `lnum` in the working tree.
     #[serde(rename = "undo")]
     Undo { id: u64, path: String, lnum: u32 },
-    /// Stage or unstage a whole file: op is "add" or "reset".
+    /// Stage or unstage one file or the whole repository. Repository-wide
+    /// operations use "add_all"/"reset_all" and ignore `file`.
     #[serde(rename = "file_op")]
     FileOp {
         id: u64,
@@ -167,6 +170,7 @@ enum Event {
         id: u64,
         version: &'static str,
         protocol: u32,
+        capabilities: HashMap<&'static str, bool>,
     },
     #[serde(rename = "blame")]
     Blame {
@@ -235,6 +239,58 @@ enum Event {
 }
 
 type EventTx = tokio::sync::mpsc::Sender<String>;
+
+/// Operations that mutate the index, plus hunk undo whose patch must be based
+/// on a stable index.  A single FIFO worker owns this queue, so mutations are
+/// applied in request order instead of racing in the general-purpose request
+/// pool and intermittently failing on `index.lock`.
+enum IndexMutation {
+    HunkStage {
+        id: u64,
+        path: String,
+        lnum: u32,
+    },
+    HunkUndo {
+        id: u64,
+        path: String,
+        lnum: u32,
+    },
+    FileOp {
+        id: u64,
+        path: String,
+        op: String,
+        file: String,
+    },
+    Commit {
+        id: u64,
+        path: String,
+        message: String,
+        amend: bool,
+    },
+    #[cfg(test)]
+    Probe {
+        id: u64,
+        delay_ms: u64,
+        observed: Arc<std::sync::Mutex<Vec<u64>>>,
+    },
+}
+
+impl IndexMutation {
+    fn id(&self) -> u64 {
+        match self {
+            Self::HunkStage { id, .. }
+            | Self::HunkUndo { id, .. }
+            | Self::FileOp { id, .. }
+            | Self::Commit { id, .. } => *id,
+            #[cfg(test)]
+            Self::Probe { id, .. } => *id,
+        }
+    }
+}
+
+fn protocol_capabilities() -> HashMap<&'static str, bool> {
+    HashMap::from([(CAP_REPOSITORY_FILE_OPS, true)])
+}
 
 async fn stdout_writer<W>(mut out: W, mut rx: tokio::sync::mpsc::Receiver<String>) -> io::Result<()>
 where
@@ -1002,17 +1058,25 @@ async fn handle_file_op(
 ) {
     let dir = file_dir(&path);
     let result = async {
-        let args: Vec<&str> = match op.as_str() {
-            "add" => vec!["add", "--", file.as_str()],
-            "reset" => vec!["reset", "-q", "--", file.as_str()],
-            _ => return Err(format!("unsupported file operation: {op}")),
-        };
+        let args = file_op_args(&op, &file)?;
         run_git(&dir, &args).await
     }
     .await;
     match result {
         Ok(_) => send_event(&tx, &Event::FileOp { id, op, path }).await,
         Err(message) => send_event(&tx, &Event::Error { id, message }).await,
+    }
+}
+
+fn file_op_args<'a>(op: &str, file: &'a str) -> Result<Vec<&'a str>, String> {
+    match op {
+        "add" => Ok(vec!["add", "--", file]),
+        "reset" => Ok(vec!["reset", "-q", "--", file]),
+        // The top pathspec makes the meaning independent of the directory the
+        // current buffer happens to live in. `--all` includes removals too.
+        "add_all" => Ok(vec!["add", "--all", "--", ":/"]),
+        "reset_all" => Ok(vec!["reset", "-q", "--", ":/"]),
+        _ => Err(format!("unsupported file operation: {op}")),
     }
 }
 
@@ -1166,6 +1230,59 @@ async fn report_request_completion(result: Result<(), JoinError>, tx: &EventTx) 
     }
 }
 
+async fn run_index_mutations(
+    mut rx: tokio::sync::mpsc::Receiver<IndexMutation>,
+    tx: EventTx,
+    git_limiter: Arc<Semaphore>,
+) {
+    while let Some(mutation) = rx.recv().await {
+        let id = mutation.id();
+        let permit = match git_limiter.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(error) => {
+                send_event(
+                    &tx,
+                    &Event::Error {
+                        id,
+                        message: format!("git request limiter unavailable: {error}"),
+                    },
+                )
+                .await;
+                continue;
+            }
+        };
+        match mutation {
+            IndexMutation::HunkStage { id, path, lnum } => {
+                handle_hunk_op(id, path, lnum, false, tx.clone(), permit).await;
+            }
+            IndexMutation::HunkUndo { id, path, lnum } => {
+                handle_hunk_op(id, path, lnum, true, tx.clone(), permit).await;
+            }
+            IndexMutation::FileOp { id, path, op, file } => {
+                handle_file_op(id, path, op, file, tx.clone(), permit).await;
+            }
+            IndexMutation::Commit {
+                id,
+                path,
+                message,
+                amend,
+            } => {
+                handle_commit(id, path, message, amend, tx.clone(), permit).await;
+            }
+            #[cfg(test)]
+            IndexMutation::Probe {
+                id,
+                delay_ms,
+                observed,
+            } => {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                observed.lock().unwrap().push(id);
+                drop(permit);
+            }
+        }
+    }
+}
+
 fn finish_request_line(mut bytes: Vec<u8>, too_long: bool) -> Result<String, String> {
     if too_long {
         return Err(format!(
@@ -1245,9 +1362,25 @@ where
     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<String>(1024);
     let writer = tokio::spawn(stdout_writer(output, out_rx));
     let git_limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_GIT_REQUESTS));
+    let (index_tx, index_rx) =
+        tokio::sync::mpsc::channel::<IndexMutation>(MAX_PENDING_INDEX_MUTATIONS);
+    let index_worker = tokio::spawn(run_index_mutations(
+        index_rx,
+        out_tx.clone(),
+        git_limiter.clone(),
+    ));
     let mut requests = JoinSet::new();
+    let mut input_error = None;
 
-    while let Some(line) = read_request_line(&mut input).await? {
+    loop {
+        let line = match read_request_line(&mut input).await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(error) => {
+                input_error = Some(error);
+                break;
+            }
+        };
         while let Some(result) = requests.try_join_next() {
             report_request_completion(result, &out_tx).await;
         }
@@ -1294,6 +1427,7 @@ where
                         id,
                         version: env!("CARGO_PKG_VERSION"),
                         protocol: PROTOCOL_VERSION,
+                        capabilities: protocol_capabilities(),
                     },
                 )
                 .await;
@@ -1344,23 +1478,56 @@ where
                 requests.spawn(handle_hunks(id, path, content, tx, permit));
             }
             Request::Stage { id, path, lnum } => {
-                let tx = out_tx.clone();
-                let permit = git_limiter.clone().acquire_owned().await.unwrap();
-                requests.spawn(handle_hunk_op(id, path, lnum, false, tx, permit));
+                if index_tx
+                    .send(IndexMutation::HunkStage { id, path, lnum })
+                    .await
+                    .is_err()
+                {
+                    send_event(
+                        &out_tx,
+                        &Event::Error {
+                            id,
+                            message: "index mutation queue unavailable".to_string(),
+                        },
+                    )
+                    .await;
+                }
             }
             Request::Undo { id, path, lnum } => {
-                let tx = out_tx.clone();
-                let permit = git_limiter.clone().acquire_owned().await.unwrap();
-                requests.spawn(handle_hunk_op(id, path, lnum, true, tx, permit));
+                if index_tx
+                    .send(IndexMutation::HunkUndo { id, path, lnum })
+                    .await
+                    .is_err()
+                {
+                    send_event(
+                        &out_tx,
+                        &Event::Error {
+                            id,
+                            message: "index mutation queue unavailable".to_string(),
+                        },
+                    )
+                    .await;
+                }
             }
             Request::FileOp { id, path, op, file } => {
                 if let Err(message) = validate_request_path(&file) {
                     send_event(&out_tx, &Event::Error { id, message }).await;
                     continue;
                 }
-                let tx = out_tx.clone();
-                let permit = git_limiter.clone().acquire_owned().await.unwrap();
-                requests.spawn(handle_file_op(id, path, op, file, tx, permit));
+                if index_tx
+                    .send(IndexMutation::FileOp { id, path, op, file })
+                    .await
+                    .is_err()
+                {
+                    send_event(
+                        &out_tx,
+                        &Event::Error {
+                            id,
+                            message: "index mutation queue unavailable".to_string(),
+                        },
+                    )
+                    .await;
+                }
             }
             Request::CommitMessage { id, path } => {
                 let tx = out_tx.clone();
@@ -1373,19 +1540,40 @@ where
                 message,
                 amend,
             } => {
-                let tx = out_tx.clone();
-                let permit = git_limiter.clone().acquire_owned().await.unwrap();
-                requests.spawn(handle_commit(id, path, message, amend, tx, permit));
+                if index_tx
+                    .send(IndexMutation::Commit {
+                        id,
+                        path,
+                        message,
+                        amend,
+                    })
+                    .await
+                    .is_err()
+                {
+                    send_event(
+                        &out_tx,
+                        &Event::Error {
+                            id,
+                            message: "index mutation queue unavailable".to_string(),
+                        },
+                    )
+                    .await;
+                }
             }
         }
     }
 
+    drop(index_tx);
+    report_request_completion(index_worker.await, &out_tx).await;
     while let Some(result) = requests.join_next().await {
         report_request_completion(result, &out_tx).await;
     }
     drop(out_tx);
     let _ = writer.await;
-    Ok(())
+    match input_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 const USAGE: &str = "\
@@ -1486,6 +1674,33 @@ mod tests {
 
     const UNCOMMITTED_SHA: &str = "0000000000000000000000000000000000000000";
 
+    struct ErrorAfterInput {
+        bytes: Vec<u8>,
+        position: usize,
+        errored: bool,
+    }
+
+    impl AsyncRead for ErrorAfterInput {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if self.position < self.bytes.len() {
+                let start = self.position;
+                let count = buf.remaining().min(self.bytes.len() - start);
+                buf.put_slice(&self.bytes[start..start + count]);
+                self.position += count;
+                return std::task::Poll::Ready(Ok(()));
+            }
+            if !self.errored {
+                self.errored = true;
+                return std::task::Poll::Ready(Err(io::Error::other("injected input failure")));
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
     #[test]
     fn blame_line_porcelain_is_parsed() {
         let sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1573,6 +1788,27 @@ u UU N... 100644 100644 100644 100644 aaaa bbbb cccc conflict.rs\n\
     }
 
     #[test]
+    fn file_operations_distinguish_one_file_from_the_repository() {
+        assert_eq!(
+            file_op_args("add", "dir/file.txt").unwrap(),
+            vec!["add", "--", "dir/file.txt"]
+        );
+        assert_eq!(
+            file_op_args("reset", "dir/file.txt").unwrap(),
+            vec!["reset", "-q", "--", "dir/file.txt"]
+        );
+        assert_eq!(
+            file_op_args("add_all", ".").unwrap(),
+            vec!["add", "--all", "--", ":/"]
+        );
+        assert_eq!(
+            file_op_args("reset_all", ".").unwrap(),
+            vec!["reset", "-q", "--", ":/"]
+        );
+        assert!(file_op_args("remove", "file.txt").is_err());
+    }
+
+    #[test]
     fn suspicious_revisions_are_rejected() {
         assert!(validate_rev("HEAD").is_ok());
         assert!(validate_rev("main~3").is_ok());
@@ -1600,6 +1836,149 @@ u UU N... 100644 100644 100644 100644 aaaa bbbb cccc conflict.rs\n\
         daemon.await.unwrap().unwrap();
         assert!(response.contains("\"type\":\"version\""));
         assert!(response.contains("\"protocol\":5"));
+        let version: serde_json::Value =
+            serde_json::from_str(response.lines().next().unwrap()).expect("version reply is JSON");
+        assert_eq!(
+            version["capabilities"][CAP_REPOSITORY_FILE_OPS],
+            serde_json::Value::Bool(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn input_errors_drain_queued_index_operations_before_returning() {
+        use tokio::io::AsyncReadExt;
+
+        let request = serde_json::json!({
+            "type": "file_op", "id": 77, "path": ".",
+            "op": "unsupported", "file": "sample.txt"
+        })
+        .to_string()
+            + "\n";
+        let input = ErrorAfterInput {
+            bytes: request.into_bytes(),
+            position: 0,
+            errored: false,
+        };
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let error = run(input, server).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        let reply: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
+        assert_eq!(reply["id"], 77);
+        assert!(
+            reply["message"]
+                .as_str()
+                .unwrap()
+                .contains("unsupported file operation")
+        );
+    }
+
+    #[tokio::test]
+    async fn index_mutations_execute_in_fifo_order() {
+        let (queue_tx, queue_rx) = tokio::sync::mpsc::channel(4);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(4);
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        queue_tx
+            .send(IndexMutation::Probe {
+                id: 1,
+                delay_ms: 40,
+                observed: observed.clone(),
+            })
+            .await
+            .unwrap();
+        queue_tx
+            .send(IndexMutation::Probe {
+                id: 2,
+                delay_ms: 0,
+                observed: observed.clone(),
+            })
+            .await
+            .unwrap();
+        drop(queue_tx);
+
+        run_index_mutations(
+            queue_rx,
+            event_tx,
+            Arc::new(Semaphore::new(MAX_CONCURRENT_GIT_REQUESTS)),
+        )
+        .await;
+        assert_eq!(*observed.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn burst_file_mutations_preserve_request_order() {
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tokio::io::AsyncReadExt;
+
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = std::env::temp_dir().join(format!(
+            "simplegit-index-fifo-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("sample.txt"), "before\n").unwrap();
+        git(&["add", "sample.txt"]);
+        git(&["commit", "-q", "-m", "initial"]);
+        std::fs::write(repo.join("sample.txt"), "after\n").unwrap();
+
+        // Do not wait for add before sending reset.  Concurrent handlers used
+        // to race on index.lock and could leave either final state; the FIFO
+        // lane must answer in input order and leave the second operation last.
+        let input = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "file_op", "id": 41, "path": repo,
+                "op": "add", "file": "sample.txt"
+            }),
+            serde_json::json!({
+                "type": "file_op", "id": 42, "path": repo,
+                "op": "reset", "file": "sample.txt"
+            })
+        );
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        run(input.as_bytes(), server).await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        let replies = response
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            replies
+                .iter()
+                .map(|reply| reply["id"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![41, 42]
+        );
+        git(&["diff", "--cached", "--quiet"]);
+        std::fs::remove_dir_all(repo).unwrap();
     }
 
     const DIFF_FIXTURE: &str = "\

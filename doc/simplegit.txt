@@ -73,9 +73,19 @@ COMMANDS                                                   *simplegit-commands*
 :SimpleGitStatus                                             *:SimpleGitStatus*
   Show the repository branch and changed files. Inside the window: <CR>
   opens the file, `d` opens it and diffs it against HEAD, `a` stages it,
-  `u` unstages it, `c` commits, `C` amends, `R` refreshes the list, `q`
+  `u` unstages it, `A` stages every repository change, `U` unstages the
+  whole repository, `c` commits, `C` amends, `R` refreshes the list, `q`
   closes. A commit started here uses the repository the status view is
   showing, not the current working directory.
+
+:SimpleGitStageAll                                   *:SimpleGitStageAll*
+:SimpleGitUnstageAll                               *:SimpleGitUnstageAll*
+  Stage or unstage every change in the repository containing the current
+  buffer. These are the command equivalents of `A` and `U` in the status
+  window; their scope is the repository root even from a nested directory.
+  This is an additive protocol-5 capability. An older protocol-5 daemon is
+  refused safely for these two commands only; rerun ./install.sh to enable
+  them. All older operations remain available.
 
 :SimpleGitCommit[!]                                          *:SimpleGitCommit*
   Commit what is staged. Opens a scratch buffer for the message; `:w`
@@ -83,6 +93,9 @@ COMMANDS                                                   *simplegit-commands*
   text at the bottom never reaches the message. The message travels over the
   daemon's stdin rather than as a command-line argument, so blank lines,
   quotes and non-ASCII survive intact.
+  Only one :write may be pending. Text entered after :write is never erased
+  by the asynchronous success reply; it remains modified in the message
+  buffer for an intentional follow-up commit.
   With [!] the previous commit is amended; its existing message is fetched
   and pre-filled, so amending edits the message rather than replacing it.
 
@@ -122,6 +135,8 @@ MAPPINGS                                                   *simplegit-mappings*
   <Plug>(simplegit-log)                :SimpleGitLog
   <Plug>(simplegit-diff)               :SimpleGitDiff
   <Plug>(simplegit-status)             :SimpleGitStatus
+  <Plug>(simplegit-stage-all)          :SimpleGitStageAll
+  <Plug>(simplegit-unstage-all)        :SimpleGitUnstageAll
   <Plug>(simplegit-toggle-line-blame)  :SimpleGitToggleLineBlame
   <Plug>(simplegit-hunk-next)          :SimpleGitHunkNext
   <Plug>(simplegit-hunk-prev)          :SimpleGitHunkPrev
@@ -214,7 +229,10 @@ TROUBLESHOOTING                                     *simplegit-troubleshooting*
 Run |:SimpleGitHealth|. "daemon binary: (not found)" means ./install.sh has
 not produced lib/simplegit-daemon (or set |g:simplegit_daemon_path|). A
 version of "unknown/0" that persists means the binary is outdated — rerun
-./install.sh. Inline annotations require Vim with virtual-text support
+./install.sh. "whole-repo ops: unavailable" means Vim negotiated protocol 5
+with an older daemon that does not advertise repository_file_ops; those two
+commands fail closed rather than sending an ambiguous request. Inline
+annotations require Vim with virtual-text support
 (patch 9.0.0067+); the blame sidebar and popups work without it.
 
 The inline annotation intentionally disappears while the buffer is modified:
@@ -243,6 +261,17 @@ What it guarantees:
   rather than respawning forever; :SimpleGitRestart re-arms it.
 - Requests are correlated to replies by id and can time out, so a wedged
   daemon never leaves a callback hanging.
+- Protocol 5 also negotiates additive capabilities. Whole-repository file
+  operations require repository_file_ops; a protocol-5 daemon without it is
+  still usable for every older request.
+- Hunk stage/undo, file stage/reset and commit operations share one FIFO
+  index lane. They complete in request order and cannot race each other for
+  .git/index.lock; read-only blame/log/status work remains concurrent.
+- An asynchronous status/commit completion remembers its initiating tab,
+  window, buffer and repository. It refreshes only that still-live status
+  view, discards stale generations (initial status requests are latest-wins),
+  and never changes the user's current focus or recreates a view that was
+  closed. Commit replies also preserve any message text typed after :write.
 
 :SimpleGitHealth
         Report daemon path, run state, negotiated protocol and capabilities,

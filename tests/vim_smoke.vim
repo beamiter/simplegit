@@ -29,6 +29,8 @@ Check(exists(':SimpleGitHistory') == 2, ':SimpleGitHistory exists')
 Check(exists(':SimpleGitDiff') == 2, ':SimpleGitDiff exists')
 Check(exists(':SimpleGitShow') == 2, ':SimpleGitShow exists')
 Check(exists(':SimpleGitStatus') == 2, ':SimpleGitStatus exists')
+Check(exists(':SimpleGitStageAll') == 2, ':SimpleGitStageAll exists')
+Check(exists(':SimpleGitUnstageAll') == 2, ':SimpleGitUnstageAll exists')
 Check(exists(':SimpleGitHealth') == 2, ':SimpleGitHealth exists')
 Check(exists(':SimpleGitToggleLineBlame') == 2, ':SimpleGitToggleLineBlame exists')
 Check(exists(':SimpleGitHunkNext') == 2, ':SimpleGitHunkNext exists')
@@ -39,6 +41,7 @@ Check(exists(':SimpleGitHunkUndo') == 2, ':SimpleGitHunkUndo exists')
 Check(exists(':SimpleGitToggleSigns') == 2, ':SimpleGitToggleSigns exists')
 Check(maparg('<Plug>(simplegit-blame)', 'n') !=# '', '<Plug>(simplegit-blame) mapped')
 Check(maparg('<Plug>(simplegit-hunk-stage)', 'n') !=# '', '<Plug>(simplegit-hunk-stage) mapped')
+Check(maparg('<Plug>(simplegit-stage-all)', 'n') !=# '', '<Plug>(simplegit-stage-all) mapped')
 
 # The autoload script must load and expose its entry points.
 try
