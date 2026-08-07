@@ -80,6 +80,10 @@ Explicit status opens and in-place refreshes share one buffer generation, so
 their replies are latest-request-wins even when the two kinds race. Repository
 matching resolves symlinks and uses the nearest `.git` directory or gitfile,
 so a mutation from a sibling directory refreshes the same worktree view.
+Every in-place refresh records both the fallback line and the selected status
+path. Reordered rows therefore keep the cursor on the same file; rename rows
+also match Git's original path. If the entry disappears, the cursor falls back
+to the nearest surviving line (including the clean placeholder or header).
 
 Default mappings (only installed when the keys are free; disable with `let g:simplegit_enable_default_mappings = 0`):
 

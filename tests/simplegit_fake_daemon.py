@@ -37,6 +37,12 @@ def main():
     file_op_delay = int(os.environ.get("SIMPLEGIT_FAKE_FILE_OP_DELAY_MS", "0"))
     commit_delay = int(os.environ.get("SIMPLEGIT_FAKE_COMMIT_DELAY_MS", "0"))
     status_delays = delays_from_env("SIMPLEGIT_FAKE_STATUS_DELAYS")
+    status_entries = []
+    raw_status_entries = os.environ.get("SIMPLEGIT_FAKE_STATUS_ENTRIES", "")
+    if raw_status_entries:
+        decoded = json.loads(raw_status_entries)
+        if isinstance(decoded, list) and all(isinstance(value, list) for value in decoded):
+            status_entries = decoded
     status_count = 0
 
     for line in sys.stdin:
@@ -74,12 +80,15 @@ def main():
                 if status_count <= len(status_delays)
                 else 0
             )
+            entries = [{"xy": "??", "path": "sample.txt"}]
+            if status_entries:
+                entries = status_entries[min(status_count - 1, len(status_entries) - 1)]
             schedule(
                 {
                     "type": "status",
                     "id": request_id,
                     "branch": f"fake-{status_count}",
-                    "entries": [{"xy": "??", "path": "sample.txt"}],
+                    "entries": entries,
                 },
                 delay,
             )

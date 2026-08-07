@@ -20,6 +20,7 @@ $SIMPLEGIT_FAKE_OMIT_CAPABILITIES = '1'
 $SIMPLEGIT_FAKE_FILE_OP_DELAY_MS = '0'
 $SIMPLEGIT_FAKE_COMMIT_DELAY_MS = '0'
 $SIMPLEGIT_FAKE_STATUS_DELAYS = ''
+$SIMPLEGIT_FAKE_STATUS_ENTRIES = ''
 g:simplegit_daemon_path = fake
 g:simplegit_auto_enable = 0
 g:simplegit_status_refresh_delay = 80
@@ -421,11 +422,93 @@ delete(shared_repo, 'rf')
 delete(shared_gitdir, 'rf')
 delete(distinct_repo, 'rf')
 
+# Status refreshes preserve the selected logical path, not its old screen
+# line. Reordering, rename orig paths, deletion, clean/header fallbacks and a
+# late older response all share the same window/buffer/repository generation.
+var old_status_bufnr = StatusBuf()
+if old_status_bufnr > 0
+  execute 'silent! bwipeout! ' .. old_status_bufnr
+endif
+delete(request_log)
+$SIMPLEGIT_FAKE_STATUS_DELAYS = '0,200,0,0,0,0,250,20'
+$SIMPLEGIT_FAKE_STATUS_ENTRIES = json_encode([
+  [{xy: '??', path: 'a.txt'}, {xy: '??', path: 'b.txt'}, {xy: '??', path: 'c.txt'}],
+  [{xy: '??', path: 'c.txt'}, {xy: '??', path: 'a.txt'}, {xy: '??', path: 'b.txt'}],
+  [{xy: '??', path: 'c.txt'}, {xy: '??', path: 'a.txt'},
+    {xy: 'R.', path: 'b-new.txt', orig: 'b.txt'}],
+  [{xy: '??', path: 'c.txt'}, {xy: '??', path: 'a.txt'}],
+  [],
+  [{xy: '??', path: 'z.txt'}, {xy: '??', path: 'y.txt'}],
+  [{xy: '??', path: 'y.txt'}, {xy: '??', path: 'z.txt'}],
+  [{xy: '??', path: 'z.txt'}, {xy: '??', path: 'y.txt'}],
+])
+var cursor_repo = tempname()
+mkdir(cursor_repo .. '/.git', 'p')
+writefile(['cursor'], cursor_repo .. '/cursor.txt')
+starts = simplegit#core#Health().starts
+simplegit#Restart()
+WaitFor(() => simplegit#core#Health().starts > starts && simplegit#core#Ready(),
+  'cursor-identity daemon handshake')
+simplegit#Enable()
+tabnew
+execute 'edit ' .. fnameescape(cursor_repo .. '/cursor.txt')
+simplegit#Status()
+WaitFor(() => StatusHeader(StatusBuf()) ==# '## fake-1', 'cursor status opens')
+var cursor_status_bufnr = StatusBuf()
+var cursor_status_winid = win_getid()
+cursor(3, 1) # b.txt
+
+# The response may land while another tab is active; update only the captured
+# status window and never steal focus.
+feedkeys('R', 'xt')
+WaitFor(() => len(Requests('status')) >= 2, 'reordered refresh starts')
+tabnew
+var cursor_away_winid = win_getid()
+WaitFor(() => StatusHeader(cursor_status_bufnr) ==# '## fake-2',
+  'reordered refresh lands cross-tab')
+assert_equal(cursor_away_winid, win_getid(), 'cursor refresh preserves focus')
+assert_equal(4, getcurpos(cursor_status_winid)[1], 'b.txt follows its reordered row')
+tabclose
+win_gotoid(cursor_status_winid)
+
+feedkeys('a', 'xt')
+WaitFor(() => len(Requests('file_op')) == 1, 'selected-path mutation starts')
+WaitFor(() => StatusHeader(cursor_status_bufnr) ==# '## fake-3',
+  'mutation rename refresh')
+assert_equal(4, line('.'), 'orig path follows renamed row')
+assert_equal('b-new.txt', getbufvar(cursor_status_bufnr, 'simplegit_paths')[3])
+
+feedkeys('R', 'xt')
+WaitFor(() => StatusHeader(cursor_status_bufnr) ==# '## fake-4', 'deleted-row refresh')
+assert_equal(3, line('.'), 'deleted row falls back to nearest surviving line')
+feedkeys('R', 'xt')
+WaitFor(() => StatusHeader(cursor_status_bufnr) ==# '## fake-5', 'clean refresh')
+assert_equal(2, line('.'), 'clean placeholder clamps the old row')
+
+cursor(1, 1)
+feedkeys('R', 'xt')
+WaitFor(() => StatusHeader(cursor_status_bufnr) ==# '## fake-6', 'header refresh')
+assert_equal(1, line('.'), 'header selection remains on the header')
+
+cursor(3, 1) # y.txt
+feedkeys('RR', 'xt')
+WaitFor(() => StatusHeader(cursor_status_bufnr) ==# '## fake-8',
+  'newest cursor refresh wins')
+assert_equal(3, line('.'), 'latest response preserves y.txt after reorder')
+sleep 350m
+assert_equal('## fake-8', StatusHeader(cursor_status_bufnr),
+  'late older refresh remains discarded')
+assert_equal(3, line('.'), 'late response cannot move the cursor')
+simplegit#Disable()
+WaitFor(() => !simplegit#core#IsRunning(), 'cursor-identity daemon stops')
+delete(cursor_repo, 'rf')
+
 # Editing after :write must never be erased by the eventual commit success,
 # and a second :write while that request is pending must not enqueue a second
 # commit. The preserved buffer can be used for a deliberate follow-up commit.
 delete(request_log)
 $SIMPLEGIT_FAKE_STATUS_DELAYS = ''
+$SIMPLEGIT_FAKE_STATUS_ENTRIES = ''
 $SIMPLEGIT_FAKE_COMMIT_DELAY_MS = '250'
 starts = simplegit#core#Health().starts
 simplegit#Restart()

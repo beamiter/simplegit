@@ -2,6 +2,17 @@
 
 ## Unreleased - 2026-08-05
 
+### Status 光标跟随文件
+
+- 手动、自动及 mutation 后的 status 刷新同时记录所选 path 与备用行号；条目
+  重排时光标跟随同一文件,rename 可通过 `orig` 识别原路径,不再落到碰巧占据旧
+  行号的另一文件。
+- 所选条目消失时才回退到最近存活行；header 与 clean placeholder 保持合理
+  位置。路径恢复仍受精确 winid/bufnr/repository 与 generation 约束,迟到响应
+  不能移动光标或抢走跨 tab 焦点。
+- fake-daemon 回归覆盖重排、rename、删除、clean/header、跨 tab 回复及双请求
+  latest-wins。
+
 ### Status 自动保鲜
 
 - 已打开的 status view 现在会在 `FocusGained` / `ShellCmdPost` 后自动刷新;

@@ -1633,6 +1633,18 @@ def RepoToken(dir: string): string
   return fallback
 enddef
 
+def StatusPathAt(bufnr: number, lnum: number): string
+  if bufnr <= 0 || !bufexists(bufnr) || lnum <= 1
+    return ''
+  endif
+  var raw_paths = getbufvar(bufnr, 'simplegit_paths', [])
+  if type(raw_paths) != v:t_list || lnum > len(raw_paths)
+    return ''
+  endif
+  var raw_path = raw_paths[lnum - 1]
+  return type(raw_path) == v:t_string ? raw_path : ''
+enddef
+
 def RequestContext(kind: string, dir: string, lnum: number): dict<any>
   var repo = RepoToken(dir)
   var ctx: dict<any> = {
@@ -1653,6 +1665,7 @@ def RequestContext(kind: string, dir: string, lnum: number): dict<any>
     ctx.status_tabnr = tabpagenr()
     ctx.status_winid = win_getid()
     ctx.status_bufnr = bufnr('%')
+    ctx.status_cursor_path = StatusPathAt(bufnr('%'), lnum)
   endif
   return ctx
 enddef
@@ -1664,7 +1677,8 @@ def OriginStillCurrent(ctx: dict<any>): bool
 enddef
 
 def InitialStatusContext(dir: string): dict<any>
-  var ctx = RequestContext('status', dir, 1)
+  var initial_line = bufname('%') ==# STATUS_BUF ? line('.') : 1
+  var ctx = RequestContext('status', dir, initial_line)
   # Explicit opens and in-place refreshes share the target buffer's generation
   # clock. Reserve the explicit request before it goes on the wire, so any
   # already-in-flight refresh becomes stale; a later refresh will in turn
@@ -1719,6 +1733,10 @@ enddef
 
 def StatusRefreshContext(source: dict<any>, dir: string, lnum: number): dict<any>
   var bufnr = get(source, 'status_bufnr', 0)
+  var cursor_path = get(source, 'status_cursor_path', '')
+  if type(cursor_path) != v:t_string || cursor_path ==# ''
+    cursor_path = StatusPathAt(bufnr, lnum)
+  endif
   var ctx: dict<any> = {
     kind: 'status',
     interactive: false,
@@ -1733,6 +1751,7 @@ def StatusRefreshContext(source: dict<any>, dir: string, lnum: number): dict<any
     status_winid: get(source, 'status_winid', 0),
     status_bufnr: bufnr,
     status_generation: NextStatusGeneration(bufnr),
+    status_cursor_path: cursor_path,
   }
   return ctx
 enddef
@@ -1877,6 +1896,11 @@ def OnStatus(ctx: dict<any>, ev: dict<any>)
   var dir = get(ctx, 'dir', getcwd())
   var display = ['## ' .. (branch ==# '' ? '(no branch)' : branch)]
   var paths: list<string> = ['']
+  var requested_cursor_path = get(ctx, 'status_cursor_path', '')
+  if type(requested_cursor_path) != v:t_string
+    requested_cursor_path = ''
+  endif
+  var cursor_path_line = 0
   for entry in entries
     if !ValidStatusEntry(entry)
       continue
@@ -1889,6 +1913,14 @@ def OnStatus(ctx: dict<any>, ev: dict<any>)
     endif
     display->add(line)
     paths->add(entry.path)
+    # Git reports a rename with the new path plus `orig`. Treat either as the
+    # same logical row so a refresh following the rename keeps the user's
+    # selection on that entry.
+    if cursor_path_line == 0 && requested_cursor_path !=# ''
+          && (entry.path ==# requested_cursor_path
+            || (type(orig) == v:t_string && orig ==# requested_cursor_path))
+      cursor_path_line = len(display)
+    endif
   endfor
   if len(display) == 1
     display->add('   (working tree clean)')
@@ -1914,7 +1946,8 @@ def OnStatus(ctx: dict<any>, ev: dict<any>)
     var target_winid = get(ctx, 'status_winid', 0)
     win_execute(target_winid, 'setlocal nowrap nomodifiable')
     win_execute(target_winid, 'resize ' .. height)
-    var target_line = min([max([get(ctx, 'lnum', 1), 1]), len(display)])
+    var target_line = cursor_path_line > 0 ? cursor_path_line
+      : min([max([get(ctx, 'lnum', 1), 1]), len(display)])
     win_execute(target_winid, 'call cursor(' .. target_line .. ', 1)')
     return
   endif
@@ -1977,7 +2010,9 @@ def OnStatus(ctx: dict<any>, ev: dict<any>)
   nnoremap <silent><buffer> R <ScriptCmd>StatusRefresh()<CR>
   nnoremap <silent><buffer> c <ScriptCmd>Commit(false)<CR>
   nnoremap <silent><buffer> C <ScriptCmd>Commit(true)<CR>
-  execute ':' .. min([max([get(ctx, 'lnum', 1), 1]), line('$')])
+  var target_line = cursor_path_line > 0 ? cursor_path_line
+    : min([max([get(ctx, 'lnum', 1), 1]), line('$')])
+  execute ':' .. target_line
 enddef
 
 def StatusRefresh(lnum: number = 0)

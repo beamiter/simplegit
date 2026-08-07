@@ -86,6 +86,12 @@ COMMANDS                                                   *simplegit-commands*
   one. Repository matching resolves symlinks and discovers the nearest `.git`
   directory or gitfile; sibling directories in one worktree therefore share
   refreshes, while distinct repositories do not. `R` refreshes immediately.
+  Each refresh snapshots the selected path plus its fallback line. Reordered
+  rows keep the cursor on the same file, and a rename matches either its new
+  or original path. If that entry disappears, the nearest surviving row is
+  used. Header and clean-placeholder selections remain valid. This cursor
+  restoration is covered by the same target and generation checks, so a late
+  response cannot move the cursor.
 
 :SimpleGitStageAll                                   *:SimpleGitStageAll*
 :SimpleGitUnstageAll                               *:SimpleGitUnstageAll*
