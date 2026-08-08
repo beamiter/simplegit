@@ -39,9 +39,30 @@ Check(exists(':SimpleGitHunkPreview') == 2, ':SimpleGitHunkPreview exists')
 Check(exists(':SimpleGitHunkStage') == 2, ':SimpleGitHunkStage exists')
 Check(exists(':SimpleGitHunkUndo') == 2, ':SimpleGitHunkUndo exists')
 Check(exists(':SimpleGitToggleSigns') == 2, ':SimpleGitToggleSigns exists')
+Check(exists(':SimpleGitCommit') == 2, ':SimpleGitCommit exists')
 Check(maparg('<Plug>(simplegit-blame)', 'n') !=# '', '<Plug>(simplegit-blame) mapped')
+Check(maparg('<Plug>(simplegit-hunk-inner)', 'o') !=# '',
+  '<Plug>(simplegit-hunk-inner) mapped in operator-pending mode')
+Check(maparg('<Plug>(simplegit-hunk-stage)', 'x') !=# '',
+  '<Plug>(simplegit-hunk-stage) mapped in visual mode')
 Check(maparg('<Plug>(simplegit-hunk-stage)', 'n') !=# '', '<Plug>(simplegit-hunk-stage) mapped')
 Check(maparg('<Plug>(simplegit-stage-all)', 'n') !=# '', '<Plug>(simplegit-stage-all) mapped')
+
+# g:simplegit_version is the one version a user can read without a running
+# daemon, and it is what they quote in a bug report -- so it has to be the
+# version of this checkout, not whatever it said two releases ago.  Nothing
+# else reads it, which is exactly why it drifted unnoticed.
+var declared = ''
+for line in readfile(root .. '/Cargo.toml')
+  if line =~# '^version\s*='
+    declared = matchstr(line, '"\zs[^"]*\ze"')
+    break
+  endif
+endfor
+Check(declared !=# '', 'Cargo.toml declares a version')
+Check(get(g:, 'simplegit_version', '') ==# declared,
+  'g:simplegit_version (' .. get(g:, 'simplegit_version', '') .. ') matches Cargo.toml ('
+  .. declared .. ')')
 
 # The autoload script must load and expose its entry points.
 try

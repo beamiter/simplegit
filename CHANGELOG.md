@@ -2,6 +2,13 @@
 
 ## Unreleased - 2026-08-08
 
+### 修复:`g:simplegit_version` 停在 0.3.0
+
+- crate 和 daemon 报 0.5.0,而用户唯一能在不启动 daemon 的情况下读到、也是写进
+  bug report 的那个版本号还是 0.3.0。这个变量代码里没人读,所以漂了两个版本也没
+  人发现。
+- 现在与 Cargo.toml 对齐,并由 `make vim-test` 在两者不一致时直接让构建失败。
+
 ### 新增:daemon 主动上报仓库变化,不再等 `FocusGained`
 
 - 别的终端里 `git checkout` 之后,signs / blame / 分支全是错的,要等 `FocusGained`

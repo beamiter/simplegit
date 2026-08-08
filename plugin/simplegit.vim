@@ -4,7 +4,9 @@ if exists('g:loaded_simplegit')
   finish
 endif
 g:loaded_simplegit = 1
-g:simplegit_version = '0.3.0'
+# Keep in step with `version` in Cargo.toml; tests/vim_smoke.vim fails the
+# build when the two disagree, because this is the number a user quotes.
+g:simplegit_version = '0.5.0'
 
 def ConfigFlag(name: string, default_value: number): number
   var value = get(g:, name, default_value)
