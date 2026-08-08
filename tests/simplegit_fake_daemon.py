@@ -44,6 +44,16 @@ def main():
         if isinstance(decoded, list) and all(isinstance(value, list) for value in decoded):
             status_entries = decoded
     status_count = 0
+    blame_line_delay = int(os.environ.get("SIMPLEGIT_FAKE_BLAME_LINE_DELAY_MS", "0"))
+    blame_file_lines = int(os.environ.get("SIMPLEGIT_FAKE_BLAME_LINES", "10"))
+    uncommitted_lnum = int(os.environ.get("SIMPLEGIT_FAKE_UNCOMMITTED_LNUM", "0"))
+    blame_commit = {
+        "sha": "deadbeef" * 5,
+        "author": "Alice",
+        "email": "alice@example.com",
+        "time": int(os.environ.get("SIMPLEGIT_FAKE_BLAME_TIME", "1700000000")),
+        "summary": "initial import",
+    }
     hunks = []
     raw_hunks = os.environ.get("SIMPLEGIT_FAKE_HUNKS", "")
     if raw_hunks:
@@ -97,6 +107,44 @@ def main():
                     "entries": entries,
                 },
                 delay,
+            )
+        elif kind == "blame_line":
+            lnum = request.get("lnum", 0)
+            body = dict(blame_commit)
+            if lnum == uncommitted_lnum:
+                body = {
+                    "sha": "0" * 40,
+                    "author": "Not Committed Yet",
+                    "email": "",
+                    "time": blame_commit["time"],
+                    "summary": "uncommitted",
+                }
+            schedule(
+                dict(
+                    {
+                        "type": "blame_line",
+                        "id": request_id,
+                        "path": request.get("path", ""),
+                        "lnum": lnum,
+                    },
+                    **body,
+                ),
+                blame_line_delay,
+            )
+        elif kind == "blame":
+            emit(
+                {
+                    "type": "blame",
+                    "id": request_id,
+                    "path": request.get("path", ""),
+                    "lines": [blame_commit["sha"]] * blame_file_lines,
+                    "commits": {
+                        blame_commit["sha"]: {
+                            key: blame_commit[key]
+                            for key in ("author", "email", "time", "summary")
+                        }
+                    },
+                }
             )
         elif kind == "branch":
             emit(

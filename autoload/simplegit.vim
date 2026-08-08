@@ -30,6 +30,12 @@ var s_status_latest: dict<number> = {}
 # bufnr (string) -> {lines: list<string>, commits: dict<any>, failed: bool}
 var s_blame_cache: dict<dict<any>> = {}
 var s_blame_inflight: dict<bool> = {}
+# Single-line blame, the annotation's fast path: bufnr (string) ->
+# {tick: number, lines: dict<string>} where lines maps a line number to its
+# rendered annotation.  An entry with an empty string means "asked, nothing to
+# show", which is what stops the cursor from re-asking on every rest.
+var s_line_blame_cache: dict<dict<any>> = {}
+var s_line_blame_inflight: dict<bool> = {}
 var s_blame_timer: number = 0
 var s_line_blame_on: bool = true
 
@@ -55,6 +61,7 @@ const STATUS_BUF = 'simplegit://status'
 const COMMIT_BUF = 'simplegit://commit'
 const CAP_REPOSITORY_FILE_OPS = 'repository_file_ops'
 const CAP_BRANCH_SUMMARY = 'branch_summary'
+const CAP_BLAME_LINE = 'blame_line'
 
 # =============================================================
 # Small helpers
@@ -200,6 +207,7 @@ def ClearPending()
   s_wait_queue = []
   s_status_latest = {}
   s_blame_inflight = {}
+  s_line_blame_inflight = {}
   s_hunk_inflight = {}
   s_branch_inflight = {}
 enddef
@@ -315,6 +323,8 @@ def OnDaemonEvent(ev: dict<any>)
   endif
   if ev.type ==# 'blame'
     OnBlame(ctx, ev)
+  elseif ev.type ==# 'blame_line'
+    OnBlameLine(ctx, ev)
   elseif ev.type ==# 'log'
     OnLog(ctx, ev)
   elseif ev.type ==# 'graph_log'
@@ -369,10 +379,13 @@ enddef
 
 def OnRequestError(ctx: dict<any>, message: any)
   var text = type(message) == v:t_string ? message : string(message)
-  if get(ctx, 'kind', '') ==# 'blame'
+  if get(ctx, 'kind', '') ==# 'blame' || get(ctx, 'kind', '') ==# 'blame_line'
     var key = string(get(ctx, 'bufnr', -1))
     if has_key(s_blame_inflight, key)
       remove(s_blame_inflight, key)
+    endif
+    if has_key(s_line_blame_inflight, key .. ':' .. get(ctx, 'lnum', 0))
+      remove(s_line_blame_inflight, key .. ':' .. get(ctx, 'lnum', 0))
     endif
     # Remember the failure so cursor movement does not hammer the daemon
     # with requests for files outside any repository.
@@ -469,6 +482,38 @@ def InvalidateBlame(bufnr: number)
   if has_key(s_blame_cache, key)
     remove(s_blame_cache, key)
   endif
+  if has_key(s_line_blame_cache, key)
+    remove(s_line_blame_cache, key)
+  endif
+enddef
+
+const BLAME_FORMAT_DEFAULT = '%a, %w • %s'
+
+# Render one commit through g:simplegit_blame_format.  Expanding every key in
+# a single substitute() pass is what keeps a summary containing a literal `%`
+# from being re-expanded as a format key of its own.
+def FormatBlame(sha: string, info: dict<any>): string
+  if sha ==# UNCOMMITTED
+    return 'Uncommitted changes'
+  endif
+  var epoch = get(info, 'time', 0)
+  var fields = {
+    a: get(info, 'author', ''),
+    e: get(info, 'email', ''),
+    h: ShortSha(sha),
+    d: CommitDate(epoch),
+    w: TimeAgo(epoch),
+    s: get(info, 'summary', ''),
+    '%': '%',
+  }
+  var fmt = get(g:, 'simplegit_blame_format', BLAME_FORMAT_DEFAULT)
+  if type(fmt) != v:t_string || fmt ==# ''
+    fmt = BLAME_FORMAT_DEFAULT
+  endif
+  # An unknown key is left as typed, so a typo is visible rather than silently
+  # swallowing the character after it.
+  return substitute(fmt, '%\(.\)',
+    (m: list<string>): string => get(fields, m[1], m[0]), 'g')
 enddef
 
 def LineAnnotation(blame: dict<any>, lnum: number): string
@@ -484,10 +529,105 @@ def LineAnnotation(blame: dict<any>, lnum: number): string
   if empty(info)
     return ''
   endif
-  var author = get(info, 'author', '')
-  var when = TimeAgo(get(info, 'time', 0))
-  var summary = get(info, 'summary', '')
-  return author .. ', ' .. when .. ' • ' .. summary
+  return FormatBlame(sha, info)
+enddef
+
+# =============================================================
+# Single-line blame — the annotation's fast path
+#
+# Annotating one line used to blame the entire file: on a large file with deep
+# history that is seconds of git plus a sha and a header block per line to
+# decode on Vim's main thread, redone after every :w.  `git blame -L n,n` stops
+# as soon as that one line is attributed.
+# =============================================================
+def LineBlameSupported(): bool
+  # Capabilities are known only after the handshake; until then use the
+  # whole-file request rather than one an older daemon cannot parse.
+  return s_daemon_ready && simplegit#core#HasCap(CAP_BLAME_LINE)
+enddef
+
+# {} when this line has not been asked about yet; otherwise the commit fields,
+# with an empty sha meaning "asked, nothing to show" — which is what stops the
+# cursor from re-asking on every rest.  Raw fields rather than rendered text,
+# so changing g:simplegit_blame_format takes effect without a refetch.
+def CachedLineBlame(bufnr: number, lnum: number): dict<any>
+  var entry = get(s_line_blame_cache, string(bufnr), {})
+  if empty(entry) || get(entry, 'tick', -1) != getbufvar(bufnr, 'changedtick', -2)
+    return {}
+  endif
+  var lines: dict<any> = get(entry, 'lines', {})
+  return get(lines, string(lnum), {})
+enddef
+
+def RecordLineBlame(bufnr: number, lnum: number, info: dict<any>)
+  var key = string(bufnr)
+  var tick = getbufvar(bufnr, 'changedtick', 0)
+  var entry: dict<any> = get(s_line_blame_cache, key, {})
+  if empty(entry) || get(entry, 'tick', -1) != tick
+    entry = {tick: tick, lines: {}}
+  endif
+  # Reading a long file line by line must not grow this without bound.
+  if len(entry.lines) >= 1024
+    entry.lines = {}
+  endif
+  entry.lines[string(lnum)] = info
+  if len(s_line_blame_cache) >= 64 && !has_key(s_line_blame_cache, key)
+    remove(s_line_blame_cache, keys(s_line_blame_cache)[0])
+  endif
+  s_line_blame_cache[key] = entry
+enddef
+
+def RequestLineBlame(bufnr: number, lnum: number, purpose: string, interactive: bool): bool
+  var path = BufFilePath(bufnr)
+  if path ==# ''
+    return false
+  endif
+  var key = string(bufnr) .. ':' .. lnum
+  if has_key(s_line_blame_inflight, key)
+    return true
+  endif
+  var ok = Dispatch({type: 'blame_line', path: path, lnum: lnum},
+    {kind: 'blame_line', bufnr: bufnr, lnum: lnum, purpose: purpose,
+     interactive: interactive, changedtick: getbufvar(bufnr, 'changedtick', 0)})
+  if ok
+    s_line_blame_inflight[key] = true
+  endif
+  return ok
+enddef
+
+def OnBlameLine(ctx: dict<any>, ev: dict<any>)
+  var bufnr = get(ctx, 'bufnr', -1)
+  var lnum = get(ctx, 'lnum', 0)
+  var key = string(bufnr) .. ':' .. lnum
+  if has_key(s_line_blame_inflight, key)
+    remove(s_line_blame_inflight, key)
+  endif
+  var sha = get(ev, 'sha', '')
+  if type(sha) != v:t_string
+    DebugLog('ignored malformed blame_line response')
+    return
+  endif
+  if !bufexists(bufnr)
+    return
+  endif
+  # An edit while the reply was in flight moved the line the answer describes.
+  if getbufvar(bufnr, 'changedtick', 0) != get(ctx, 'changedtick', -1)
+    return
+  endif
+  # Keep only the fields the annotation renders, not the whole event.
+  var info = {
+    sha: sha,
+    author: get(ev, 'author', ''),
+    email: get(ev, 'email', ''),
+    time: get(ev, 'time', 0),
+    summary: get(ev, 'summary', ''),
+  }
+  RecordLineBlame(bufnr, lnum, info)
+  if get(ctx, 'purpose', 'virtual') ==# 'popup'
+    ShowLineBlamePopup(bufnr, lnum, sha, info)
+  elseif bufnr == bufnr('%') && lnum == line('.')
+    ShowLineBlameNow()
+  endif
 enddef
 
 # =============================================================
@@ -524,20 +664,33 @@ def ShowLineBlameNow()
   if getbufvar(bufnr, '&modified') || BufFilePath(bufnr) ==# ''
     return
   endif
+  var lnum = line('.')
   var blame = BlameFor(bufnr)
-  if empty(blame)
-    RequestBlame(bufnr, 'virtual', false)
-    return
-  endif
   if get(blame, 'failed', false)
     return
   endif
-  var text = LineAnnotation(blame, line('.'))
+  var text = ''
+  if !empty(blame)
+    # The sidebar already paid for the whole file; reuse it rather than
+    # asking again per line.
+    text = LineAnnotation(blame, lnum)
+  elseif LineBlameSupported()
+    var cached = CachedLineBlame(bufnr, lnum)
+    if empty(cached)
+      RequestLineBlame(bufnr, lnum, 'virtual', false)
+      return
+    endif
+    var sha: string = get(cached, 'sha', '')
+    text = sha ==# '' ? '' : FormatBlame(sha, cached)
+  else
+    RequestBlame(bufnr, 'virtual', false)
+    return
+  endif
   if text ==# ''
     return
   endif
   EnsurePropType()
-  prop_add(line('.'), 0, {
+  prop_add(lnum, 0, {
     type: PROP_TYPE,
     bufnr: bufnr,
     text: '    ' .. text,
@@ -628,6 +781,30 @@ enddef
 # =============================================================
 # Blame popup for the current line
 # =============================================================
+def BlamePopupText(sha: string, info: dict<any>): list<string>
+  var when = get(info, 'time', 0)
+  return [
+    'Commit  ' .. ShortSha(sha),
+    'Author  ' .. get(info, 'author', ''),
+    'Date    ' .. (when > 0 ? strftime('%Y-%m-%d %H:%M', when) .. ' (' .. TimeAgo(when) .. ')' : ''),
+    '',
+    get(info, 'summary', ''),
+  ]
+enddef
+
+def ShowPopup(text: list<string>)
+  if has('popupwin')
+    popup_atcursor(text, {
+      padding: [0, 1, 0, 1],
+      border: [1, 1, 1, 1],
+      borderchars: ['─', '│', '─', '│', '┌', '┐', '┘', '└'],
+      moved: 'any',
+    })
+  else
+    echo join(text, ' | ')
+  endif
+enddef
+
 def ShowBlamePopup(bufnr: number)
   if bufnr != bufnr('%')
     return
@@ -648,25 +825,22 @@ def ShowBlamePopup(bufnr: number)
     echo '[SimpleGit] Uncommitted changes'
     return
   endif
-  var info = get(blame.commits, sha, {})
-  var when = get(info, 'time', 0)
-  var text = [
-    'Commit  ' .. ShortSha(sha),
-    'Author  ' .. get(info, 'author', ''),
-    'Date    ' .. (when > 0 ? strftime('%Y-%m-%d %H:%M', when) .. ' (' .. TimeAgo(when) .. ')' : ''),
-    '',
-    get(info, 'summary', ''),
-  ]
-  if has('popupwin')
-    popup_atcursor(text, {
-      padding: [0, 1, 0, 1],
-      border: [1, 1, 1, 1],
-      borderchars: ['─', '│', '─', '│', '┌', '┐', '┘', '└'],
-      moved: 'any',
-    })
-  else
-    echo join(text, ' | ')
+  ShowPopup(BlamePopupText(sha, get(blame.commits, sha, {})))
+enddef
+
+def ShowLineBlamePopup(bufnr: number, lnum: number, sha: string, info: dict<any>)
+  if bufnr != bufnr('%') || lnum != line('.')
+    return
   endif
+  if sha ==# UNCOMMITTED
+    echo '[SimpleGit] Uncommitted changes'
+    return
+  endif
+  if sha ==# ''
+    Warn('line has no blame information')
+    return
+  endif
+  ShowPopup(BlamePopupText(sha, info))
 enddef
 
 export def BlameLine()
@@ -676,13 +850,28 @@ export def BlameLine()
     return
   endif
   var blame = BlameFor(bufnr)
-  if empty(blame)
-    if !RequestBlame(bufnr, 'popup', true)
+  if !empty(blame)
+    ShowBlamePopup(bufnr)
+    return
+  endif
+  # A modified buffer no longer matches the file on disk, so a line number is
+  # not a safe thing to send: fall back to the whole-file request, which
+  # reports the mismatch instead of asking git for a line that may not exist.
+  if LineBlameSupported() && !getbufvar(bufnr, '&modified')
+    var lnum = line('.')
+    var cached = CachedLineBlame(bufnr, lnum)
+    if !empty(cached)
+      ShowLineBlamePopup(bufnr, lnum, get(cached, 'sha', ''), cached)
+      return
+    endif
+    if !RequestLineBlame(bufnr, lnum, 'popup', true)
       Warn('daemon unavailable; run ./install.sh')
     endif
     return
   endif
-  ShowBlamePopup(bufnr)
+  if !RequestBlame(bufnr, 'popup', true)
+    Warn('daemon unavailable; run ./install.sh')
+  endif
 enddef
 
 # =============================================================
@@ -2521,6 +2710,22 @@ export def HunkSummary(buf: number = 0): dict<number>
   return HunkCounts(TargetBuf(buf))
 enddef
 
+# The inline blame annotation for one line, rendered through
+# g:simplegit_blame_format — '' while it is still unknown.  Like the other
+# accessors this only reads caches and never dispatches, so a custom renderer
+# can call it as freely as the plugin's own annotation does.
+export def BlameAnnotation(buf: number = 0, lnum: number = 0): string
+  var bufnr = TargetBuf(buf)
+  var line_number = lnum > 0 ? lnum : (bufnr == bufnr('%') ? line('.') : 1)
+  var blame = BlameFor(bufnr)
+  if !empty(blame)
+    return get(blame, 'failed', false) ? '' : LineAnnotation(blame, line_number)
+  endif
+  var cached = CachedLineBlame(bufnr, line_number)
+  var sha: string = get(cached, 'sha', '')
+  return sha ==# '' ? '' : FormatBlame(sha, cached)
+enddef
+
 # Ready-made segment, for example `main ↑2 +12 ~3 -1`. Empty while the branch
 # is unknown or the buffer belongs to no repository, so a statusline can
 # concatenate it unconditionally.
@@ -2586,6 +2791,7 @@ export def Stop()
   s_daemon_ready = false
   ClearPending()
   s_blame_cache = {}
+  s_line_blame_cache = {}
   s_hunk_cache = {}
   s_branch_cache = {}
 enddef
@@ -2637,6 +2843,10 @@ export def Health()
         .. 'ms debounce, '
         .. (ConfBool('simplegit_status_auto_refresh', true) ? 'on' : 'off')
         .. (s_status_refresh_timer != 0 ? ' (pending)' : '')
+  echo '  per-line blame: '
+        .. (!s_daemon_ready ? 'unknown (handshake pending)'
+          : simplegit#core#HasCap(CAP_BLAME_LINE) ? 'supported'
+          : 'unavailable (rerun ./install.sh)')
   echo '  branch summary: '
         .. (!s_daemon_ready ? 'unknown (handshake pending)'
           : simplegit#core#HasCap(CAP_BRANCH_SUMMARY) ? 'supported'

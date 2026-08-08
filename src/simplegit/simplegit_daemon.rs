@@ -22,6 +22,7 @@ const MAX_PENDING_INDEX_MUTATIONS: usize = 1024;
 const PROTOCOL_VERSION: u32 = 5;
 const CAP_REPOSITORY_FILE_OPS: &str = "repository_file_ops";
 const CAP_BRANCH_SUMMARY: &str = "branch_summary";
+const CAP_BLAME_LINE: &str = "blame_line";
 const GIT_REPOSITORY_ENV_VARS: [&str; 8] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -38,9 +39,14 @@ const GIT_REPOSITORY_ENV_VARS: [&str; 8] = [
 enum Request {
     #[serde(rename = "version")]
     Version { id: u64 },
-    /// Per-line blame for one file on disk.
+    /// Whole-file blame, for the sidebar.
     #[serde(rename = "blame")]
     Blame { id: u64, path: String },
+    /// Blame for a single line (`git blame -L`). The inline annotation shows
+    /// one line at a time, and blaming the whole file to render it costs
+    /// seconds on a large file with deep history.
+    #[serde(rename = "blame_line")]
+    BlameLine { id: u64, path: String, lnum: u32 },
     /// Commit history that touched one file.
     #[serde(rename = "log")]
     Log {
@@ -123,9 +129,11 @@ enum Request {
     },
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Clone, Default, PartialEq, Eq)]
 struct CommitInfo {
     author: String,
+    /// Bare address, angle brackets stripped, for `%e` in the annotation.
+    email: String,
     time: i64,
     summary: String,
 }
@@ -184,6 +192,18 @@ enum Event {
         path: String,
         lines: Vec<String>,
         commits: HashMap<String, CommitInfo>,
+    },
+    #[serde(rename = "blame_line")]
+    BlameLine {
+        id: u64,
+        path: String,
+        lnum: u32,
+        /// All zeroes for a line that is not committed yet.
+        sha: String,
+        author: String,
+        email: String,
+        time: i64,
+        summary: String,
     },
     #[serde(rename = "log")]
     Log {
@@ -308,7 +328,11 @@ impl IndexMutation {
 }
 
 fn protocol_capabilities() -> HashMap<&'static str, bool> {
-    HashMap::from([(CAP_REPOSITORY_FILE_OPS, true), (CAP_BRANCH_SUMMARY, true)])
+    HashMap::from([
+        (CAP_REPOSITORY_FILE_OPS, true),
+        (CAP_BRANCH_SUMMARY, true),
+        (CAP_BLAME_LINE, true),
+    ])
 }
 
 async fn stdout_writer<W>(mut out: W, mut rx: tokio::sync::mpsc::Receiver<String>) -> io::Result<()>
@@ -467,12 +491,16 @@ struct BlameResult {
     commits: HashMap<String, CommitInfo>,
 }
 
-/// Parse `git blame --line-porcelain` output. Every output line carries the
-/// full header block, so the parser only needs the fields it displays.
+/// Parse `git blame --porcelain` output. The first block for a commit carries
+/// the full header; later blocks for the same commit carry only the sha line,
+/// which is exactly why `commits.entry(..).or_insert_with(..)` below must keep
+/// the first block rather than overwrite it.  That also makes the parser
+/// correct for `--line-porcelain`, where every block is a full header.
 fn parse_blame(stdout: &str) -> BlameResult {
     let mut result = BlameResult::default();
     let mut sha = String::new();
     let mut author = String::new();
+    let mut email = String::new();
     let mut time: i64 = 0;
     let mut summary = String::new();
 
@@ -485,6 +513,7 @@ fn parse_blame(stdout: &str) -> BlameResult {
                     .entry(sha.clone())
                     .or_insert_with(|| CommitInfo {
                         author: author.clone(),
+                        email: email.clone(),
                         time,
                         summary: summary.clone(),
                     });
@@ -492,12 +521,19 @@ fn parse_blame(stdout: &str) -> BlameResult {
             }
             sha.clear();
             author.clear();
+            email.clear();
             time = 0;
             summary.clear();
             continue;
         }
         if let Some(value) = line.strip_prefix("author ") {
             author = value.to_string();
+        } else if let Some(value) = line.strip_prefix("author-mail ") {
+            email = value
+                .trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .to_string();
         } else if let Some(value) = line.strip_prefix("author-time ") {
             time = value.trim().parse().unwrap_or(0);
         } else if let Some(value) = line.strip_prefix("summary ") {
@@ -515,8 +551,12 @@ fn parse_blame(stdout: &str) -> BlameResult {
 
 async fn handle_blame(id: u64, path: String, tx: EventTx, _permit: OwnedSemaphorePermit) {
     let dir = file_dir(&path);
+    // --porcelain repeats only the sha for a commit already described, where
+    // --line-porcelain repeats the whole header block per line: on a file with
+    // few distinct commits that is an order of magnitude less stdout to write,
+    // read and JSON-decode on Vim's main thread.
     let result = match file_name(&path) {
-        Ok(name) => run_git(&dir, &["blame", "--line-porcelain", "--", &name])
+        Ok(name) => run_git(&dir, &["blame", "--porcelain", "--", &name])
             .await
             .map(|stdout| parse_blame(&stdout)),
         Err(message) => Err(message),
@@ -530,6 +570,47 @@ async fn handle_blame(id: u64, path: String, tx: EventTx, _permit: OwnedSemaphor
                     path,
                     lines: blame.lines,
                     commits: blame.commits,
+                },
+            )
+            .await;
+        }
+        Err(message) => send_event(&tx, &Event::Error { id, message }).await,
+    }
+}
+
+/// Blame exactly one line.  `-L n,n` lets git stop walking history as soon as
+/// that line is attributed, instead of attributing every line in the file to
+/// render a single annotation.
+async fn handle_blame_line(
+    id: u64,
+    path: String,
+    lnum: u32,
+    tx: EventTx,
+    _permit: OwnedSemaphorePermit,
+) {
+    let dir = file_dir(&path);
+    let range = format!("-L{lnum},{lnum}");
+    let result = match file_name(&path) {
+        Ok(name) => run_git(&dir, &["blame", "--porcelain", &range, "--", &name])
+            .await
+            .map(|stdout| parse_blame(&stdout)),
+        Err(message) => Err(message),
+    };
+    match result {
+        Ok(blame) => {
+            let sha = blame.lines.first().cloned().unwrap_or_default();
+            let info = blame.commits.get(&sha).cloned().unwrap_or_default();
+            send_event(
+                &tx,
+                &Event::BlameLine {
+                    id,
+                    path,
+                    lnum,
+                    sha,
+                    author: info.author,
+                    email: info.email,
+                    time: info.time,
+                    summary: info.summary,
                 },
             )
             .await;
@@ -1430,6 +1511,7 @@ fn request_id_and_path(req: &Request) -> (u64, Option<&str>) {
     match req {
         Request::Version { id } => (*id, None),
         Request::Blame { id, path } => (*id, Some(path)),
+        Request::BlameLine { id, path, .. } => (*id, Some(path)),
         Request::Log { id, path, .. } => (*id, Some(path)),
         Request::GraphLog { id, path, .. } => (*id, Some(path)),
         Request::Show { id, path, .. } => (*id, Some(path)),
@@ -1529,6 +1611,11 @@ where
                 let tx = out_tx.clone();
                 let permit = git_limiter.clone().acquire_owned().await.unwrap();
                 requests.spawn(handle_blame(id, path, tx, permit));
+            }
+            Request::BlameLine { id, path, lnum } => {
+                let tx = out_tx.clone();
+                let permit = git_limiter.clone().acquire_owned().await.unwrap();
+                requests.spawn(handle_blame_line(id, path, lnum, tx, permit));
             }
             Request::Log { id, path, limit } => {
                 let tx = out_tx.clone();
@@ -1829,8 +1916,70 @@ mod tests {
         assert_eq!(result.lines, vec![sha_a, sha_a, sha_b]);
         assert_eq!(result.commits.len(), 2);
         assert_eq!(result.commits[sha_a].author, "Alice");
+        assert_eq!(result.commits[sha_a].email, "alice@example.com");
         assert_eq!(result.commits[sha_a].time, 1_700_000_000);
         assert_eq!(result.commits[sha_b].summary, "second commit");
+    }
+
+    /// Plain `--porcelain` -- what both blame paths now request -- emits the
+    /// header block only for the first line of a commit; every later line of
+    /// the same commit is a bare sha line followed by its content.  Nothing
+    /// pinned that before, and it is precisely what makes the switch away from
+    /// --line-porcelain safe.
+    #[test]
+    fn blame_porcelain_repeats_only_the_sha() {
+        let sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let sha_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let stdout = format!(
+            "{sha_a} 1 1 2\n\
+             author Alice\n\
+             author-mail <alice@example.com>\n\
+             author-time 1700000000\n\
+             summary first commit\n\
+             filename foo.txt\n\
+             \tline one\n\
+             {sha_a} 2 2\n\
+             \tline two\n\
+             {sha_b} 3 3 1\n\
+             author Bob\n\
+             author-mail <bob@example.com>\n\
+             author-time 1710000000\n\
+             summary second commit\n\
+             filename foo.txt\n\
+             \tline three\n\
+             {sha_a} 4 4\n\
+             \tline four\n"
+        );
+        let result = parse_blame(&stdout);
+        assert_eq!(result.lines, vec![sha_a, sha_a, sha_b, sha_a]);
+        // The abbreviated repeats must reuse the first block, not blank it out.
+        assert_eq!(result.commits.len(), 2);
+        assert_eq!(result.commits[sha_a].author, "Alice");
+        assert_eq!(result.commits[sha_a].email, "alice@example.com");
+        assert_eq!(result.commits[sha_a].summary, "first commit");
+        assert_eq!(result.commits[sha_a].time, 1_700_000_000);
+        assert_eq!(result.commits[sha_b].author, "Bob");
+    }
+
+    /// `git blame --porcelain -L n,n` returns a single block; the daemon
+    /// reports it as one commit rather than a whole-file map.
+    #[test]
+    fn blame_of_one_line_yields_one_commit() {
+        let sha = "cccccccccccccccccccccccccccccccccccccccc";
+        let stdout = format!(
+            "{sha} 42 42 1\n\
+             author Carol\n\
+             author-mail <carol@example.com>\n\
+             author-time 1720000000\n\
+             summary only this line\n\
+             filename foo.txt\n\
+             \tthe line itself\n"
+        );
+        let result = parse_blame(&stdout);
+        assert_eq!(result.lines, vec![sha]);
+        assert_eq!(result.commits[sha].author, "Carol");
+        assert_eq!(result.commits[sha].email, "carol@example.com");
+        assert_eq!(result.commits[sha].summary, "only this line");
     }
 
     #[test]

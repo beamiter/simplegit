@@ -2,6 +2,24 @@
 
 ## Unreleased - 2026-08-08
 
+### 单行 blame
+
+- 内联注释此前为了标注一行而 blame 整个文件:在大文件+深历史上就是数秒的 git,
+  外加"每行一个 40 字符 sha + 一整块 header"的 JSON 在 Vim 主线程上解码,而且
+  每次 `:w` 都要重来一遍。现在改为 `git blame --porcelain -L n,n`,只标注光标
+  所在的那一行,并按行缓存(带 changedtick 校验,飞行途中发生编辑的回复会被丢弃)。
+- `:SimpleGitBlameLine` 的 popup 走同一条路径,同样只 blame 一行。
+- 侧边栏(`:SimpleGitBlame`)仍然一次读整个文件;只要那份缓存还在,注释就直接
+  复用它,不会再按行发请求。
+- `handle_blame` 从 `--line-porcelain` 换成 `--porcelain`:同一 commit 的后续行
+  只重复 sha 而不重复整块 header,stdout 通常小一个数量级。`parse_blame` 本就
+  依赖 `entry().or_insert_with()` 保留首块,现在补了针对缩略输出的测试把这一点钉住。
+- 新增 `g:simplegit_blame_format`(默认 `'%a, %w • %s'`,键 `%a %e %h %d %w %s %%`)
+  与公开的 `simplegit#BlameAnnotation()`。缓存的是原始字段而不是渲染结果,所以
+  改 format 立即生效、无需重新取数。
+- capability `blame_line`(protocol 仍为 5):旧 daemon 保持原有整文件行为。
+- 新增 `make vim-blame` 回归。
+
 ### Statusline API
 
 - 新增公开、稳定的 statusline 接口:`simplegit#StatusLine()` 直接给出

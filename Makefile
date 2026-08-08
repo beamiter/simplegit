@@ -1,6 +1,6 @@
-.PHONY: check fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-core defcompile core-verify
+.PHONY: check fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame vim-core defcompile core-verify
 
-check: core-verify fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline defcompile vim-core
+check: core-verify fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame defcompile vim-core
 
 fmt:
 	cargo fmt --all -- --check
@@ -31,6 +31,11 @@ vim-file-ops:
 # pins that none of them dispatches a request.
 vim-statusline:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_statusline.vim
+
+# Per-line blame: the `git blame -L` request, its capability fallback to the
+# whole-file blame, the per-line cache and g:simplegit_blame_format.
+vim-blame:
+	vim -Nu NONE -n -i NONE -es -S tests/vim_blame.vim
 
 # ---------------------------------------------------------------------------
 # simplecore: the vendored daemon supervisor shared by the simple* suite.

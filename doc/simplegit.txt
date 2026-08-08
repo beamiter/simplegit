@@ -50,6 +50,8 @@ COMMANDS                                                   *simplegit-commands*
 
 :SimpleGitBlameLine                                       *:SimpleGitBlameLine*
   Show a popup with commit, author, date and summary for the current line.
+  This blames only that line (`git blame -L`), so it is as fast on a large
+  file as on a small one; the result is cached per line.
 
 :SimpleGitToggleLineBlame                           *:SimpleGitToggleLineBlame*
   Toggle the inline current-line blame annotation.
@@ -181,6 +183,17 @@ g:simplegit_line_blame (default 1)                     *g:simplegit_line_blame*
 g:simplegit_blame_delay (default 350)                 *g:simplegit_blame_delay*
   Milliseconds after the cursor stops before the annotation appears.
 
+g:simplegit_blame_format (default '%a, %w • %s')     *g:simplegit_blame_format*
+  Layout of the inline annotation and of |simplegit#BlameAnnotation()|: >
+    %a  author name          %h  short commit sha
+    %e  author email         %d  commit date (YYYY-MM-DD)
+    %s  commit summary       %w  relative time ("3 days ago")
+    %%  a literal percent
+<
+  An unrecognised key is left as typed. Uncommitted lines always read
+  "Uncommitted changes" regardless of the format. Changing this takes effect
+  on the next annotation without refetching anything.
+
 g:simplegit_blame_width (default 34)                  *g:simplegit_blame_width*
   Width of the :SimpleGitBlame sidebar.
 
@@ -279,6 +292,13 @@ simplegit#HunkSummary([{bufnr}])                      *simplegit#HunkSummary()*
   same hunks that drive the sign column, so they track unsaved edits exactly
   as the signs do.
 
+simplegit#BlameAnnotation([{bufnr} [, {lnum}]])  *simplegit#BlameAnnotation()*
+  The inline blame annotation for one line, rendered through
+  |g:simplegit_blame_format| — the same string the virtual text shows. Empty
+  while that line's blame is still unknown. {lnum} defaults to the cursor
+  line of the current buffer. Like the other accessors it only reads caches,
+  so it never fetches a line that has not been annotated yet.
+
 b:simplegit_status_dict                              *b:simplegit_status_dict*
   Every file buffer carries the |simplegit#StatusDict()| result, updated
   whenever its hunks or its branch change. This is the
@@ -330,6 +350,13 @@ The inline annotation intentionally disappears while the buffer is modified:
 blame data reflects the file on disk, and edited line numbers would no longer
 match. Save the buffer to refresh it.
 
+The annotation blames one line at a time (`git blame --porcelain -L n,n`) and
+caches the answer per line, so a file with deep history annotates as quickly
+as a shallow one. The blame sidebar still reads the whole file in one request,
+and while that result is cached every annotation is served from it. An older
+daemon that does not advertise the `blame_line` capability keeps the previous
+whole-file behaviour; |:SimpleGitHealth| reports which.
+
 
 ==============================================================================
 DAEMON SUPERVISION                                    *simplegit-daemon*
@@ -353,9 +380,10 @@ What it guarantees:
 - Requests are correlated to replies by id and can time out, so a wedged
   daemon never leaves a callback hanging.
 - Protocol 5 also negotiates additive capabilities. Whole-repository file
-  operations require repository_file_ops and the |simplegit-statusline|
-  branch requires branch_summary; a protocol-5 daemon without either is
-  still usable for every older request.
+  operations require repository_file_ops, the |simplegit-statusline| branch
+  requires branch_summary and single-line blame requires blame_line; a
+  protocol-5 daemon without any of them is still usable for every older
+  request.
 - Hunk stage/undo, file stage/reset and commit operations share one FIFO
   index lane. They complete in request order and cannot race each other for
   .git/index.lock; read-only blame/log/status work remains concurrent.

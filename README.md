@@ -6,7 +6,7 @@ Like the other `simple*` plugins, rendering stays in Vim9script and all git work
 
 ## Features
 
-- **Inline line blame** (GitLens style): `author, 3 days ago • commit summary` appears as virtual text after the current line, debounced and only when the buffer is unmodified.
+- **Inline line blame** (GitLens style): `author, 3 days ago • commit summary` appears as virtual text after the current line, debounced and only when the buffer is unmodified. One line is blamed at a time (`git blame -L`) and cached per line, so deep history costs nothing extra; the layout is `g:simplegit_blame_format`.
 - **Blame sidebar** (`:SimpleGitBlame`): per-line commit/date/author, scroll-synced with the file; `<CR>` opens the commit, `p` pops up its details, `q` closes.
 - **File history** (`:SimpleGitHistory`): `git log --follow` for the current file; `<CR>` shows the commit's changes to this file, `a` the whole commit.
 - **Commit graph** (`:SimpleGitLog`): repository-wide `git log --graph` with branch topology, refs and dates; `<CR>` shows the commit under the cursor, `m` loads more commits.
@@ -123,6 +123,7 @@ Default mappings (only installed when the keys are free; disable with `let g:sim
 let g:simplegit_auto_enable = 1        " start on VimEnter
 let g:simplegit_line_blame = 1         " inline current-line annotation
 let g:simplegit_blame_delay = 350      " ms of cursor rest before it appears
+let g:simplegit_blame_format = '%a, %w • %s'  " %a %e %h %d %w %s
 let g:simplegit_blame_width = 34       " sidebar width
 let g:simplegit_history_limit = 200    " max commits in :SimpleGitHistory
 let g:simplegit_log_limit = 200        " commits per :SimpleGitLog page

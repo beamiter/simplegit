@@ -27,6 +27,9 @@ g:simplegit_auto_enable = ConfigFlag('simplegit_auto_enable', 1)
 g:simplegit_line_blame = ConfigFlag('simplegit_line_blame', 1)
 # Delay (ms) after the cursor stops before the annotation appears.
 g:simplegit_blame_delay = get(g:, 'simplegit_blame_delay', 350)
+# Annotation layout: %a author, %e email, %h short sha, %d date, %w relative
+# time, %s summary, %% a literal percent.
+g:simplegit_blame_format = get(g:, 'simplegit_blame_format', '%a, %w • %s')
 # Width of the :SimpleGitBlame sidebar.
 g:simplegit_blame_width = get(g:, 'simplegit_blame_width', 34)
 # Maximum commits shown by :SimpleGitHistory.
