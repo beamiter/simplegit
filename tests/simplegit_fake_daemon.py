@@ -58,6 +58,13 @@ def main():
         "time": int(os.environ.get("SIMPLEGIT_FAKE_BLAME_TIME", "1700000000")),
         "summary": "initial import",
     }
+    branch_count = 0
+    branch_delays = delays_from_env("SIMPLEGIT_FAKE_BRANCH_DELAYS")
+    branch_heads = [
+        value
+        for value in os.environ.get("SIMPLEGIT_FAKE_BRANCH_HEADS", "").split(",")
+        if value
+    ]
     hunks = []
     raw_hunks = os.environ.get("SIMPLEGIT_FAKE_HUNKS", "")
     if raw_hunks:
@@ -212,15 +219,28 @@ def main():
                 }
             )
         elif kind == "branch":
-            emit(
+            branch_count += 1
+            # SIMPLEGIT_FAKE_BRANCH_HEADS/_DELAYS answer the nth branch read
+            # differently, which is how a test holds one read on the wire while
+            # a checkout-style event asks the question again.
+            head = os.environ.get("SIMPLEGIT_FAKE_HEAD", "fake-branch")
+            if branch_heads:
+                head = branch_heads[min(branch_count - 1, len(branch_heads) - 1)]
+            delay = (
+                branch_delays[branch_count - 1]
+                if branch_count <= len(branch_delays)
+                else 0
+            )
+            schedule(
                 {
                     "type": "branch",
                     "id": request_id,
                     "path": request.get("path", ""),
-                    "head": os.environ.get("SIMPLEGIT_FAKE_HEAD", "fake-branch"),
+                    "head": head,
                     "ahead": int(os.environ.get("SIMPLEGIT_FAKE_AHEAD", "0")),
                     "behind": int(os.environ.get("SIMPLEGIT_FAKE_BEHIND", "0")),
-                }
+                },
+                delay,
             )
         elif kind == "hunks":
             schedule(

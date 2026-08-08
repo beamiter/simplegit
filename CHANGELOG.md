@@ -2,6 +2,19 @@
 
 ## Unreleased - 2026-08-08
 
+### 修复:in-flight 的 branch 读会吞掉一次外部 checkout
+
+- 外部变更(`FocusGained`/`ShellCmdPost`)只清空 `s_branch_cache`,却留着
+  `s_branch_inflight`。如果 checkout 恰好落在一次 branch 读已经上路、回复还没到
+  的窗口里,`EnsureBranch()` 会因为 in-flight 标记直接返回、不再问;而那条陈旧的
+  回复落地时又把**切换前**的分支写回缓存。结果是 statusline 显示旧分支,而且缓存
+  已被填满,要等下一次外部事件或 `:SimpleGitRestart` 才会纠正。
+- 现在缓存与 in-flight 标记一起失效,并引入 generation:回复带着自己发出时的
+  generation,不匹配就丢弃。于是重问立刻发出,陈旧回复(哪怕后到)也进不了缓存;
+  失败回复走同一条规则。
+- `make vim-statusline` 新增回归:第一次读被压住 500ms,期间触发一次外部变更,
+  断言第二次请求确实上了线、分支最终是新的,并且在陈旧回复落地之后仍然是新的。
+
 ### 修复:live diff 的临时文件
 
 - 未保存 buffer 的 live diff 此前写到 `$TMPDIR/simplegit-<pid>-<id>.buffer`:

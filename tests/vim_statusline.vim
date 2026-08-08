@@ -200,6 +200,41 @@ assert_equal(hunks_before, len(Requests('hunks')),
   'without the sign column nothing asks the daemon for hunks')
 simplegit#ToggleSigns()
 
+# --- A checkout landing while a branch read is in flight -------------------
+# The window between dispatching a branch read and its reply is exactly when a
+# `git checkout` in another terminal is likely to happen.  Forgetting the
+# cached branch is not enough: the read already on the wire answers the old
+# question, and if it is allowed to settle it refills the cache with the branch
+# the user just left -- and, the cache now being populated, nothing asks again
+# until the next external event.  So the abandoned read has to be both
+# re-issued at once and discarded when it finally lands.
+delete(request_log)
+$SIMPLEGIT_FAKE_BRANCH_HEADS = 'before-checkout,after-checkout'
+# The first (superseded) read is held long enough to land *after* the second,
+# so taking the newest reply to arrive would still be wrong.
+$SIMPLEGIT_FAKE_BRANCH_DELAYS = '500,0'
+simplegit#Stop()
+WaitFor(() => !simplegit#core#IsRunning(), 'previous daemon stops')
+var race_starts = simplegit#core#Health().starts
+simplegit#Restart()
+WaitFor(() => simplegit#core#Health().starts > race_starts && simplegit#core#Ready(),
+  'branch race daemon handshake')
+
+execute 'edit ' .. fnameescape(repo .. '/sample.txt')
+WaitFor(() => len(Requests('branch')) == 1, 'opening the buffer reads the branch')
+# Still in flight: its reply is 500ms away.
+assert_equal('', simplegit#Head(), 'the branch is unknown while the read is in flight')
+simplegit#OnExternalChange()
+WaitFor(() => len(Requests('branch')) >= 2,
+  'an external change re-asks even while a read is in flight')
+WaitFor(() => simplegit#Head() ==# 'after-checkout', 'the re-read answers')
+# Outlive the superseded reply and prove it was thrown away.
+sleep 700m
+assert_equal('after-checkout', simplegit#Head(),
+  'the abandoned read does not refill the cache')
+assert_equal('after-checkout', get(simplegit#StatusDict(), 'head', ''),
+  'and the dict agrees')
+
 simplegit#Disable()
 WaitFor(() => !simplegit#core#IsRunning(), 'statusline daemon stops')
 delete(repo, 'rf')

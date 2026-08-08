@@ -418,7 +418,12 @@ def OnRequestError(ctx: dict<any>, message: any)
     endif
     s_hunk_cache[key] = {failed: true, hunks: []}
   elseif get(ctx, 'kind', '') ==# 'branch'
-    RecordBranchFailure(get(ctx, 'repo_token', ''))
+    # Same rule as a successful reply: a failure that answers a superseded
+    # question must not be cached, or a re-read that has already been issued
+    # would be shadowed by it.
+    if BranchReplyCurrent(ctx)
+      RecordBranchFailure(get(ctx, 'repo_token', ''))
+    endif
   elseif get(ctx, 'kind', '') ==# 'status'
     var request_key = get(ctx, 'status_request_key', '')
     if request_key !=# ''
@@ -762,7 +767,7 @@ def RefreshVisibleGitState()
   # `git init`, clone or submodule add moves where a buffer's repository even
   # begins -- so the remembered repository tokens go too.  This is the one
   # event that can invalidate them, and it is rare enough to pay for.
-  s_branch_cache = {}
+  InvalidateBranches()
   s_repo_token_cache = {}
   for win in getwininfo()
     if getbufvar(win.bufnr, '&buftype') !=# ''
@@ -2719,6 +2724,27 @@ enddef
 # repo token -> {head: string, ahead: number, behind: number}
 var s_branch_cache: dict<dict<any>> = {}
 var s_branch_inflight: dict<bool> = {}
+# Bumped whenever the cached branches stop being trustworthy (an external
+# checkout, a daemon restart).  A read that was already on the wire when that
+# happened answers the *old* question, so its reply carries the generation it
+# was issued under and is dropped when it no longer matches -- otherwise the
+# stale answer would refill the cache and EnsureBranch() would see a hit and
+# never ask again.
+var s_branch_generation: number = 0
+
+# Forget every cached branch and abandon the reads still in flight.
+def InvalidateBranches()
+  s_branch_generation += 1
+  s_branch_cache = {}
+  # Dropping the in-flight marks (rather than keeping them until their replies
+  # land) is what lets EnsureBranch() re-ask immediately; the abandoned replies
+  # are recognised by their generation and discarded.
+  s_branch_inflight = {}
+enddef
+
+def BranchReplyCurrent(ctx: dict<any>): bool
+  return get(ctx, 'branch_generation', -1) == s_branch_generation
+enddef
 
 # bufnr -> {name, token}: which repository a buffer belongs to, remembered.
 #
@@ -2791,6 +2817,7 @@ def EnsureBranch(bufnr: number)
     return
   endif
   var ctx: dict<any> = {kind: 'branch', interactive: false, repo_token: repo,
+    branch_generation: s_branch_generation,
     requires_capability: CAP_BRANCH_SUMMARY}
   if Dispatch({type: 'branch', path: fnamemodify(BufFilePath(bufnr), ':h')}, ctx)
     # Also set when the capability gate refused to send: an older daemon has
@@ -2806,6 +2833,10 @@ def OnBranch(ctx: dict<any>, ev: dict<any>)
   var behind = get(ev, 'behind', 0)
   if type(head) != v:t_string || type(ahead) != v:t_number || type(behind) != v:t_number
     DebugLog('ignored malformed branch response')
+    return
+  endif
+  if !BranchReplyCurrent(ctx)
+    DebugLog('ignored superseded branch response')
     return
   endif
   var repo = get(ctx, 'repo_token', '')
@@ -2976,7 +3007,7 @@ export def Stop()
   s_blame_cache = {}
   s_line_blame_cache = {}
   s_hunk_cache = {}
-  s_branch_cache = {}
+  InvalidateBranches()
 enddef
 
 export def Restart()
