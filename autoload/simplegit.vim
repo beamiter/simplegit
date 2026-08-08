@@ -1089,6 +1089,15 @@ enddef
 # working in, which is exactly what an asynchronous reply must never do.  A
 # scratch buffer owned by another tab is retired instead, because these names
 # are unique by construction and :file refuses a duplicate.
+#
+# Whichever branch it takes, this returns an *empty* scratch buffer that is
+# current in the current tab -- every caller writes its content with
+# setline(1, ...) and relies on nothing surviving underneath.  A branch that
+# returned a buffer still holding the previous text left the tail of that text
+# glued below the new content; for the commit message that meant committing
+# lines written for something else.  Unsaved text is protected by refusing the
+# command that would discard it (see Commit()), never by handing a dirty
+# buffer to a caller that assumes an empty one.
 def OpenScratch(name: string, height: number): number
   var existing = ScratchBufnr(name)
   for win in getwininfo()
@@ -1103,17 +1112,6 @@ def OpenScratch(name: string, height: number): number
     endif
   endfor
   if existing > 0
-    if getbufvar(existing, '&modified')
-      # Unsaved text -- a commit message being written in another tab -- is
-      # worth more than the tab the user is standing in.  Go to it instead of
-      # discarding it.  Only :SimpleGitCommit can reach this, and only
-      # synchronously, from a key the user just pressed.
-      var wins = win_findbuf(existing)
-      if !empty(wins)
-        win_gotoid(wins[0])
-        return existing
-      endif
-    endif
     silent execute 'bwipeout! ' .. existing
   endif
   silent keepalt botright new
@@ -2464,12 +2462,33 @@ def CommitHelpLines(dir: string, amend: bool): list<string>
   return lines
 enddef
 
+# Where a message the user still has to deal with is, so that the warning
+# naming it is actionable from any tab.
+def CommitBufWhere(bufnr: number): string
+  for win in getwininfo()
+    if win.bufnr == bufnr
+      return win.tabnr == tabpagenr() ? 'in this tab' : printf('in tab %d', win.tabnr)
+    endif
+  endfor
+  return 'elsewhere'
+enddef
+
 export def Commit(amend: bool = false)
   var existing = bufnr(COMMIT_BUF)
   if existing > 0 && bufexists(existing)
-        && getbufvar(existing, 'simplegit_commit_pending', false)
-    Warn('a commit is already in progress')
-    return
+    if getbufvar(existing, 'simplegit_commit_pending', false)
+      Warn('a commit is already in progress')
+      return
+    endif
+    if getbufvar(existing, '&modified')
+      # A message being written is not something to overwrite: opening on top
+      # of it replaced its head with the help template and left its tail below,
+      # and :w then committed those leftover lines as part of a different
+      # commit.  Point at it instead and let the user finish or abort it.
+      Warn('finish (:w) or abort (q) the commit message already open ' ..
+        CommitBufWhere(existing))
+      return
+    endif
   endif
   var dir = CommitRepoDir()
   var request_ctx = RequestContext('commit', dir, 1)

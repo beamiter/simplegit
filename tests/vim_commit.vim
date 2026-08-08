@@ -205,6 +205,45 @@ call assert_equal(s:before + 1, s:LogCount(),
 call assert_equal(s:decoy_before, s:DecoyCommits(),
       \ 'nothing was committed into the working directory repository')
 
+" --------------------------------- an unsaved message is never overwritten ---
+
+" Composing a message and running :SimpleGitCommit again from another tab used
+" to reopen the very same scratch buffer without clearing it: the help template
+" replaced the head of the message, its tail stayed below the comment block,
+" and :w then committed lines written for a different commit -- after dragging
+" the user back into the tab the message was being written in.
+execute 'edit ' . fnameescape(s:repo . '/tracked.txt')
+SimpleGitCommit
+call assert_true(s:FocusCommit() > 0, 'the commit buffer opens')
+stopinsert
+let s:pending = ['Work in progress', '', 'B1', 'B2', 'B3', 'B4', 'B5']
+call setline(1, s:pending)
+let s:message_buf = winbufnr(s:CommitBufWin())
+
+tabnew
+execute 'edit ' . fnameescape(s:repo . '/tracked.txt')
+let s:here = win_getid()
+SimpleGitCommit
+call assert_equal(s:here, win_getid(), 'a refused commit leaves the user where they are')
+call assert_notequal('simplegit://commit', bufname('%'), 'no second message buffer opens')
+call assert_equal(s:pending, getbufline(s:message_buf, 1, '$'),
+      \ 'the message being written is left exactly as it was')
+tabclose
+
+" Aborting it must not leave any of it behind for the next message either.
+call assert_true(s:FocusCommit() > 0, 'the message is still open in its own tab')
+setlocal nomodified
+close
+SimpleGitCommit
+call assert_true(s:FocusCommit() > 0, 'a fresh commit buffer opens once the old one is gone')
+stopinsert
+call assert_equal(5, line('$'), 'the next message is the bare help template')
+call assert_false(join(getline(1, '$'), "\n") =~# 'B5',
+      \ 'no part of the abandoned message survives into it')
+call setline(1, [''])
+setlocal nomodified
+close
+
 " ----------------------------------------------------------------- teardown ---
 
 call simplegit#Disable()

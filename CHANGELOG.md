@@ -12,6 +12,19 @@
   daemon 退出时回收目录。
 - 新增单元测试断言目录/文件权限,以及"预置符号链接必须写不进去、目标内容不变"。
 
+### 修复:正在写的 commit message 会被覆盖
+
+- 在 tab 1 写了一半 commit message,再从别的 tab 执行 `:SimpleGitCommit`:
+  `OpenScratch()` 的"保留未保存文本"分支会把用户拽回 tab 1,并把那个**没有清空**
+  的 buffer 交给调用方。`Commit()` 随后 `setline(1, body)` 只覆盖前几行,旧
+  message 的尾巴就留在注释块下面,`:w` 会把它当作新 commit 的正文提交上去。
+- 现在 `OpenScratch()` 无论走哪条分支都返回一个空 buffer(调用方本来就是这么
+  假设的),未保存的 message 改由 `:SimpleGitCommit` 自己保护:有未保存 message
+  时直接拒绝并告知它在第几个 tab,请先 `:w` 提交或 `q` 放弃。焦点不会被拽走,
+  message 也一个字都不会丢。
+- `make vim-commit` 新增回归:跨 tab 二次 `:SimpleGitCommit` 不移动焦点、不新开
+  buffer、原 message 逐行不变;放弃之后下一次拿到的是干净模板。
+
 ### 修复:第一次按 `]g` 会被吞掉
 
 - `RequestHunks()` 在已有请求 in-flight 时直接 `return true`,只置 stale 位,
@@ -31,8 +44,9 @@
   现在它们与 status/commit 用同一套规则:记录发起的 tab/window/buffer + repo token
   + 代际,投递时重新校验,不满足就丢弃。
 - `OpenScratch()` 的复用改为只在当前 tab 内进行;同名 scratch 属于别的 tab 时就地
-  retire(唯一例外是 buffer 已修改——正在写的 commit message 比 tab 位置更重要)。
-  `OpenStatusScratch()` 因此并入 `OpenScratch()`,status 行为不变。
+  retire(未保存的 commit message 由 `:SimpleGitCommit` 自己拒绝来保护,见上文,
+  而不是把没清空的 buffer 交给调用方)。`OpenStatusScratch()` 因此并入
+  `OpenScratch()`,status 行为不变。
 - commit graph 翻页(`m`)改用 `win_execute()`/`appendbufline()`,即使目标窗口
   已经在别的 tab 也不会切换焦点。
 - 新增 `make vim-views` 回归:跨 tab 复用、迟到的 diff/show/history 回复不抢焦点
