@@ -25,6 +25,9 @@ var s_wait_queue: list<dict<any>> = []
 # Latest initial status request for each origin window/buffer/repository.
 var s_status_request_generation: number = 0
 var s_status_latest: dict<number> = {}
+# Latest request for each asynchronously opened view (show/history/log/diff).
+var s_view_generation: number = 0
+var s_view_latest: dict<number> = {}
 
 # ----------- Blame state -----------
 # bufnr (string) -> {lines: list<string>, commits: dict<any>, failed: bool}
@@ -206,6 +209,7 @@ def ClearPending()
   s_pending = {}
   s_wait_queue = []
   s_status_latest = {}
+  s_view_latest = {}
   s_blame_inflight = {}
   s_line_blame_inflight = {}
   s_hunk_inflight = {}
@@ -379,6 +383,13 @@ enddef
 
 def OnRequestError(ctx: dict<any>, message: any)
   var text = type(message) == v:t_string ? message : string(message)
+  # A failed request must release its view reservation, or the next request
+  # for the same view would look superseded and be discarded in turn.
+  var view_target = get(ctx, 'view_target', '')
+  if view_target !=# ''
+        && get(s_view_latest, view_target, -2) == get(ctx, 'view_generation', -1)
+    remove(s_view_latest, view_target)
+  endif
   if get(ctx, 'kind', '') ==# 'blame' || get(ctx, 'kind', '') ==# 'blame_line'
     var key = string(get(ctx, 'bufnr', -1))
     if has_key(s_blame_inflight, key)
@@ -977,8 +988,10 @@ def BlameWindowShow()
     Warn('source buffer is gone')
     return
   endif
-  if !Dispatch({type: 'show', path: path, rev: sha},
-      {kind: 'show', interactive: true, title: 'commit ' .. ShortSha(sha)})
+  var title = 'commit ' .. ShortSha(sha)
+  var ctx = ViewContext('show', path, 'simplegit://' .. title)
+  ctx.title = title
+  if !Dispatch({type: 'show', path: path, rev: sha}, ctx)
     Warn('daemon unavailable')
   endif
 enddef
@@ -1053,11 +1066,23 @@ enddef
 # =============================================================
 # Scratch windows (show / history / status)
 # =============================================================
+# The buffer carrying exactly this scratch name, or -1.  bufnr() matches a
+# pattern rather than a literal, so confirm the name it found.
+def ScratchBufnr(name: string): number
+  var found = bufnr(name)
+  return found > 0 && bufexists(found) && bufname(found) ==# name ? found : -1
+enddef
+
+# Reuse an existing window for this name instead of stacking splits -- but
+# only inside the current tab.  getwininfo() enumerates every tab page, so
+# following a same-named window would move the user out of the tab they are
+# working in, which is exactly what an asynchronous reply must never do.  A
+# scratch buffer owned by another tab is retired instead, because these names
+# are unique by construction and :file refuses a duplicate.
 def OpenScratch(name: string, height: number): number
-  # Reuse an existing window for this name instead of stacking splits on
-  # every invocation.
+  var existing = ScratchBufnr(name)
   for win in getwininfo()
-    if bufname(win.bufnr) ==# name
+    if win.bufnr == existing && win.tabnr == tabpagenr()
       win_gotoid(win.winid)
       setlocal modifiable
       silent :%delete _
@@ -1067,6 +1092,20 @@ def OpenScratch(name: string, height: number): number
       return bufnr('%')
     endif
   endfor
+  if existing > 0
+    if getbufvar(existing, '&modified')
+      # Unsaved text -- a commit message being written in another tab -- is
+      # worth more than the tab the user is standing in.  Go to it instead of
+      # discarding it.  Only :SimpleGitCommit can reach this, and only
+      # synchronously, from a key the user just pressed.
+      var wins = win_findbuf(existing)
+      if !empty(wins)
+        win_gotoid(wins[0])
+        return existing
+      endif
+    endif
+    silent execute 'bwipeout! ' .. existing
+  endif
   silent keepalt botright new
   if height > 0
     execute 'resize ' .. height
@@ -1078,31 +1117,64 @@ def OpenScratch(name: string, height: number): number
   return bufnr('%')
 enddef
 
-def OpenStatusScratch(height: number): number
-  # The status URI is intentionally stable, so only one such buffer can
-  # exist. Reuse it inside the requesting tab, but never follow an old status
-  # window into a different tab. If another tab owns it, retire that scratch
-  # buffer in place and create the requested view beside the origin instead.
-  var existing = bufnr(STATUS_BUF)
-  if existing > 0 && bufexists(existing)
-    for win in getwininfo()
-      if win.bufnr == existing && win.tabnr == tabpagenr()
-        win_gotoid(win.winid)
-        setlocal modifiable
-        silent :%delete _
-        execute 'resize ' .. height
-        return existing
-      endif
-    endfor
-    silent execute 'bwipeout! ' .. existing
+# Every asynchronously opened view carries the window that asked for it, the
+# repository it describes and a latest-wins generation.  Without this a slow
+# `show`/`log`/`history`/`cat` reply opens its split in whatever window happens
+# to be current when it lands -- pulling the user into another tab, which the
+# status path has guarded against for a while and these paths had not.
+def ViewContext(kind: string, path: string, target: string): dict<any>
+  s_view_generation += 1
+  if len(s_view_latest) >= 64 && !has_key(s_view_latest, target)
+    remove(s_view_latest, keys(s_view_latest)[0])
   endif
-  return OpenScratch(STATUS_BUF, height)
+  s_view_latest[target] = s_view_generation
+  var dir = path ==# '' ? getcwd()
+    : isdirectory(path) ? path : fnamemodify(path, ':h')
+  return {
+    kind: kind,
+    interactive: true,
+    origin_tabnr: tabpagenr(),
+    origin_winid: win_getid(),
+    origin_bufnr: bufnr('%'),
+    repo_token: RepoToken(dir),
+    view_target: target,
+    view_generation: s_view_generation,
+  }
+enddef
+
+def ViewStillWanted(ctx: dict<any>): bool
+  var target = get(ctx, 'view_target', '')
+  if target ==# ''
+    # A request issued before this guard existed; nothing to check.
+    return true
+  endif
+  if get(s_view_latest, target, -2) != get(ctx, 'view_generation', -1)
+    DebugLog('discarded superseded ' .. get(ctx, 'kind', 'view') .. ' reply')
+    return false
+  endif
+  remove(s_view_latest, target)
+  if !OriginStillCurrent(ctx)
+    DebugLog('discarded ' .. get(ctx, 'kind', 'view') .. ' reply after its origin changed')
+    return false
+  endif
+  # The origin window may still be current while showing a different file --
+  # and possibly a different repository -- than the one this reply describes.
+  var origin_path = BufFilePath(get(ctx, 'origin_bufnr', -1))
+  if origin_path !=# ''
+        && RepoToken(fnamemodify(origin_path, ':h')) !=# get(ctx, 'repo_token', '')
+    DebugLog('discarded ' .. get(ctx, 'kind', 'view') .. ' reply after its repository changed')
+    return false
+  endif
+  return true
 enddef
 
 def OnShow(ctx: dict<any>, ev: dict<any>)
   var lines = get(ev, 'lines', v:null)
   if type(lines) != v:t_list
     DebugLog('ignored malformed show response')
+    return
+  endif
+  if !ViewStillWanted(ctx)
     return
   endif
   var title = get(ctx, 'title', 'show')
@@ -1119,8 +1191,10 @@ export def Show(rev: string)
   if path ==# ''
     path = getcwd()
   endif
-  if !Dispatch({type: 'show', path: path, rev: use_rev},
-      {kind: 'show', interactive: true, title: 'commit ' .. use_rev})
+  var title = 'commit ' .. use_rev
+  var ctx = ViewContext('show', path, 'simplegit://' .. title)
+  ctx.title = title
+  if !Dispatch({type: 'show', path: path, rev: use_rev}, ctx)
     Warn('daemon unavailable; run ./install.sh')
   endif
 enddef
@@ -1140,6 +1214,9 @@ def OnLog(ctx: dict<any>, ev: dict<any>)
   var entries = get(ev, 'entries', v:null)
   if type(entries) != v:t_list
     DebugLog('ignored malformed log response')
+    return
+  endif
+  if !ViewStillWanted(ctx)
     return
   endif
   var path = get(ctx, 'path', '')
@@ -1185,7 +1262,10 @@ def HistoryShow(whole_commit: bool)
   if !whole_commit
     req.file = path
   endif
-  if !Dispatch(req, {kind: 'show', interactive: true, title: 'commit ' .. ShortSha(sha)})
+  var title = 'commit ' .. ShortSha(sha)
+  var ctx = ViewContext('show', path, 'simplegit://' .. title)
+  ctx.title = title
+  if !Dispatch(req, ctx)
     Warn('daemon unavailable')
   endif
 enddef
@@ -1197,8 +1277,10 @@ export def History()
     return
   endif
   var limit = ConfNum('simplegit_history_limit', 200)
-  if !Dispatch({type: 'log', path: path, limit: limit},
-      {kind: 'log', interactive: true, path: path})
+  var ctx = ViewContext('log', path,
+    'simplegit://history/' .. fnamemodify(path, ':t'))
+  ctx.path = path
+  if !Dispatch({type: 'log', path: path, limit: limit}, ctx)
     Warn('daemon unavailable; run ./install.sh')
   endif
 enddef
@@ -1233,6 +1315,9 @@ def OnGraphLog(ctx: dict<any>, ev: dict<any>)
   endif
   var path = get(ctx, 'path', '')
   var append_mode = get(ctx, 'append', false)
+  if !append_mode && !ViewStillWanted(ctx)
+    return
+  endif
   var display: list<string> = []
   var shas: list<string> = []
   for row in rows
@@ -1257,13 +1342,17 @@ def OnGraphLog(ctx: dict<any>, ev: dict<any>)
       Warn('no more commits')
       return
     endif
-    win_gotoid(win)
-    setlocal modifiable
-    append(line('$'), display)
-    setlocal nomodifiable
-    b:simplegit_graph_shas = get(b:, 'simplegit_graph_shas', [])->extend(shas)
-    b:simplegit_graph_skip = get(b:, 'simplegit_graph_skip', 0)
-      + len(filter(copy(shas), (_, sha) => sha !=# ''))
+    # win_execute() rather than win_gotoid(): paging appends to a window that
+    # may by now live in another tab, and reaching it must not take the user
+    # there.
+    win_execute(win, 'setlocal modifiable')
+    appendbufline(buf, '$', display)
+    win_execute(win, 'setlocal nomodifiable')
+    setbufvar(buf, 'simplegit_graph_shas',
+      getbufvar(buf, 'simplegit_graph_shas', [])->copy()->extend(shas))
+    setbufvar(buf, 'simplegit_graph_skip',
+      getbufvar(buf, 'simplegit_graph_skip', 0)
+        + len(filter(copy(shas), (_, sha) => sha !=# '')))
     return
   endif
 
@@ -1299,8 +1388,10 @@ def GraphLogShow()
   if sha ==# ''
     return
   endif
-  if !Dispatch({type: 'show', path: path, rev: sha},
-      {kind: 'show', interactive: true, title: 'commit ' .. sha})
+  var title = 'commit ' .. sha
+  var ctx = ViewContext('show', path, 'simplegit://' .. title)
+  ctx.title = title
+  if !Dispatch({type: 'show', path: path, rev: sha}, ctx)
     Warn('daemon unavailable')
   endif
 enddef
@@ -1325,8 +1416,9 @@ export def Log()
     path = getcwd()
   endif
   var limit = ConfNum('simplegit_log_limit', 200)
-  if !Dispatch({type: 'graph_log', path: path, limit: limit, skip: 0},
-      {kind: 'graph_log', interactive: true, path: path})
+  var ctx = ViewContext('graph_log', path, 'simplegit://log')
+  ctx.path = path
+  if !Dispatch({type: 'graph_log', path: path, limit: limit, skip: 0}, ctx)
     Warn('daemon unavailable; run ./install.sh')
   endif
 enddef
@@ -1338,6 +1430,9 @@ def OnCat(ctx: dict<any>, ev: dict<any>)
   var lines = get(ev, 'lines', v:null)
   if type(lines) != v:t_list
     DebugLog('ignored malformed cat response')
+    return
+  endif
+  if !ViewStillWanted(ctx)
     return
   endif
   var src = get(ctx, 'bufnr', -1)
@@ -1384,8 +1479,10 @@ export def Diff(rev: string)
     return
   endif
   var use_rev = rev ==# '' ? 'HEAD' : rev
-  if !Dispatch({type: 'cat', path: path, rev: use_rev},
-      {kind: 'cat', interactive: true, bufnr: bufnr, rev: use_rev})
+  var ctx = ViewContext('cat', path, 'simplegit://diff/' .. bufnr)
+  ctx.bufnr = bufnr
+  ctx.rev = use_rev
+  if !Dispatch({type: 'cat', path: path, rev: use_rev}, ctx)
     Warn('daemon unavailable; run ./install.sh')
   endif
 enddef
@@ -2199,7 +2296,7 @@ def OnStatus(ctx: dict<any>, ev: dict<any>)
   endif
 
   # Initial and refresh-only requests compete on one buffer generation.  Do
-  # this before OpenStatusScratch(), which may clear or retire the old buffer.
+  # this before OpenScratch(), which may clear or retire the old buffer.
   var existing_status = bufnr(STATUS_BUF)
   if existing_status > 0 && bufexists(existing_status)
     var reserved_bufnr = get(ctx, 'status_generation_bufnr', 0)
@@ -2212,7 +2309,7 @@ def OnStatus(ctx: dict<any>, ev: dict<any>)
     endif
   endif
 
-  var target_bufnr = OpenStatusScratch(height)
+  var target_bufnr = OpenScratch(STATUS_BUF, height)
   var landed_generation = get(ctx, 'status_generation', 0)
   if landed_generation > 0
     # Cross-tab replacement may have retired the buffer on which this

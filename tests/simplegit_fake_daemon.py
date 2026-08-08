@@ -44,6 +44,9 @@ def main():
         if isinstance(decoded, list) and all(isinstance(value, list) for value in decoded):
             status_entries = decoded
     status_count = 0
+    show_count = 0
+    show_delays = delays_from_env("SIMPLEGIT_FAKE_SHOW_DELAYS")
+    view_delay = int(os.environ.get("SIMPLEGIT_FAKE_VIEW_DELAY_MS", "0"))
     blame_line_delay = int(os.environ.get("SIMPLEGIT_FAKE_BLAME_LINE_DELAY_MS", "0"))
     blame_file_lines = int(os.environ.get("SIMPLEGIT_FAKE_BLAME_LINES", "10"))
     uncommitted_lnum = int(os.environ.get("SIMPLEGIT_FAKE_UNCOMMITTED_LNUM", "0"))
@@ -107,6 +110,67 @@ def main():
                     "entries": entries,
                 },
                 delay,
+            )
+        elif kind == "show":
+            show_count += 1
+            delay = (
+                show_delays[show_count - 1]
+                if show_count <= len(show_delays)
+                else view_delay
+            )
+            schedule(
+                {
+                    "type": "show",
+                    "id": request_id,
+                    "lines": [f"commit fake-{show_count}", "", "    subject"],
+                },
+                delay,
+            )
+        elif kind == "cat":
+            schedule(
+                {
+                    "type": "cat",
+                    "id": request_id,
+                    "lines": ["cat line one", "cat line two"],
+                },
+                view_delay,
+            )
+        elif kind == "log":
+            schedule(
+                {
+                    "type": "log",
+                    "id": request_id,
+                    "path": request.get("path", ""),
+                    "entries": [
+                        {
+                            "sha": "deadbeef" * 5,
+                            "author": "Alice",
+                            "time": 1700000000,
+                            "subject": "initial import",
+                        }
+                    ],
+                },
+                view_delay,
+            )
+        elif kind == "graph_log":
+            schedule(
+                {
+                    "type": "graph_log",
+                    "id": request_id,
+                    "path": request.get("path", ""),
+                    "skip": request.get("skip", 0),
+                    "rows": [
+                        {
+                            "graph": "* ",
+                            "sha": "deadbeef" * 5,
+                            "date": "2026-08-08",
+                            "author": "Alice",
+                            "refs": "",
+                            "subject": "initial import",
+                        }
+                    ],
+                },
+                view_delay,
             )
         elif kind == "blame_line":
             lnum = request.get("lnum", 0)

@@ -68,7 +68,9 @@ COMMANDS                                                   *simplegit-commands*
 
 :SimpleGitDiff [rev]                                           *:SimpleGitDiff*
   Diff the current file against [rev] (default HEAD) in a vertical split.
-  `q` in the revision buffer closes the diff.
+  `q` in the revision buffer closes the diff. If you leave the originating
+  window before the revision arrives, the diff is discarded rather than
+  opening wherever you moved to.
 
 :SimpleGitShow [rev]                                           *:SimpleGitShow*
   Show a commit (message, stats and patch). [rev] defaults to HEAD.
@@ -392,6 +394,14 @@ What it guarantees:
   view, discards stale generations (initial status requests are latest-wins),
   and never changes the user's current focus or recreates a view that was
   closed. Commit replies also preserve any message text typed after :write.
+- The views opened by a reply — |:SimpleGitShow|, |:SimpleGitHistory|,
+  |:SimpleGitLog| and |:SimpleGitDiff| — carry the same guard. If you move to
+  another window or tab, or the origin window moves to another repository,
+  before the reply lands, it is discarded instead of opening a split where you
+  now are; a newer request for the same view supersedes an older one. Reusing
+  an existing scratch window is scoped to the current tab, so a view never
+  drags you into the tab that opened it first; a copy owned by another tab is
+  retired, unless it holds unsaved text.
 
 :SimpleGitHealth
         Report daemon path, run state, negotiated protocol and capabilities,

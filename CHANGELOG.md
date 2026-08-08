@@ -2,6 +2,22 @@
 
 ## Unreleased - 2026-08-08
 
+### 异步打开的 view 也带 origin 守卫
+
+- `show` / `log` / `graph_log` / `cat` 的回复此前没有任何 origin 检查:慢一点的
+  `:SimpleGitDiff` 回来时会 `win_gotoid(src_win)` 把光标拽回原窗口、开 diff split;
+  `:SimpleGitShow` 则通过 `getwininfo()`(它会枚举所有 tab)复用同名 scratch 窗口,
+  直接把用户拖到另一个 tab——这与 README 里"回复不会在你走开后抢回焦点"的承诺相反。
+  现在它们与 status/commit 用同一套规则:记录发起的 tab/window/buffer + repo token
+  + 代际,投递时重新校验,不满足就丢弃。
+- `OpenScratch()` 的复用改为只在当前 tab 内进行;同名 scratch 属于别的 tab 时就地
+  retire(唯一例外是 buffer 已修改——正在写的 commit message 比 tab 位置更重要)。
+  `OpenStatusScratch()` 因此并入 `OpenScratch()`,status 行为不变。
+- commit graph 翻页(`m`)改用 `win_execute()`/`appendbufline()`,即使目标窗口
+  已经在别的 tab 也不会切换焦点。
+- 新增 `make vim-views` 回归:跨 tab 复用、迟到的 diff/show/history 回复不抢焦点
+  不开窗、以及同一 view 的两次请求 latest-wins。
+
 ### 单行 blame
 
 - 内联注释此前为了标注一行而 blame 整个文件:在大文件+深历史上就是数秒的 git,

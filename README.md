@@ -84,6 +84,14 @@ finds an older protocol-5 daemon, these two commands fail closed with an
 upgrade message instead of sending an operation the daemon may misinterpret;
 the rest of Simplegit continues to work. Rerun `./install.sh` after updating.
 
+Every view opened by an asynchronous reply — `:SimpleGitShow`,
+`:SimpleGitHistory`, `:SimpleGitLog`, `:SimpleGitDiff` and the status window —
+remembers the window that asked for it. Move to another window or tab before
+the reply lands and it is discarded instead of opening a split where you now
+are, and a newer request for the same view supersedes an older one. Reusing a
+scratch window is scoped to the current tab, so a view never pulls you into
+the tab that first opened it.
+
 Status is latest-request-wins, including the first asynchronous open. A
 commit message is likewise generation-guarded: a second `:write` is refused
 while the commit is pending, and text typed after the first `:write` is kept

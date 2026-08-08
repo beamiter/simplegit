@@ -1,6 +1,6 @@
-.PHONY: check fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame vim-core defcompile core-verify
+.PHONY: check fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame vim-views vim-core defcompile core-verify
 
-check: core-verify fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame defcompile vim-core
+check: core-verify fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame vim-views defcompile vim-core
 
 fmt:
 	cargo fmt --all -- --check
@@ -36,6 +36,11 @@ vim-statusline:
 # whole-file blame, the per-line cache and g:simplegit_blame_format.
 vim-blame:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_blame.vim
+
+# Asynchronously opened views (show / history / log / diff): tab-scoped scratch
+# reuse, and replies that land after the user moved on.
+vim-views:
+	vim -Nu NONE -n -i NONE -es -S tests/vim_views.vim
 
 # ---------------------------------------------------------------------------
 # simplecore: the vendored daemon supervisor shared by the simple* suite.
