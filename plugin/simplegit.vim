@@ -159,7 +159,10 @@ augroup SimpleGit
   autocmd CursorMoved,BufEnter * simplegit#ScheduleLineBlame()
   autocmd InsertLeave * simplegit#ScheduleLineBlame()
   autocmd BufWritePost * simplegit#OnBufWrite()
-  autocmd BufReadPost,BufEnter * simplegit#RefreshHunks()
+  # BufReadPost also fires on a re-read of a buffer that is already open, so it
+  # says "this text was replaced"; BufEnter only says "you are looking at it".
+  autocmd BufReadPost * simplegit#RefreshHunks(true)
+  autocmd BufEnter * simplegit#RefreshHunks()
   autocmd TextChanged,TextChangedI,TextChangedP * simplegit#ScheduleHunks()
   autocmd FocusGained,ShellCmdPost * simplegit#OnExternalChange()
   autocmd BufDelete * simplegit#OnBufClose(expand('<abuf>')->str2nr())

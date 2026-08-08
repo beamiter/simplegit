@@ -1890,13 +1890,23 @@ export def HunkUndo()
   HunkOperate('undo')
 enddef
 
-export def RefreshHunks()
+# `reloaded` is set from BufReadPost, which fires when a buffer is re-read from
+# disk: `:edit!` to throw an edit away, the reload after a hunk revert,
+# 'autoread' picking up an external checkout.  The cached hunks describe the
+# text that was just replaced, and without dropping them this function takes
+# the "already answered" branch below and repaints the stale signs forever.
+export def RefreshHunks(reloaded: bool = false)
   if !s_enabled
     return
   endif
   var bufnr = bufnr('%')
   if BufFilePath(bufnr) ==# ''
     return
+  endif
+  if reloaded
+    InvalidateHunks(bufnr)
+    InvalidateBlame(bufnr)
+    ScheduleLineBlame()
   endif
   # The statusline API publishes a branch even where the sign column is off --
   # and b:simplegit_status_dict with it.  Publishing only from the hunk reply

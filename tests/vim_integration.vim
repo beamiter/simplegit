@@ -229,6 +229,10 @@ if WaitFor(() => len(PlacedSigns()) > 0, 'hunk signs placed')
   simplegit#ScheduleHunks()
   WaitFor(() => SignAt(1) ==# 'SimpleGitChange', 'live diff marks unsaved edit')
   silent edit!
+  # ...and stop describing them once the edit is thrown away. A reload
+  # replaces the text the cached hunks were computed from, so the answer has
+  # to be asked for again rather than repainted.
+  WaitFor(() => SignAt(1) ==# '', 'a reload drops the signs of the discarded edit')
 
   # Status window: stage and unstage whole files in place.
   simplegit#Status()

@@ -2,6 +2,18 @@
 
 ## Unreleased - 2026-08-08
 
+### 修复:重新读入 buffer 之后 signs 不会更新
+
+- `BufReadPost` 走的是 `RefreshHunks()`,而它只在缓存为空时才去问 daemon,否则
+  直接用旧结果重画。于是任何一次「buffer 被重新读入」——`:edit!` 丢弃修改、
+  `git checkout` 之后 `'autoread'` 重新载入、revert hunk 之后的自动重载——都还在
+  按被替换掉的那份文本画 signs,而且因为缓存非空,以后每一次 `BufEnter` 都会把
+  同一批过时的 signs 再画一遍,直到下一次保存或外部事件为止。blame 缓存同理。
+- `BufReadPost` 与 `BufEnter` 现在分开:前者说的是「这段文本被换掉了」,会先让
+  hunk/blame 缓存失效再刷新;后者只是「你正在看它」,保持原样。
+- `make vim-integration` 新增回归:live diff 标出未保存修改之后 `:edit!` 丢弃它,
+  断言那一行的 sign 会消失。
+
 ### 修复:in-flight 的 branch 读会吞掉一次外部 checkout
 
 - 外部变更(`FocusGained`/`ShellCmdPost`)只清空 `s_branch_cache`,却留着
