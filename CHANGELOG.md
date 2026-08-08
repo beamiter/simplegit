@@ -2,6 +2,16 @@
 
 ## Unreleased - 2026-08-08
 
+### 修复:第一次按 `]g` 会被吞掉
+
+- `RequestHunks()` 在已有请求 in-flight 时直接 `return true`,只置 stale 位,
+  purpose 就此丢失。而 `BufReadPost` 必然会给每个 file buffer 起一次刷新,所以
+  "刚打开文件就按 `]g`" 命中的正是这条路径:不跳转、不报错、按键凭空消失
+  (`[g` 与 hunk preview 同理)。现在会把这个动作排队,答案到达时执行;期间又按了
+  别的键则最后一次生效。UI 动作不再顺带置 stale 位,少一次多余的 git 调用。
+- hunks 请求失败时会清掉排队动作并明确提示,而不是让按键无声消失。
+- 新增 `make vim-hunks` 回归。
+
 ### 异步打开的 view 也带 origin 守卫
 
 - `show` / `log` / `graph_log` / `cat` 的回复此前没有任何 origin 检查:慢一点的

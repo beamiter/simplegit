@@ -124,7 +124,9 @@ COMMANDS                                                   *simplegit-commands*
 :SimpleGitHunkPrev                                         *:SimpleGitHunkPrev*
   Jump to the next/previous hunk (working tree vs index) in the current file.
   While the buffer is modified, hunks track the unsaved buffer contents,
-  debounced by |g:simplegit_hunk_delay|.
+  debounced by |g:simplegit_hunk_delay|. Pressed before the buffer's first
+  refresh has answered, the jump is queued and runs as soon as it does, rather
+  than being lost.
 
 :SimpleGitHunkPreview                                   *:SimpleGitHunkPreview*
   Show the diff of the hunk under the cursor in a popup.

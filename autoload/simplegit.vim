@@ -48,6 +48,9 @@ var s_hunk_cache: dict<dict<any>> = {}
 var s_hunk_inflight: dict<bool> = {}
 # Buffers that changed again while a hunks request was in flight.
 var s_hunk_stale: dict<bool> = {}
+# A jump or preview asked for while a refresh was in flight, to run when the
+# answer lands: bufnr (string) -> purpose.
+var s_hunk_pending_action: dict<string> = {}
 var s_hunk_timer: number = 0
 var s_status_refresh_timer: number = 0
 var s_status_refresh_forced: bool = false
@@ -213,6 +216,7 @@ def ClearPending()
   s_blame_inflight = {}
   s_line_blame_inflight = {}
   s_hunk_inflight = {}
+  s_hunk_pending_action = {}
   s_branch_inflight = {}
 enddef
 
@@ -405,6 +409,12 @@ def OnRequestError(ctx: dict<any>, message: any)
     var key = string(get(ctx, 'bufnr', -1))
     if has_key(s_hunk_inflight, key)
       remove(s_hunk_inflight, key)
+    endif
+    if has_key(s_hunk_pending_action, key)
+      # The jump this buffer was waiting for cannot happen; say so rather than
+      # leaving the keypress unexplained.
+      remove(s_hunk_pending_action, key)
+      Warn('no hunk information for this buffer')
     endif
     s_hunk_cache[key] = {failed: true, hunks: []}
   elseif get(ctx, 'kind', '') ==# 'branch'
@@ -1637,8 +1647,15 @@ def RequestHunks(bufnr: number, purpose: string, interactive: bool): bool
   endif
   var key = string(bufnr)
   if has_key(s_hunk_inflight, key)
-    # Answer in flight already; rerun once it lands so the last edit wins.
-    s_hunk_stale[key] = true
+    if purpose ==# 'signs'
+      # Answer in flight already; rerun once it lands so the last edit wins.
+      s_hunk_stale[key] = true
+    else
+      # A jump or preview must not be dropped on the floor.  BufReadPost puts
+      # a refresh in flight, so without this the first ]g after opening a
+      # buffer did nothing at all -- no jump, no message, keypress gone.
+      s_hunk_pending_action[key] = purpose
+    endif
     return true
   endif
   var req: dict<any> = {type: 'hunks', path: path}
@@ -1684,6 +1701,11 @@ def OnHunks(ctx: dict<any>, ev: dict<any>)
   PlaceSigns(bufnr)
   PublishStatusDict(bufnr)
   var purpose = get(ctx, 'purpose', 'signs')
+  if has_key(s_hunk_pending_action, key)
+    # Something was pressed while this request was in flight; the later press
+    # wins, exactly as it would have without the race.
+    purpose = remove(s_hunk_pending_action, key)
+  endif
   if purpose ==# 'preview'
     ShowHunkPreview(bufnr)
   elseif purpose ==# 'next'

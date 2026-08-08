@@ -47,6 +47,7 @@ def main():
     show_count = 0
     show_delays = delays_from_env("SIMPLEGIT_FAKE_SHOW_DELAYS")
     view_delay = int(os.environ.get("SIMPLEGIT_FAKE_VIEW_DELAY_MS", "0"))
+    hunks_delay = int(os.environ.get("SIMPLEGIT_FAKE_HUNKS_DELAY_MS", "0"))
     blame_line_delay = int(os.environ.get("SIMPLEGIT_FAKE_BLAME_LINE_DELAY_MS", "0"))
     blame_file_lines = int(os.environ.get("SIMPLEGIT_FAKE_BLAME_LINES", "10"))
     uncommitted_lnum = int(os.environ.get("SIMPLEGIT_FAKE_UNCOMMITTED_LNUM", "0"))
@@ -222,13 +223,14 @@ def main():
                 }
             )
         elif kind == "hunks":
-            emit(
+            schedule(
                 {
                     "type": "hunks",
                     "id": request_id,
                     "path": request.get("path", ""),
                     "hunks": hunks,
-                }
+                },
+                hunks_delay,
             )
         elif kind == "file_op":
             schedule(
