@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased - 2026-08-05
+## Unreleased - 2026-08-08
+
+### CI 的 MSRV pin 修复
+
+- `.github/workflows/ci.yml` 的 `dtolnay/rust-toolchain` 停在 1.85.0,而
+  Cargo.toml 声明 `rust-version = "1.88"`。cargo 把更高的 rust-version 当作硬
+  错误,所以 msrv job 在编译任何代码之前就失败——每次 push 都是红的。pin 提到
+  1.88.0,并新增一步从 Cargo.toml 提取 `rust-version` 与实际安装的 rustc 比对
+  major.minor,不一致就带说明失败,下次抬 MSRV 不会再悄悄漏掉这个 pin。
 
 ### Status 光标跟随文件
 

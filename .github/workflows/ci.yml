@@ -13,12 +13,31 @@ jobs:
   # newly used language feature can quietly break it, because every other job
   # runs on stable.  This is the check that caught `ignore` pulling in
   # let-chains and two crates whose own sources had outgrown their declared
-  # MSRV.  Keep the toolchain here in step with rust-version in Cargo.toml.
+  # MSRV.
+  #
+  # This pin sat at 1.85.0 while Cargo.toml declared 1.88, so `cargo check
+  # --locked` hard-errored on the manifest before compiling anything and the
+  # job was red on every push.  The guard step below derives the expectation
+  # from Cargo.toml and fails loudly on a mismatch, so a future MSRV bump
+  # cannot silently leave this pin behind again.
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Verify the pinned toolchain matches the declared MSRV
+        run: |
+          declared="$(sed -n 's/^rust-version *= *"\([0-9][0-9.]*\)".*/\1/p' Cargo.toml)"
+          test -n "$declared"
+          installed="$(rustc --version | cut -d' ' -f2)"
+          # Cargo.toml names major.minor, the action pin names a patch release.
+          series() { printf '%s' "$1" | cut -d. -f1,2; }
+          if [ "$(series "$installed")" != "$(series "$declared")" ]; then
+            echo "MSRV drift: Cargo.toml declares $declared," \
+                 "this job installed $installed." >&2
+            echo "Update the dtolnay/rust-toolchain pin above to match." >&2
+            exit 1
+          fi
       - name: Build on the declared minimum supported Rust
         run: cargo check --all-targets --locked
   test:
