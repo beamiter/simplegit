@@ -251,8 +251,9 @@ g:simplegit_status_auto_refresh (default 1)
 g:simplegit_live_max_bytes (default 1048576)       *g:simplegit_live_max_bytes*
   Buffers larger than this fall back to the on-disk diff until saved.
   Below it, the unsaved text is handed to git through a temporary file in a
-  private per-daemon directory (0700, files 0600, refusing to write through
-  an existing path), removed as soon as the diff returns.
+  private directory (0700, files 0600, refusing to write through an existing
+  path) created for that one diff and removed again, files and directory
+  alike, as soon as it returns.
 
 g:simplegit_daemon_path (default '')                  *g:simplegit_daemon_path*
   Absolute path of the daemon binary; overrides runtimepath discovery.
@@ -402,9 +403,11 @@ What it guarantees:
   protocol-5 daemon without any of them is still usable for every older
   request.
 - The live buffer-vs-index diff writes the unsaved buffer to a private
-  per-daemon scratch directory rather than a predictable $TMPDIR path, so
-  unsaved text is never readable by other users on a shared machine and a
-  planted symlink cannot redirect the write.
+  scratch directory rather than a predictable $TMPDIR path, so unsaved text
+  is never readable by other users on a shared machine and a planted symlink
+  cannot redirect the write. The directory lives exactly as long as the one
+  diff that needs it: a daemon is stopped by a signal, so nothing that only
+  runs at exit can be relied on to clean up after it.
 - Hunk stage/undo, file stage/reset and commit operations share one FIFO
   index lane. They complete in request order and cannot race each other for
   .git/index.lock; read-only blame/log/status work remains concurrent.

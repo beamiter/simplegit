@@ -1154,18 +1154,23 @@ async fn disk_hunk_diff(path: &str) -> Result<String, String> {
 /// Diff unsaved buffer contents against the index: materialize both sides as
 /// temp files and let `git diff --no-index` produce the hunks. Exit code 1
 /// just means the files differ.
-/// Private scratch directory for live-diff temp files, created once per daemon
-/// with mode 0700.
+/// Private scratch directory for one live diff, created with mode 0700 and
+/// removed again as soon as that diff is done.
 ///
 /// These files used to live at `$TMPDIR/simplegit-<pid>-<id>.buffer`, written
 /// with plain `fs::write`: the pid is public and request ids increment, so the
 /// path was predictable, `write` follows a symlink an attacker pre-created at
 /// it, and on a shared /tmp the unsaved buffer contents landed in a
 /// world-readable file on every keystroke burst.
-static SCRATCH_DIR: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
-
-fn create_scratch_dir() -> Result<PathBuf, String> {
-    let base = std::env::temp_dir();
+///
+/// The directory is per request rather than per daemon on purpose.  A daemon
+/// is always stopped by a signal -- simplecore sends SIGTERM and escalates to
+/// SIGKILL -- so cleanup that only runs on the way out of `main` never runs at
+/// all, and a directory created once per process leaked one empty 0700
+/// directory per Vim session, per `:SimpleGitRestart` and per daemon crash.
+/// Creating and reaping it around the diff that needs it keeps the lifetime
+/// inside the request, where it can actually be observed to happen.
+fn create_scratch_dir(base: &Path) -> Result<PathBuf, String> {
     let pid = std::process::id();
     // mkdtemp by hand: the daemon has no random-number dependency, and a
     // nanosecond clock plus create()'s exclusivity is enough -- an attacker
@@ -1192,24 +1197,6 @@ fn create_scratch_dir() -> Result<PathBuf, String> {
     Err("failed to create a private temp directory".to_string())
 }
 
-fn scratch_dir() -> Result<&'static Path, String> {
-    SCRATCH_DIR
-        .get_or_init(create_scratch_dir)
-        .as_deref()
-        .map_err(|error| error.clone())
-}
-
-/// Remove the scratch directory as the process exits.  Each diff already
-/// removes its own files, so this only reaps the empty directory -- and it
-/// belongs to process shutdown, not to `run`, which the tests drive several
-/// times over inside one process while other code still holds the memoised
-/// path.
-fn remove_scratch_dir() {
-    if let Some(Ok(dir)) = SCRATCH_DIR.get() {
-        let _ = std::fs::remove_dir(dir);
-    }
-}
-
 /// Write one scratch file that only this user can read.  `create_new` refuses
 /// an existing path, so a symlink planted at it is an error rather than a
 /// write through to whatever it points at.
@@ -1231,6 +1218,18 @@ async fn write_private(path: &Path, contents: &str) -> Result<(), String> {
 }
 
 async fn buffer_hunk_diff(id: u64, path: &str, content: &str) -> Result<String, String> {
+    buffer_hunk_diff_in(&std::env::temp_dir(), id, path, content).await
+}
+
+/// `base` is where the private scratch directory is created; only the tests
+/// pass anything other than the system temp directory, so that they can assert
+/// on what a live diff leaves behind without racing every other test.
+async fn buffer_hunk_diff_in(
+    base: &Path,
+    id: u64,
+    path: &str,
+    content: &str,
+) -> Result<String, String> {
     if content.len() > MAX_CONTENT_BYTES {
         return Err("buffer too large for a live diff".to_string());
     }
@@ -1240,7 +1239,7 @@ async fn buffer_hunk_diff(id: u64, path: &str, content: &str) -> Result<String, 
     let spec = format!(":{}{}", prefix.trim_end_matches('\n'), name);
     let index_text = run_git(&dir, &["show", &spec]).await?;
 
-    let scratch = scratch_dir()?;
+    let scratch = create_scratch_dir(base)?;
     let index_file = scratch.join(format!("{id}.index"));
     let buffer_file = scratch.join(format!("{id}.buffer"));
     let write = async {
@@ -1263,6 +1262,9 @@ async fn buffer_hunk_diff(id: u64, path: &str, content: &str) -> Result<String, 
     };
     let _ = tokio::fs::remove_file(&index_file).await;
     let _ = tokio::fs::remove_file(&buffer_file).await;
+    // The directory goes with them: this is the only moment at which the
+    // daemon is guaranteed to still be running.
+    let _ = tokio::fs::remove_dir(&scratch).await;
     diff
 }
 
@@ -1891,7 +1893,6 @@ async fn main() -> std::process::ExitCode {
     match args.first().map(String::as_str) {
         None => {
             let result = run(io::stdin(), io::stdout()).await;
-            remove_scratch_dir();
             match result {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(error) => {
@@ -2010,8 +2011,9 @@ mod tests {
     async fn live_diff_scratch_files_are_private() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = scratch_dir().expect("scratch directory");
-        let mode = std::fs::metadata(dir)
+        let base = temp_fixture_dir("scratch-private");
+        let dir = create_scratch_dir(&base).expect("scratch directory");
+        let mode = std::fs::metadata(&dir)
             .expect("scratch directory exists")
             .permissions()
             .mode()
@@ -2050,6 +2052,78 @@ mod tests {
         );
         std::fs::remove_file(&link).unwrap();
         std::fs::remove_file(&target).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A live diff must leave nothing behind.  Cleanup used to sit on the
+    /// normal return path of `main`, which a daemon never reaches: simplecore
+    /// stops it with SIGTERM and escalates to SIGKILL, so every daemon that had
+    /// ever served a live diff leaked one empty 0700 directory -- one per Vim
+    /// session, per `:SimpleGitRestart` and per crash-restart.  The lifetime
+    /// now belongs to the request, which is the only moment the process is
+    /// certainly still alive.
+    #[tokio::test]
+    async fn live_diff_leaves_no_scratch_directory_behind() {
+        use std::process::Command;
+
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let repo = temp_fixture_dir("scratch-reap-repo");
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(repo.join("sample.txt"), "before\n").unwrap();
+        git(&["add", "sample.txt"]);
+
+        let base = temp_fixture_dir("scratch-reap-base");
+        let file = repo.join("sample.txt");
+        let diff = buffer_hunk_diff_in(&base, 7, &file.to_string_lossy(), "after\n")
+            .await
+            .expect("live diff against the index");
+        assert!(
+            diff.contains("+after"),
+            "the live diff still reports the unsaved change: {diff}"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&base)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the live diff left {leftovers:?} behind"
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    /// A private directory under the system temp directory, named so that a
+    /// failed run is traceable to the test that made it.
+    fn temp_fixture_dir(label: &str) -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("simplegit-{label}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
