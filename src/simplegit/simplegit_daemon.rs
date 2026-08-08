@@ -1154,6 +1154,82 @@ async fn disk_hunk_diff(path: &str) -> Result<String, String> {
 /// Diff unsaved buffer contents against the index: materialize both sides as
 /// temp files and let `git diff --no-index` produce the hunks. Exit code 1
 /// just means the files differ.
+/// Private scratch directory for live-diff temp files, created once per daemon
+/// with mode 0700.
+///
+/// These files used to live at `$TMPDIR/simplegit-<pid>-<id>.buffer`, written
+/// with plain `fs::write`: the pid is public and request ids increment, so the
+/// path was predictable, `write` follows a symlink an attacker pre-created at
+/// it, and on a shared /tmp the unsaved buffer contents landed in a
+/// world-readable file on every keystroke burst.
+static SCRATCH_DIR: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
+
+fn create_scratch_dir() -> Result<PathBuf, String> {
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
+    // mkdtemp by hand: the daemon has no random-number dependency, and a
+    // nanosecond clock plus create()'s exclusivity is enough -- an attacker
+    // who wins the guess only causes one retry, never a reused directory.
+    for attempt in 0..64u32 {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.subsec_nanos())
+            .unwrap_or(0)
+            ^ attempt.wrapping_mul(0x9E37_79B9);
+        let candidate = base.join(format!("simplegit-{pid}-{nonce:08x}"));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("failed to create temp directory: {error}")),
+        }
+    }
+    Err("failed to create a private temp directory".to_string())
+}
+
+fn scratch_dir() -> Result<&'static Path, String> {
+    SCRATCH_DIR
+        .get_or_init(create_scratch_dir)
+        .as_deref()
+        .map_err(|error| error.clone())
+}
+
+/// Remove the scratch directory as the process exits.  Each diff already
+/// removes its own files, so this only reaps the empty directory -- and it
+/// belongs to process shutdown, not to `run`, which the tests drive several
+/// times over inside one process while other code still holds the memoised
+/// path.
+fn remove_scratch_dir() {
+    if let Some(Ok(dir)) = SCRATCH_DIR.get() {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+/// Write one scratch file that only this user can read.  `create_new` refuses
+/// an existing path, so a symlink planted at it is an error rather than a
+/// write through to whatever it points at.
+async fn write_private(path: &Path, contents: &str) -> Result<(), String> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(path)
+        .await
+        .map_err(|error| format!("failed to write temp file: {error}"))?;
+    file.write_all(contents.as_bytes())
+        .await
+        .map_err(|error| format!("failed to write temp file: {error}"))?;
+    file.flush()
+        .await
+        .map_err(|error| format!("failed to write temp file: {error}"))
+}
+
 async fn buffer_hunk_diff(id: u64, path: &str, content: &str) -> Result<String, String> {
     if content.len() > MAX_CONTENT_BYTES {
         return Err("buffer too large for a live diff".to_string());
@@ -1164,16 +1240,12 @@ async fn buffer_hunk_diff(id: u64, path: &str, content: &str) -> Result<String, 
     let spec = format!(":{}{}", prefix.trim_end_matches('\n'), name);
     let index_text = run_git(&dir, &["show", &spec]).await?;
 
-    let stem = std::env::temp_dir().join(format!("simplegit-{}-{id}", std::process::id()));
-    let index_file = stem.with_extension("index");
-    let buffer_file = stem.with_extension("buffer");
+    let scratch = scratch_dir()?;
+    let index_file = scratch.join(format!("{id}.index"));
+    let buffer_file = scratch.join(format!("{id}.buffer"));
     let write = async {
-        tokio::fs::write(&index_file, &index_text)
-            .await
-            .map_err(|error| format!("failed to write temp file: {error}"))?;
-        tokio::fs::write(&buffer_file, content)
-            .await
-            .map_err(|error| format!("failed to write temp file: {error}"))
+        write_private(&index_file, &index_text).await?;
+        write_private(&buffer_file, content).await
     }
     .await;
     let diff = match write {
@@ -1817,13 +1889,17 @@ async fn self_test() -> Result<(), String> {
 async fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        None => match run(io::stdin(), io::stdout()).await {
-            Ok(()) => std::process::ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("simplegit-daemon: {error}");
-                std::process::ExitCode::FAILURE
+        None => {
+            let result = run(io::stdin(), io::stdout()).await;
+            remove_scratch_dir();
+            match result {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("simplegit-daemon: {error}");
+                    std::process::ExitCode::FAILURE
+                }
             }
-        },
+        }
         Some("--version" | "-V") => {
             println!("simplegit-daemon {}", env!("CARGO_PKG_VERSION"));
             std::process::ExitCode::SUCCESS
@@ -1926,6 +2002,56 @@ mod tests {
     /// the same commit is a bare sha line followed by its content.  Nothing
     /// pinned that before, and it is precisely what makes the switch away from
     /// --line-porcelain safe.
+    /// The live diff writes the unsaved buffer to disk to hand it to
+    /// `git diff --no-index`.  That file must be unreadable by anyone else and
+    /// must never be an attacker's symlink to somewhere interesting.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_diff_scratch_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir().expect("scratch directory");
+        let mode = std::fs::metadata(dir)
+            .expect("scratch directory exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "scratch directory is private");
+
+        let file = dir.join("private-probe");
+        write_private(&file, "unsaved buffer contents")
+            .await
+            .expect("write");
+        let mode = std::fs::metadata(&file)
+            .expect("scratch file exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "scratch file is owner-only");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "unsaved buffer contents"
+        );
+        std::fs::remove_file(&file).unwrap();
+
+        // A path that already exists -- here a symlink, the interesting case --
+        // is refused rather than followed and truncated.
+        let target = dir.join("target");
+        std::fs::write(&target, "do not clobber me").unwrap();
+        let link = dir.join("symlink-probe");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(
+            write_private(&link, "attacker payload").await.is_err(),
+            "an existing path must not be written through"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "do not clobber me"
+        );
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_file(&target).unwrap();
+    }
+
     #[test]
     fn blame_porcelain_repeats_only_the_sha() {
         let sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

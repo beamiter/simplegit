@@ -2,6 +2,16 @@
 
 ## Unreleased - 2026-08-08
 
+### 修复:live diff 的临时文件
+
+- 未保存 buffer 的 live diff 此前写到 `$TMPDIR/simplegit-<pid>-<id>.buffer`:
+  pid 可从 /proc 读到、request id 单调递增,所以路径可预测;`tokio::fs::write`
+  会跟随符号链接,而且文件是 0644——共享 /tmp 上每次连续输入都把未保存内容
+  摊开给别人看。现在改为每个 daemon 一个 0700 的私有目录,文件用
+  `create_new` + 0600 创建(路径已存在就报错而不是写穿),diff 返回即删除,
+  daemon 退出时回收目录。
+- 新增单元测试断言目录/文件权限,以及"预置符号链接必须写不进去、目标内容不变"。
+
 ### 修复:第一次按 `]g` 会被吞掉
 
 - `RequestHunks()` 在已有请求 in-flight 时直接 `return true`,只置 stale 位,

@@ -16,7 +16,7 @@ Like the other `simple*` plugins, rendering stays in Vim9script and all git work
 - **Line blame popup** (`:SimpleGitBlameLine`): commit, author, date, and summary for the line under the cursor.
 - **Hunk handling** (GitGutter style): `+`/`~`/`_` signs for changes against the index — updated live while you type, without saving — plus hunk navigation (`:SimpleGitHunkNext`/`Prev`), a diff preview popup, and per-hunk stage (`:SimpleGitHunkStage`) and undo (`:SimpleGitHunkUndo`).
 - **Statusline API**: `simplegit#StatusLine()` renders `main ↑2 ↓1 +12 ~3 -1`; `simplegit#StatusDict()`, `simplegit#Head()` and `simplegit#HunkSummary()` expose the same data, and every file buffer carries `b:simplegit_status_dict`. All of it reads caches the plugin already keeps, so it is safe on the redraw path — no statusline plugin needs to run its own `git`.
-- Asynchronous daemon with a version/capability handshake, request correlation, concurrency limiting and timeouts; index-changing requests run through a FIFO lane, while UI replies are tied to their initiating tab/window/repository and never pull focus back after you move on. `:SimpleGitHealth` exposes the negotiated support.
+- Asynchronous daemon with a version/capability handshake, request correlation, concurrency limiting and timeouts; the live diff hands unsaved buffer text to git through a private per-daemon scratch file (0600, removed immediately); index-changing requests run through a FIFO lane, while UI replies are tied to their initiating tab/window/repository and never pull focus back after you move on. `:SimpleGitHealth` exposes the negotiated support.
 
 ## Requirements
 
