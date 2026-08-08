@@ -23,6 +23,7 @@ const PROTOCOL_VERSION: u32 = 5;
 const CAP_REPOSITORY_FILE_OPS: &str = "repository_file_ops";
 const CAP_BRANCH_SUMMARY: &str = "branch_summary";
 const CAP_BLAME_LINE: &str = "blame_line";
+const CAP_HUNK_RANGE: &str = "hunk_range";
 const GIT_REPOSITORY_ENV_VARS: [&str; 8] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -95,12 +96,28 @@ enum Request {
         #[serde(default)]
         content: Option<String>,
     },
-    /// Stage the hunk covering line `lnum` (`git apply --cached`).
+    /// Stage the hunk covering line `lnum` (`git apply --cached`). With
+    /// `last_lnum` set, every hunk overlapping `lnum..=last_lnum` goes in one
+    /// patch instead; omitting it means a one-line range, which is what a
+    /// client that predates hunk ranges sends.
     #[serde(rename = "stage")]
-    Stage { id: u64, path: String, lnum: u32 },
-    /// Revert the hunk covering line `lnum` in the working tree.
+    Stage {
+        id: u64,
+        path: String,
+        lnum: u32,
+        #[serde(default)]
+        last_lnum: Option<u32>,
+    },
+    /// Revert the hunk covering line `lnum` (or the `lnum..=last_lnum` range)
+    /// in the working tree.
     #[serde(rename = "undo")]
-    Undo { id: u64, path: String, lnum: u32 },
+    Undo {
+        id: u64,
+        path: String,
+        lnum: u32,
+        #[serde(default)]
+        last_lnum: Option<u32>,
+    },
     /// Stage or unstage one file or the whole repository. Repository-wide
     /// operations use "add_all"/"reset_all" and ignore `file`.
     #[serde(rename = "file_op")]
@@ -288,11 +305,13 @@ enum IndexMutation {
         id: u64,
         path: String,
         lnum: u32,
+        last_lnum: u32,
     },
     HunkUndo {
         id: u64,
         path: String,
         lnum: u32,
+        last_lnum: u32,
     },
     FileOp {
         id: u64,
@@ -332,6 +351,7 @@ fn protocol_capabilities() -> HashMap<&'static str, bool> {
         (CAP_REPOSITORY_FILE_OPS, true),
         (CAP_BRANCH_SUMMARY, true),
         (CAP_BLAME_LINE, true),
+        (CAP_HUNK_RANGE, true),
     ])
 }
 
@@ -1064,83 +1084,123 @@ fn parse_hunks(stdout: &str) -> Vec<Hunk> {
     hunks
 }
 
-/// Whether the hunk's post-image covers `lnum`. Pure deletions anchor on the
-/// line the sign sits on (`new_start`, clamped to 1).
-fn hunk_covers(new_start: u32, new_count: u32, lnum: u32) -> bool {
+/// Whether the hunk's post-image overlaps the buffer lines `first..=last`.
+/// Pure deletions have no post-image lines at all, so they anchor on the line
+/// the sign sits on (`new_start`, clamped to 1).
+fn hunk_intersects(new_start: u32, new_count: u32, first: u32, last: u32) -> bool {
     if new_count == 0 {
-        lnum == new_start.max(1)
+        let anchor = new_start.max(1);
+        anchor >= first && anchor <= last
     } else {
-        lnum >= new_start && lnum < new_start + new_count
+        new_start <= last && new_start + new_count > first
     }
 }
 
-/// Rewrite a hunk header so the hunk applies standalone. In a multi-hunk diff
-/// each range is only absolute for its own side; `git apply` derives insertion
-/// points from the *target* side, so rebase the other range onto it. Forward
-/// application targets the index (old side), reverse the working tree (new
-/// side).
+/// Whether the hunk's post-image covers `lnum`: the one-line case of
+/// `hunk_intersects`, kept so the coverage rule can be pinned on its own.
+#[cfg(test)]
+fn hunk_covers(new_start: u32, new_count: u32, lnum: u32) -> bool {
+    hunk_intersects(new_start, new_count, lnum, lnum)
+}
+
+/// Rewrite a hunk header so a subset of a diff applies on its own. In a
+/// multi-hunk diff each range is only absolute for its own side; `git apply`
+/// derives insertion points from the *target* side, so rebase the other range
+/// onto it. Forward application targets the index (old side), reverse the
+/// working tree (new side).
+///
+/// `delta` is the net line growth already contributed by the kept hunks above
+/// this one: the non-target side describes the file *after* those hunks land,
+/// so its start slides by that much. It is zero for a lone hunk, and that is
+/// the only case that existed before hunk ranges.
 fn lone_hunk_header(
     old_start: u32,
     old_count: u32,
     new_start: u32,
     new_count: u32,
     revert: bool,
+    delta: i64,
 ) -> String {
+    // The rebased side can legitimately be pushed to 0 (an insertion at the
+    // top of the file is "@@ -0,0"), never below it.
+    let shift = |base: u32| -> u32 { (base as i64 + delta).max(0) as u32 };
     if revert {
-        let old_start = if new_count == 0 {
+        let old_start = shift(if new_count == 0 {
             new_start + 1
         } else if old_count == 0 {
             new_start.saturating_sub(1)
         } else {
             new_start
-        };
+        });
         format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@")
     } else {
-        let new_start = if old_count == 0 {
+        let new_start = shift(if old_count == 0 {
             old_start + 1
         } else if new_count == 0 {
             old_start.saturating_sub(1)
         } else {
             old_start
-        };
+        });
         format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@")
     }
 }
 
-/// Build a minimal patch (file header plus the single hunk covering `lnum`)
-/// from `git diff -U0` output.
-fn extract_hunk_patch(stdout: &str, lnum: u32, revert: bool) -> Option<String> {
+/// Build a minimal patch (file header plus every hunk whose post-image
+/// overlaps buffer lines `first..=last`) from `git diff -U0` output.
+///
+/// The kept hunks go into one patch rather than being applied one process at a
+/// time: `git apply` is all-or-nothing, so a range that cannot apply cleanly
+/// leaves the index exactly as it was instead of half staged.
+fn extract_hunk_patches(stdout: &str, first: u32, last: u32, revert: bool) -> Option<String> {
     let mut header: Vec<&str> = Vec::new();
-    let mut hunk: Vec<String> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
     let mut in_header = true;
     let mut keep = false;
+    let mut delta: i64 = 0;
     for line in stdout.lines() {
         if line.starts_with("@@ ") {
             in_header = false;
             if keep {
-                break;
+                kept.append(&mut current);
             }
-            hunk.clear();
+            current.clear();
+            keep = false;
             if let Some((old_start, old_count, new_start, new_count)) = parse_hunk_header(line) {
-                keep = hunk_covers(new_start, new_count, lnum);
-                hunk.push(lone_hunk_header(
-                    old_start, old_count, new_start, new_count, revert,
-                ));
+                keep = hunk_intersects(new_start, new_count, first, last);
+                if keep {
+                    current.push(lone_hunk_header(
+                        old_start, old_count, new_start, new_count, revert, delta,
+                    ));
+                    delta += if revert {
+                        old_count as i64 - new_count as i64
+                    } else {
+                        new_count as i64 - old_count as i64
+                    };
+                }
             }
         } else if in_header {
             header.push(line);
-        } else {
-            hunk.push(line.to_string());
+        } else if keep {
+            current.push(line.to_string());
         }
     }
-    if !keep || header.is_empty() {
+    if keep {
+        kept.append(&mut current);
+    }
+    if kept.is_empty() || header.is_empty() {
         return None;
     }
     let mut patch = header.join("\n");
     patch.push('\n');
-    patch.push_str(&hunk.join("\n"));
+    patch.push_str(&kept.join("\n"));
     patch.push('\n');
     Some(patch)
+}
+
+#[cfg(test)]
+fn extract_hunk_patch(stdout: &str, lnum: u32, revert: bool) -> Option<String> {
+    extract_hunk_patches(stdout, lnum, lnum, revert)
 }
 
 async fn disk_hunk_diff(path: &str) -> Result<String, String> {
@@ -1400,6 +1460,7 @@ async fn handle_hunk_op(
     id: u64,
     path: String,
     lnum: u32,
+    last_lnum: u32,
     revert: bool,
     tx: EventTx,
     _permit: OwnedSemaphorePermit,
@@ -1410,8 +1471,13 @@ async fn handle_hunk_op(
         let mut args: Vec<&str> = DIFF_ARGS.to_vec();
         args.extend(["--", name.as_str()]);
         let diff = run_git(&dir, &args).await?;
-        let patch = extract_hunk_patch(&diff, lnum, revert)
-            .ok_or_else(|| "no hunk under cursor".to_string())?;
+        let patch = extract_hunk_patches(&diff, lnum, last_lnum, revert).ok_or_else(|| {
+            if last_lnum > lnum {
+                "no hunk in the selected range".to_string()
+            } else {
+                "no hunk under cursor".to_string()
+            }
+        })?;
         // Patch paths are repository-relative; apply from the root so hunks in
         // any subdirectory resolve.
         let root = run_git(&dir, &["rev-parse", "--show-toplevel"]).await?;
@@ -1499,11 +1565,21 @@ async fn run_index_mutations(
             }
         };
         match mutation {
-            IndexMutation::HunkStage { id, path, lnum } => {
-                handle_hunk_op(id, path, lnum, false, tx.clone(), permit).await;
+            IndexMutation::HunkStage {
+                id,
+                path,
+                lnum,
+                last_lnum,
+            } => {
+                handle_hunk_op(id, path, lnum, last_lnum, false, tx.clone(), permit).await;
             }
-            IndexMutation::HunkUndo { id, path, lnum } => {
-                handle_hunk_op(id, path, lnum, true, tx.clone(), permit).await;
+            IndexMutation::HunkUndo {
+                id,
+                path,
+                lnum,
+                last_lnum,
+            } => {
+                handle_hunk_op(id, path, lnum, last_lnum, true, tx.clone(), permit).await;
             }
             IndexMutation::FileOp { id, path, op, file } => {
                 handle_file_op(id, path, op, file, tx.clone(), permit).await;
@@ -1736,9 +1812,20 @@ where
                 let permit = git_limiter.clone().acquire_owned().await.unwrap();
                 requests.spawn(handle_hunks(id, path, content, tx, permit));
             }
-            Request::Stage { id, path, lnum } => {
+            Request::Stage {
+                id,
+                path,
+                lnum,
+                last_lnum,
+            } => {
+                let last_lnum = last_lnum.unwrap_or(lnum).max(lnum);
                 if index_tx
-                    .send(IndexMutation::HunkStage { id, path, lnum })
+                    .send(IndexMutation::HunkStage {
+                        id,
+                        path,
+                        lnum,
+                        last_lnum,
+                    })
                     .await
                     .is_err()
                 {
@@ -1752,9 +1839,20 @@ where
                     .await;
                 }
             }
-            Request::Undo { id, path, lnum } => {
+            Request::Undo {
+                id,
+                path,
+                lnum,
+                last_lnum,
+            } => {
+                let last_lnum = last_lnum.unwrap_or(lnum).max(lnum);
                 if index_tx
-                    .send(IndexMutation::HunkUndo { id, path, lnum })
+                    .send(IndexMutation::HunkUndo {
+                        id,
+                        path,
+                        lnum,
+                        last_lnum,
+                    })
                     .await
                     .is_err()
                 {
@@ -2314,6 +2412,14 @@ u UU N... 100644 100644 100644 100644 aaaa bbbb cccc conflict.rs\n\
             version["capabilities"][CAP_BRANCH_SUMMARY],
             serde_json::Value::Bool(true)
         );
+        assert_eq!(
+            version["capabilities"][CAP_BLAME_LINE],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            version["capabilities"][CAP_HUNK_RANGE],
+            serde_json::Value::Bool(true)
+        );
     }
 
     #[test]
@@ -2531,17 +2637,72 @@ index aaaa111..bbbb222 100644\n\
     #[test]
     fn lone_hunk_headers_rebase_on_the_target_side() {
         // Forward (stage): the old range is absolute for the index.
-        assert_eq!(lone_hunk_header(3, 1, 5, 1, false), "@@ -3,1 +3,1 @@");
-        assert_eq!(lone_hunk_header(10, 0, 11, 2, false), "@@ -10,0 +11,2 @@");
-        assert_eq!(lone_hunk_header(20, 3, 22, 0, false), "@@ -20,3 +19,0 @@");
-        assert_eq!(lone_hunk_header(0, 0, 1, 2, false), "@@ -0,0 +1,2 @@");
+        assert_eq!(lone_hunk_header(3, 1, 5, 1, false, 0), "@@ -3,1 +3,1 @@");
+        assert_eq!(
+            lone_hunk_header(10, 0, 11, 2, false, 0),
+            "@@ -10,0 +11,2 @@"
+        );
+        assert_eq!(
+            lone_hunk_header(20, 3, 22, 0, false, 0),
+            "@@ -20,3 +19,0 @@"
+        );
+        assert_eq!(lone_hunk_header(0, 0, 1, 2, false, 0), "@@ -0,0 +1,2 @@");
         // Reverse (undo): the new range is absolute for the working tree.
-        assert_eq!(lone_hunk_header(3, 1, 5, 1, true), "@@ -5,1 +5,1 @@");
-        assert_eq!(lone_hunk_header(10, 0, 11, 2, true), "@@ -10,0 +11,2 @@");
-        assert_eq!(lone_hunk_header(20, 3, 22, 0, true), "@@ -23,3 +22,0 @@");
+        assert_eq!(lone_hunk_header(3, 1, 5, 1, true, 0), "@@ -5,1 +5,1 @@");
+        assert_eq!(lone_hunk_header(10, 0, 11, 2, true, 0), "@@ -10,0 +11,2 @@");
+        assert_eq!(lone_hunk_header(20, 3, 22, 0, true, 0), "@@ -23,3 +22,0 @@");
         // The staged '+seven' regression: insertion extracted after a net -1
         // earlier hunk must land after old line 6, not before it.
-        assert_eq!(lone_hunk_header(6, 0, 6, 1, false), "@@ -6,0 +7,1 @@");
+        assert_eq!(lone_hunk_header(6, 0, 6, 1, false, 0), "@@ -6,0 +7,1 @@");
+        // With earlier hunks of the same patch kept, the rebased side slides by
+        // their net growth: two lines added above move this one down by two.
+        assert_eq!(
+            lone_hunk_header(20, 1, 22, 1, false, 2),
+            "@@ -20,1 +22,1 @@"
+        );
+        assert_eq!(
+            lone_hunk_header(20, 3, 22, 0, false, -1),
+            "@@ -20,3 +18,0 @@"
+        );
+        assert_eq!(
+            lone_hunk_header(20, 1, 22, 1, true, -2),
+            "@@ -20,1 +22,1 @@"
+        );
+        // A delta can never push a start below zero.
+        assert_eq!(lone_hunk_header(1, 1, 1, 1, false, -9), "@@ -1,1 +0,1 @@");
+    }
+
+    #[test]
+    fn a_range_keeps_every_overlapping_hunk_in_one_patch() {
+        // Lines 3..12 overlap the first two hunks and not the deletion at 22.
+        let patch = extract_hunk_patches(DIFF_FIXTURE, 3, 12, false).unwrap();
+        assert!(patch.starts_with("diff --git a/src/lib.rs b/src/lib.rs\n"));
+        assert!(patch.contains("-old line\n+new line\n"));
+        assert!(patch.contains("+added one\n+added two\n"));
+        assert!(!patch.contains("gone one"));
+        // The first hunk is line-neutral, so the second is not displaced.
+        assert!(patch.contains("@@ -3,1 +3,1 @@"));
+        assert!(patch.contains("@@ -10,0 +11,2 @@"));
+
+        // The whole file: the deletion now follows a +2 insertion, so on the
+        // index side it lands two lines further down than it would alone.
+        let patch = extract_hunk_patches(DIFF_FIXTURE, 1, 100, false).unwrap();
+        assert!(patch.contains("@@ -20,3 +21,0 @@"));
+        assert_eq!(patch.matches("@@ -").count(), 3);
+
+        // Reverting the same range rebases the other side instead: the
+        // deletion is restored after the +2 insertion has been taken away.
+        let patch = extract_hunk_patches(DIFF_FIXTURE, 1, 100, true).unwrap();
+        assert!(patch.contains("@@ -3,1 +3,1 @@"));
+        assert!(patch.contains("@@ -10,0 +11,2 @@"));
+        assert!(patch.contains("@@ -21,3 +22,0 @@"));
+
+        // A range that touches no hunk yields no patch at all, so nothing is
+        // applied -- rather than a header-only patch git would reject.
+        assert!(extract_hunk_patches(DIFF_FIXTURE, 4, 9, false).is_none());
+        // A pure deletion is reachable only through its anchor line.
+        assert!(extract_hunk_patches(DIFF_FIXTURE, 22, 22, false).is_some());
+        assert!(extract_hunk_patches(DIFF_FIXTURE, 23, 40, false).is_none());
     }
 
     #[test]

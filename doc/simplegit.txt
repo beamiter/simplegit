@@ -131,16 +131,26 @@ COMMANDS                                                   *simplegit-commands*
   refresh has answered, the jump is queued and runs as soon as it does, rather
   than being lost.
 
-:SimpleGitHunkPreview                                   *:SimpleGitHunkPreview*
-  Show the diff of the hunk under the cursor in a popup.
+:[range]SimpleGitHunkPreview                            *:SimpleGitHunkPreview*
+  Show the diff of the hunk under the cursor in a popup. With a range (a
+  visual selection, `:10,20SimpleGitHunkPreview`), every hunk the range
+  touches is shown, in file order.
 
-:SimpleGitHunkStage                                       *:SimpleGitHunkStage*
+:[range]SimpleGitHunkStage                                *:SimpleGitHunkStage*
   Stage the hunk under the cursor into the index (like git add -p for one
   hunk). The buffer must be saved first; hunks reflect the file on disk.
+  With a range, every hunk the range touches is staged, as one patch: if any
+  part of it will not apply, nothing is staged. A pure deletion is touched
+  only through the line its sign sits on.
+  A range needs a daemon that advertises the `hunk_range` capability; against
+  an older one the command refuses rather than quietly staging only the first
+  hunk. |:SimpleGitHealth| reports it as "hunk ranges".
 
-:SimpleGitHunkUndo                                         *:SimpleGitHunkUndo*
+:[range]SimpleGitHunkUndo                                  *:SimpleGitHunkUndo*
   Revert the hunk under the cursor in the working tree and reload the
-  buffer. This discards the change; it is not confirmed.
+  buffer. This discards the change; it is not confirmed. With a range, every
+  hunk the range touches is reverted together, under the same all-or-nothing
+  and capability rules as |:SimpleGitHunkStage|.
 
 :SimpleGitToggleSigns                                   *:SimpleGitToggleSigns*
   Toggle the sign-column hunk markers.
@@ -170,6 +180,17 @@ MAPPINGS                                                   *simplegit-mappings*
   <Plug>(simplegit-hunk-stage)         :SimpleGitHunkStage
   <Plug>(simplegit-hunk-undo)          :SimpleGitHunkUndo
 <
+In visual mode, hunk-stage, hunk-undo and hunk-preview apply to every hunk the
+selection touches. Two text objects select one hunk, in both visual and
+operator-pending mode: >
+  <Plug>(simplegit-hunk-inner)         the lines of the hunk under the cursor
+  <Plug>(simplegit-hunk-around)        the same, plus the blank lines below it
+<
+A pure deletion has no lines in the buffer, so it selects the single line its
+sign sits on. Text objects cannot wait for anything: outside a hunk, or before
+this buffer's hunks have been read for the first time, they select nothing and
+say so.
+
 Default mappings (only when the key is unmapped, disable with
 g:simplegit_enable_default_mappings = 0): >
   <leader>gb   blame sidebar        <leader>gm   line blame popup
@@ -177,7 +198,11 @@ g:simplegit_enable_default_mappings = 0): >
   <leader>gs   repository status
   ]g / [g      next/previous hunk   <leader>gp   preview hunk
   <leader>ga   stage hunk           <leader>gu   undo hunk
+  ih / ah      hunk text objects (visual and operator-pending)
 <
+<leader>ga, <leader>gu and <leader>gp are mapped in visual mode too, where
+they act on the selection.
+
 ===============================================================================
 CONFIGURATION                                         *simplegit-configuration*
 

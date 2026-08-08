@@ -278,6 +278,80 @@ endif
 bwipeout!
 delete(sandbox, 'rf')
 
+# --- Hunk ranges: stage and revert a selection ------------------------------
+# A range collects every hunk it touches into ONE patch, so the ranges of the
+# kept hunks have to be rebased against each other -- a deletion above an
+# insertion shifts where that insertion lands on the index side.  The unit
+# tests pin the arithmetic; only real `git apply` can say whether the patch it
+# produces actually applies, which is what this section is for.
+var range_repo = tempname()
+mkdir(range_repo, 'p')
+Git(range_repo, 'init -q')
+Git(range_repo, 'config user.email test@example.com')
+Git(range_repo, 'config user.name Test')
+var committed = ['a1', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7', 'a8', 'a9', 'a10']
+var ranged = range_repo .. '/ranged.txt'
+writefile(committed, ranged)
+Git(range_repo, 'add ranged.txt')
+Git(range_repo, 'commit -q -m initial')
+
+# One change, one deletion and one insertion, in that order down the file:
+#   1 a1  2 a2 changed  3 a3  4 a4  5 a6  6 a7  7 a8  8 NEW  9 a9  10 a10
+var edited = ['a1', 'a2 changed', 'a3', 'a4', 'a6', 'a7', 'a8', 'NEW', 'a9', 'a10']
+def ResetRanged()
+  Git(range_repo, 'reset -q')
+  Git(range_repo, 'checkout -q -- ranged.txt')
+  writefile(edited, ranged)
+  silent edit!
+enddef
+
+writefile(edited, ranged)
+execute 'edit ' .. fnameescape(ranged)
+if WaitFor(() => len(PlacedSigns()) > 0, 'range fixture signs placed')
+  # A range covering only the insertion stages only the insertion.
+  simplegit#HunkStage(8, 9)
+  WaitFor(() => Git(range_repo, 'diff --cached') =~# '+NEW',
+    'a narrow range stages its hunk')
+  Check(Git(range_repo, 'diff --cached') !~# 'a2 changed',
+    'a range does not stage a hunk it does not touch')
+  Check(Git(range_repo, 'diff --cached') !~# '-a5',
+    'a range does not stage the deletion above it')
+
+  # The whole file in one go: three hunks, one patch, and the insertion has to
+  # be rebased past the deletion that precedes it.
+  ResetRanged()
+  WaitFor(() => len(PlacedSigns()) > 0, 'signs return after reset')
+  simplegit#HunkStage(1, line('$'))
+  WaitFor(() => Git(range_repo, 'diff') ==# '',
+    'a whole-file range leaves nothing unstaged')
+  var staged = Git(range_repo, 'diff --cached')
+  Check(staged =~# '+a2 changed', 'the change hunk is staged')
+  Check(staged =~# '-a5', 'the deletion is staged')
+  Check(staged =~# '+NEW', 'the insertion is staged')
+
+  # Reverting the same range rebases the other way round and has to restore
+  # the file exactly.
+  ResetRanged()
+  WaitFor(() => len(PlacedSigns()) > 0, 'signs return before the revert')
+  simplegit#HunkUndo(1, line('$'))
+  WaitFor(() => readfile(ranged) == committed, 'a range revert restores the file')
+  Check(getline(1, '$') == committed, 'and the buffer follows')
+
+  # The text objects answer from the same hunk list.
+  ResetRanged()
+  WaitFor(() => len(PlacedSigns()) > 0, 'signs return before the text object')
+  cursor(8, 1)
+  simplegit#SelectHunk()
+  Check(mode() =~# '^[vV]', 'ih selects linewise (mode ' .. mode() .. ')')
+  execute "normal! \<Esc>"
+  Check(line("'<") == 8 && line("'>") == 8, 'ih covers exactly the inserted line')
+  cursor(1, 1)
+  simplegit#SelectHunk()
+  Check(mode() !~# '^[vV]', 'ih outside a hunk selects nothing')
+endif
+bwipeout!
+delete(range_repo, 'rf')
+
 simplegit#Disable()
 
 if len(errors) > 0

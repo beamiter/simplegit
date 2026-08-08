@@ -85,9 +85,11 @@ command! -nargs=? SimpleGitDiff simplegit#Diff(<q-args>)
 command! -nargs=? SimpleGitShow simplegit#Show(<q-args>)
 command! SimpleGitHunkNext simplegit#HunkNext()
 command! SimpleGitHunkPrev simplegit#HunkPrev()
-command! SimpleGitHunkPreview simplegit#HunkPreview()
-command! SimpleGitHunkStage simplegit#HunkStage()
-command! SimpleGitHunkUndo simplegit#HunkUndo()
+# -range: with no range Vim passes the cursor line as both ends, so the
+# rangeless forms keep meaning exactly what they always did.
+command! -range SimpleGitHunkPreview simplegit#HunkPreview(<line1>, <line2>)
+command! -range SimpleGitHunkStage simplegit#HunkStage(<line1>, <line2>)
+command! -range SimpleGitHunkUndo simplegit#HunkUndo(<line1>, <line2>)
 command! SimpleGitToggleSigns simplegit#ToggleSigns()
 command! -bang SimpleGitCommit simplegit#Commit(<bang>0)
 command! SimpleGitRestart simplegit#Restart()
@@ -110,6 +112,19 @@ nnoremap <silent> <Plug>(simplegit-hunk-prev) <Cmd>SimpleGitHunkPrev<CR>
 nnoremap <silent> <Plug>(simplegit-hunk-preview) <Cmd>SimpleGitHunkPreview<CR>
 nnoremap <silent> <Plug>(simplegit-hunk-stage) <Cmd>SimpleGitHunkStage<CR>
 nnoremap <silent> <Plug>(simplegit-hunk-undo) <Cmd>SimpleGitHunkUndo<CR>
+
+# Visual mode: operate on every hunk the selection touches.  ':' in visual mode
+# inserts the '<,'> range, which the -range commands pass straight through.
+xnoremap <silent> <Plug>(simplegit-hunk-stage) :SimpleGitHunkStage<CR>
+xnoremap <silent> <Plug>(simplegit-hunk-undo) :SimpleGitHunkUndo<CR>
+xnoremap <silent> <Plug>(simplegit-hunk-preview) :SimpleGitHunkPreview<CR>
+
+# Hunk text objects.  ':<C-u>' rather than '<Cmd>': the function reselects
+# linewise, which a <Cmd> mapping is not allowed to do.
+onoremap <silent> <Plug>(simplegit-hunk-inner) :<C-u>call simplegit#SelectHunk(v:false)<CR>
+xnoremap <silent> <Plug>(simplegit-hunk-inner) :<C-u>call simplegit#SelectHunk(v:false)<CR>
+onoremap <silent> <Plug>(simplegit-hunk-around) :<C-u>call simplegit#SelectHunk(v:true)<CR>
+xnoremap <silent> <Plug>(simplegit-hunk-around) :<C-u>call simplegit#SelectHunk(v:true)<CR>
 
 # Defaults never replace a mapping owned by the user.
 if g:simplegit_enable_default_mappings
@@ -145,6 +160,29 @@ if g:simplegit_enable_default_mappings
   endif
   if maparg('<leader>gu', 'n') ==# ''
     nmap <silent> <leader>gu <Plug>(simplegit-hunk-undo)
+  endif
+  # The same three leaders in visual mode, applied to the selection.
+  if maparg('<leader>ga', 'x') ==# ''
+    xmap <silent> <leader>ga <Plug>(simplegit-hunk-stage)
+  endif
+  if maparg('<leader>gu', 'x') ==# ''
+    xmap <silent> <leader>gu <Plug>(simplegit-hunk-undo)
+  endif
+  if maparg('<leader>gp', 'x') ==# ''
+    xmap <silent> <leader>gp <Plug>(simplegit-hunk-preview)
+  endif
+  # 'h' for hunk, matching gitgutter's ic/ac and gitsigns' ih.
+  if maparg('ih', 'o') ==# ''
+    omap <silent> ih <Plug>(simplegit-hunk-inner)
+  endif
+  if maparg('ih', 'x') ==# ''
+    xmap <silent> ih <Plug>(simplegit-hunk-inner)
+  endif
+  if maparg('ah', 'o') ==# ''
+    omap <silent> ah <Plug>(simplegit-hunk-around)
+  endif
+  if maparg('ah', 'x') ==# ''
+    xmap <silent> ah <Plug>(simplegit-hunk-around)
   endif
 endif
 

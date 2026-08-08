@@ -2,6 +2,30 @@
 
 ## Unreleased - 2026-08-08
 
+### 新增:按范围 stage/revert/preview hunk,以及 `ih` / `ah` text object
+
+- `:SimpleGitHunkStage` / `:SimpleGitHunkUndo` / `:SimpleGitHunkPreview` 现在接受
+  range:可视选区(`<leader>ga` / `<leader>gu` / `<leader>gp` 在 visual mode 也
+  映射好了)或 `:10,20SimpleGitHunkStage`,作用于选区碰到的**每一个** hunk。纯删除
+  没有自己的行,只能通过 sign 所在的那一行被选中——Vim 侧与 daemon 侧用的是同一
+  条规则,否则 preview 和 stage 会各看各的。
+- daemon 把选中的 hunk 合成**一个** patch 交给 `git apply`,而不是一个 hunk 一次
+  进程:`git apply` 是全有或全无的,所以一个 range 要么整体生效,要么索引原样不动,
+  不会停在"staged 一半"。被丢掉的 hunk 会让保留下来的 hunk 在非目标一侧发生位移,
+  header 因此按累计增量重新基准化(stage 基准在 index 侧,revert 在工作树侧)。
+- 新协议能力 `hunk_range`(协议号仍是 5,能力是加上去的)。旧 daemon 不认识
+  `last_lnum`,只会 stage 选区第一行的那个 hunk——那不是用户要的,所以带 range 的
+  请求在线上就被能力门挡住并明确报错,而不是悄悄缩小范围。`:SimpleGitHealth`
+  新增一行 `hunk ranges`。
+- 新增 `ih` / `ah` text object(visual + operator-pending,仅在按键未被占用时安装):
+  `dih` 删掉光标所在 hunk,`ah` 额外吃掉紧随其后的空行。text object 不能等待,
+  所以 hunk 还没读回来时它明确拒绝,而不是选错行。
+- 测试:Rust 单元测试覆盖多 hunk patch 的 header 重定基准(正向/反向、纯插入/
+  纯删除、以及 delta 不会把起点压到负数);`make vim-integration` 用真 git 跑一遍
+  端到端——窄 range 只 stage 它碰到的 hunk、整文件 range 三个 hunk 一次 `git apply`
+  成功、反向 range revert 逐字节还原文件、`ih` 选中插入的那一行且在 hunk 之外
+  什么都不选。
+
 ### 修复:重新读入 buffer 之后 signs 不会更新
 
 - `BufReadPost` 走的是 `RefreshHunks()`,而它只在缓存为空时才去问 daemon,否则

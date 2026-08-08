@@ -14,7 +14,7 @@ Like the other `simple*` plugins, rendering stays in Vim9script and all git work
 - **Commit inspection** (`:SimpleGitShow [rev]`): message, stats and patch with `git` syntax highlighting.
 - **Repository status** (`:SimpleGitStatus`): branch plus changed files; `<CR>` opens a file, `d` opens and diffs it, `a`/`u` stage/unstage it, `A`/`U` stage/unstage the whole repository, `R` refreshes.
 - **Line blame popup** (`:SimpleGitBlameLine`): commit, author, date, and summary for the line under the cursor.
-- **Hunk handling** (GitGutter style): `+`/`~`/`_` signs for changes against the index — updated live while you type, without saving — plus hunk navigation (`:SimpleGitHunkNext`/`Prev`), a diff preview popup, and per-hunk stage (`:SimpleGitHunkStage`) and undo (`:SimpleGitHunkUndo`).
+- **Hunk handling** (GitGutter style): `+`/`~`/`_` signs for changes against the index — updated live while you type, without saving — plus hunk navigation (`:SimpleGitHunkNext`/`Prev`), a diff preview popup, and per-hunk stage (`:SimpleGitHunkStage`) and undo (`:SimpleGitHunkUndo`). Stage, revert and preview also take a range, so a visual selection acts on every hunk it touches, and `ih` / `ah` select a hunk as a text object.
 - **Statusline API**: `simplegit#StatusLine()` renders `main ↑2 ↓1 +12 ~3 -1`; `simplegit#StatusDict()`, `simplegit#Head()` and `simplegit#HunkSummary()` expose the same data, and every file buffer carries `b:simplegit_status_dict`, sign column on or off. All of it reads caches the plugin already keeps — not the daemon and not the filesystem — so it is safe on the redraw path; no statusline plugin needs to run its own `git`.
 - Asynchronous daemon with a version/capability handshake, request correlation, concurrency limiting and timeouts; the live diff hands unsaved buffer text to git through a private scratch directory created and removed around that one diff (0700, files 0600); index-changing requests run through a FIFO lane, while UI replies are tied to their initiating tab/window/repository and never pull focus back after you move on. `:SimpleGitHealth` exposes the negotiated support.
 
@@ -56,9 +56,9 @@ The installer performs a locked release build, atomically installs `lib/simplegi
 | `:SimpleGitStageAll` / `:SimpleGitUnstageAll` | Stage / unstage the whole repository |
 | `:SimpleGitToggleLineBlame` | Toggle the inline annotation |
 | `:SimpleGitHunkNext` / `:SimpleGitHunkPrev` | Jump to the next/previous hunk |
-| `:SimpleGitHunkPreview` | Popup diff of the hunk under the cursor |
-| `:SimpleGitHunkStage` | Stage the hunk under the cursor |
-| `:SimpleGitHunkUndo` | Revert the hunk under the cursor |
+| `:[range]SimpleGitHunkPreview` | Popup diff of the hunk under the cursor, or of every hunk in the range |
+| `:[range]SimpleGitHunkStage` | Stage the hunk under the cursor, or every hunk the range touches |
+| `:[range]SimpleGitHunkUndo` | Revert the hunk under the cursor, or every hunk the range touches |
 | `:SimpleGitToggleSigns` | Toggle the sign-column markers |
 | `:SimpleGitHealth` | Diagnostics |
 
@@ -123,8 +123,9 @@ Default mappings (only installed when the keys are free; disable with `let g:sim
 | `<leader>gs` | Repository status |
 | `]g` / `[g` | Next / previous hunk |
 | `<leader>gp` | Preview hunk |
-| `<leader>ga` | Stage hunk |
-| `<leader>gu` | Undo hunk |
+| `<leader>ga` | Stage hunk (visual: every hunk in the selection) |
+| `<leader>gu` | Undo hunk (visual: every hunk in the selection) |
+| `ih` / `ah` | Hunk text object, without / with the blank lines below it |
 
 ## Configuration
 

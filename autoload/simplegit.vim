@@ -68,6 +68,7 @@ const COMMIT_BUF = 'simplegit://commit'
 const CAP_REPOSITORY_FILE_OPS = 'repository_file_ops'
 const CAP_BRANCH_SUMMARY = 'branch_summary'
 const CAP_BLAME_LINE = 'blame_line'
+const CAP_HUNK_RANGE = 'hunk_range'
 
 # =============================================================
 # Small helpers
@@ -1563,11 +1564,20 @@ def HunkLine(hunk: dict<any>): number
   return max([hunk.new_start, 1])
 enddef
 
-def HunkCovers(hunk: dict<any>, lnum: number): bool
+# Whether a hunk shows up anywhere in the buffer lines first..last.  A pure
+# deletion has no lines of its own, so it counts as touched only through the
+# anchor line its sign sits on -- the same rule the daemon applies when it
+# picks hunks out of a diff, and they have to agree or a selection would
+# preview one set of hunks and stage another.
+def HunkTouches(hunk: dict<any>, first: number, last: number): bool
   if hunk.new_count == 0
-    return lnum == HunkLine(hunk)
+    return HunkLine(hunk) >= first && HunkLine(hunk) <= last
   endif
-  return lnum >= hunk.new_start && lnum < hunk.new_start + hunk.new_count
+  return hunk.new_start <= last && hunk.new_start + hunk.new_count - 1 >= first
+enddef
+
+def HunkCovers(hunk: dict<any>, lnum: number): bool
+  return HunkTouches(hunk, lnum, lnum)
 enddef
 
 # The sign name wanted on each line, as a dict lnum -> name.
@@ -1747,7 +1757,11 @@ def OnHunkOp(ctx: dict<any>, ev: dict<any>)
   endif
   InvalidateHunks(bufnr)
   RequestHunks(bufnr, 'signs', false)
-  echo '[SimpleGit] ' .. (action ==# 'undo' ? 'hunk reverted' : 'hunk staged')
+  # The daemon does not count what it applied, but the caller knows whether it
+  # asked about one line or a selection, and "hunk staged" after selecting ten
+  # of them reads like only one was taken.
+  var subject = get(ctx, 'ranged', false) ? 'hunks' : 'hunk'
+  echo '[SimpleGit] ' .. subject .. (action ==# 'undo' ? ' reverted' : ' staged')
 enddef
 
 def JumpHunk(bufnr: number, direction: number)
@@ -1784,30 +1798,41 @@ def JumpHunk(bufnr: number, direction: number)
   cursor(target, 1)
 enddef
 
+# The range a preview was asked for, kept across the wait for a hunks reply:
+# bufnr (string) -> [first, last].  Without it a preview requested over a
+# selection would come back as a preview of whatever line the cursor sits on.
+var s_hunk_preview_range: dict<list<number>> = {}
+
 def ShowHunkPreview(bufnr: number)
   if bufnr != bufnr('%')
     return
   endif
-  var lnum = line('.')
+  var key = string(bufnr)
+  var range = has_key(s_hunk_preview_range, key)
+    ? remove(s_hunk_preview_range, key)
+    : [line('.'), line('.')]
+  var lines: list<string> = []
   for hunk in HunksFor(bufnr)
-    if !HunkCovers(hunk, lnum)
-      continue
+    if HunkTouches(hunk, range[0], range[1])
+      lines->extend(hunk.lines)
     endif
-    if has('popupwin')
-      var winid = popup_atcursor(hunk.lines, {
-        padding: [0, 1, 0, 1],
-        border: [1, 1, 1, 1],
-        borderchars: ['─', '│', '─', '│', '┌', '┐', '┘', '└'],
-        moved: 'any',
-        maxheight: 20,
-      })
-      win_execute(winid, 'setlocal filetype=diff')
-    else
-      echo join(hunk.lines, "\n")
-    endif
-    return
   endfor
-  Warn('no hunk under cursor')
+  if empty(lines)
+    Warn(range[0] == range[1] ? 'no hunk under cursor' : 'no hunk in the selection')
+    return
+  endif
+  if has('popupwin')
+    var winid = popup_atcursor(lines, {
+      padding: [0, 1, 0, 1],
+      border: [1, 1, 1, 1],
+      borderchars: ['─', '│', '─', '│', '┌', '┐', '┘', '└'],
+      moved: 'any',
+      maxheight: 20,
+    })
+    win_execute(winid, 'setlocal filetype=diff')
+  else
+    echo join(lines, "\n")
+  endif
 enddef
 
 # Shared entry guard: hunk features need a readable, unmodified file.
@@ -1852,13 +1877,25 @@ export def HunkPrev()
   JumpHunk(bufnr, -1)
 enddef
 
-export def HunkPreview()
+# The lines a hunk command applies to.  Commands are declared -range, so with
+# no range given Vim passes the cursor line as both ends, and a zero means the
+# caller (a <Plug> map, a script) did not go through a command at all.
+def HunkRange(first: number, last: number): list<number>
+  var start = first > 0 ? first : line('.')
+  var finish = last > 0 ? last : start
+  return start <= finish ? [start, finish] : [finish, start]
+enddef
+
+export def HunkPreview(first: number = 0, last: number = 0)
   var bufnr = HunkTarget(false)
   if bufnr < 0
     return
   endif
+  var range = HunkRange(first, last)
+  s_hunk_preview_range[string(bufnr)] = range
   if empty(get(s_hunk_cache, string(bufnr), {}))
     if !RequestHunks(bufnr, 'preview', true)
+      remove(s_hunk_preview_range, string(bufnr))
       Warn('daemon unavailable; run ./install.sh')
     endif
     return
@@ -1866,7 +1903,7 @@ export def HunkPreview()
   ShowHunkPreview(bufnr)
 enddef
 
-def HunkOperate(op: string)
+def HunkOperate(op: string, first: number, last: number)
   var bufnr = HunkTarget(true)
   if bufnr < 0
     return
@@ -1876,18 +1913,69 @@ def HunkOperate(op: string)
     Warn('no hunks in this buffer')
     return
   endif
-  if !Dispatch({type: op, path: BufFilePath(bufnr), lnum: line('.')},
-      {kind: 'hunk_op', bufnr: bufnr, interactive: true})
+  var range = HunkRange(first, last)
+  var ranged = range[0] != range[1]
+  var req: dict<any> = {type: op, path: BufFilePath(bufnr), lnum: range[0]}
+  var ctx: dict<any> = {kind: 'hunk_op', bufnr: bufnr, interactive: true,
+    ranged: ranged}
+  if ranged
+    req.last_lnum = range[1]
+    # Fail closed rather than quietly narrowing: a daemon that predates hunk
+    # ranges ignores last_lnum and would stage only the hunk on the first line
+    # of the selection, which is neither what was asked for nor visible as a
+    # failure.
+    ctx.requires_capability = CAP_HUNK_RANGE
+  endif
+  if !Dispatch(req, ctx)
     Warn('daemon unavailable; run ./install.sh')
   endif
 enddef
 
-export def HunkStage()
-  HunkOperate('stage')
+export def HunkStage(first: number = 0, last: number = 0)
+  HunkOperate('stage', first, last)
 enddef
 
-export def HunkUndo()
-  HunkOperate('undo')
+export def HunkUndo(first: number = 0, last: number = 0)
+  HunkOperate('undo', first, last)
+enddef
+
+# The `ih` / `ah` text objects: select the hunk the cursor sits in, linewise.
+# `around` additionally takes the blank lines directly below it, so `dah` on a
+# newly added paragraph leaves no gap behind.
+#
+# Text objects cannot wait for anything, so this answers from the cached hunks
+# alone and says so when they are not there yet, rather than selecting the
+# wrong lines or leaving the operator hanging on a request.
+export def SelectHunk(around: bool = false)
+  var bufnr = HunkTarget(false)
+  if bufnr < 0
+    return
+  endif
+  if empty(get(s_hunk_cache, string(bufnr), {}))
+    RequestHunks(bufnr, 'signs', false)
+    Warn('hunks not loaded yet for this buffer')
+    return
+  endif
+  var lnum = line('.')
+  for hunk in HunksFor(bufnr)
+    if !HunkCovers(hunk, lnum)
+      continue
+    endif
+    var first = HunkLine(hunk)
+    # A pure deletion has no lines in the buffer at all; its anchor is the only
+    # honest selection, and it is what the sign points at.
+    var last = hunk.new_count == 0
+      ? first
+      : min([hunk.new_start + hunk.new_count - 1, line('$')])
+    if around
+      while last < line('$') && getline(last + 1) =~# '^\s*$'
+        last += 1
+      endwhile
+    endif
+    execute 'normal! ' .. first .. 'GV' .. last .. 'G'
+    return
+  endfor
+  Warn('no hunk under cursor')
 enddef
 
 # `reloaded` is set from BufReadPost, which fires when a buffer is re-read from
@@ -3074,6 +3162,10 @@ export def Health()
   echo '  branch summary: '
         .. (!s_daemon_ready ? 'unknown (handshake pending)'
           : simplegit#core#HasCap(CAP_BRANCH_SUMMARY) ? 'supported'
+          : 'unavailable (rerun ./install.sh)')
+  echo '  hunk ranges:    '
+        .. (!s_daemon_ready ? 'unknown (handshake pending)'
+          : simplegit#core#HasCap(CAP_HUNK_RANGE) ? 'supported'
           : 'unavailable (rerun ./install.sh)')
   echo '  cached buffers: ' .. len(s_blame_cache) .. ' blame, ' .. len(s_hunk_cache) .. ' hunks, '
         .. len(s_branch_cache) .. ' branches'
