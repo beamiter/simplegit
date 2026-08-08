@@ -54,6 +54,7 @@ const SIGN_GROUP = 'simplegit'
 const STATUS_BUF = 'simplegit://status'
 const COMMIT_BUF = 'simplegit://commit'
 const CAP_REPOSITORY_FILE_OPS = 'repository_file_ops'
+const CAP_BRANCH_SUMMARY = 'branch_summary'
 
 # =============================================================
 # Small helpers
@@ -136,6 +137,20 @@ def CommitDate(epoch: number): string
   return epoch > 0 ? strftime('%Y-%m-%d', epoch) : '          '
 enddef
 
+# `↑2 ↓1` for a branch that has diverged from its upstream; empty when it has
+# not diverged, or has no upstream at all.  Both counts arrive straight from
+# the daemon, so tolerate a non-numeric value rather than throwing.
+def UpstreamSuffix(ahead: any, behind: any): string
+  var suffix = ''
+  if type(ahead) == v:t_number && ahead > 0
+    suffix ..= ' ↑' .. ahead
+  endif
+  if type(behind) == v:t_number && behind > 0
+    suffix ..= ' ↓' .. behind
+  endif
+  return suffix
+enddef
+
 # =============================================================
 # Daemon lifecycle (JSON lines over stdin/stdout)
 # =============================================================
@@ -186,6 +201,7 @@ def ClearPending()
   s_status_latest = {}
   s_blame_inflight = {}
   s_hunk_inflight = {}
+  s_branch_inflight = {}
 enddef
 
 def OnDaemonExit(code: number, restarting: bool)
@@ -309,6 +325,8 @@ def OnDaemonEvent(ev: dict<any>)
     OnCat(ctx, ev)
   elseif ev.type ==# 'status'
     OnStatus(ctx, ev)
+  elseif ev.type ==# 'branch'
+    OnBranch(ctx, ev)
   elseif ev.type ==# 'hunks'
     OnHunks(ctx, ev)
   elseif ev.type ==# 'hunk_op'
@@ -365,6 +383,8 @@ def OnRequestError(ctx: dict<any>, message: any)
       remove(s_hunk_inflight, key)
     endif
     s_hunk_cache[key] = {failed: true, hunks: []}
+  elseif get(ctx, 'kind', '') ==# 'branch'
+    RecordBranchFailure(get(ctx, 'repo_token', ''))
   elseif get(ctx, 'kind', '') ==# 'status'
     var request_key = get(ctx, 'status_request_key', '')
     if request_key !=# ''
@@ -564,12 +584,15 @@ def RefreshVisibleGitState()
   if !s_enabled
     return
   endif
+  # A commit, checkout or pull moves the branch as readily as the hunks.
+  s_branch_cache = {}
   for win in getwininfo()
     if getbufvar(win.bufnr, '&buftype') !=# ''
       continue
     endif
     InvalidateBlame(win.bufnr)
     InvalidateHunks(win.bufnr)
+    EnsureBranch(win.bufnr)
     RequestHunks(win.bufnr, 'signs', false)
   endfor
   ScheduleLineBlame()
@@ -1373,6 +1396,7 @@ def OnHunks(ctx: dict<any>, ev: dict<any>)
   endif
   s_hunk_cache[key] = {failed: false, hunks: valid}
   PlaceSigns(bufnr)
+  PublishStatusDict(bufnr)
   var purpose = get(ctx, 'purpose', 'signs')
   if purpose ==# 'preview'
     ShowHunkPreview(bufnr)
@@ -1552,11 +1576,16 @@ export def HunkUndo()
 enddef
 
 export def RefreshHunks()
-  if !s_enabled || !SignsEnabled()
+  if !s_enabled
     return
   endif
   var bufnr = bufnr('%')
   if BufFilePath(bufnr) ==# ''
+    return
+  endif
+  # The statusline API publishes a branch even where the sign column is off.
+  EnsureBranch(bufnr)
+  if !SignsEnabled()
     return
   endif
   if empty(get(s_hunk_cache, string(bufnr), {}))
@@ -1893,8 +1922,20 @@ def OnStatus(ctx: dict<any>, ev: dict<any>)
     DebugLog('ignored malformed status response')
     return
   endif
+  # A status view already carries everything the statusline API needs; feed
+  # the cache from it so an open status window costs no extra branch reads.
+  var ahead = get(ev, 'ahead', 0)
+  var behind = get(ev, 'behind', 0)
+  if branch !=# ''
+    var repo = get(ctx, 'repo_token', '')
+    RecordBranch(repo, branch,
+      type(ahead) == v:t_number ? ahead : 0,
+      type(behind) == v:t_number ? behind : 0)
+    PublishRepo(repo)
+  endif
   var dir = get(ctx, 'dir', getcwd())
-  var display = ['## ' .. (branch ==# '' ? '(no branch)' : branch)]
+  var display = ['## ' .. (branch ==# '' ? '(no branch)' : branch)
+    .. UpstreamSuffix(ahead, behind)]
   var paths: list<string> = ['']
   var requested_cursor_path = get(ctx, 'status_cursor_path', '')
   if type(requested_cursor_path) != v:t_string
@@ -2327,6 +2368,180 @@ export def Status()
 enddef
 
 # =============================================================
+# Statusline API (public, stable)
+#
+# The gitsigns `b:gitsigns_status_dict` / FugitiveStatusline() equivalent: a
+# buffer dict plus autoload accessors, so a statusline plugin can render
+# `main +12 ~3 -1` without running its own git.  Statusline expressions are
+# re-evaluated on every redraw, so every accessor here is O(cached hunks),
+# never dispatches and never blocks.  The branch is refreshed once per
+# repository from the buffer lifecycle instead — see EnsureBranch().
+# =============================================================
+
+# repo token -> {head: string, ahead: number, behind: number}
+var s_branch_cache: dict<dict<any>> = {}
+var s_branch_inflight: dict<bool> = {}
+
+def BufRepoToken(bufnr: number): string
+  var path = BufFilePath(bufnr)
+  return path ==# '' ? '' : RepoToken(fnamemodify(path, ':h'))
+enddef
+
+def RecordBranch(repo: string, head: string, ahead: number, behind: number)
+  if repo ==# ''
+    return
+  endif
+  if has_key(s_branch_inflight, repo)
+    remove(s_branch_inflight, repo)
+  endif
+  # One entry per repository, so this stays small; the bound only guards a
+  # session that visits an unreasonable number of worktrees.
+  if len(s_branch_cache) >= 64 && !has_key(s_branch_cache, repo)
+    remove(s_branch_cache, keys(s_branch_cache)[0])
+  endif
+  s_branch_cache[repo] = {head: head, ahead: ahead, behind: behind}
+enddef
+
+# Requesting a branch for a path outside any repository must not repeat on
+# every BufEnter, so a failure is cached exactly like a success.
+def RecordBranchFailure(repo: string)
+  RecordBranch(repo, '', 0, 0)
+enddef
+
+# One background branch read per repository, issued from the buffer lifecycle.
+# Never call this from a statusline expression: it dispatches.
+def EnsureBranch(bufnr: number)
+  if !s_enabled
+    return
+  endif
+  var repo = BufRepoToken(bufnr)
+  if repo ==# '' || has_key(s_branch_cache, repo) || has_key(s_branch_inflight, repo)
+    return
+  endif
+  var ctx: dict<any> = {kind: 'branch', interactive: false, repo_token: repo,
+    requires_capability: CAP_BRANCH_SUMMARY}
+  if Dispatch({type: 'branch', path: fnamemodify(BufFilePath(bufnr), ':h')}, ctx)
+    # Also set when the capability gate refused to send: an older daemon has
+    # no branch data to give, and retrying on every buffer entry would only
+    # repeat that verdict.  A restart clears this through ClearPending().
+    s_branch_inflight[repo] = true
+  endif
+enddef
+
+def OnBranch(ctx: dict<any>, ev: dict<any>)
+  var head = get(ev, 'head', '')
+  var ahead = get(ev, 'ahead', 0)
+  var behind = get(ev, 'behind', 0)
+  if type(head) != v:t_string || type(ahead) != v:t_number || type(behind) != v:t_number
+    DebugLog('ignored malformed branch response')
+    return
+  endif
+  var repo = get(ctx, 'repo_token', '')
+  RecordBranch(repo, head, ahead, behind)
+  PublishRepo(repo)
+enddef
+
+def HunkCounts(bufnr: number): dict<number>
+  var counts = {added: 0, changed: 0, removed: 0}
+  for hunk in HunksFor(bufnr)
+    if hunk.old_count == 0
+      counts.added += hunk.new_count
+    elseif hunk.new_count == 0
+      counts.removed += hunk.old_count
+    else
+      counts.changed += hunk.new_count
+    endif
+  endfor
+  return counts
+enddef
+
+def BuildStatusDict(bufnr: number): dict<any>
+  var branch = get(s_branch_cache, BufRepoToken(bufnr), {})
+  var counts = HunkCounts(bufnr)
+  return {
+    head: get(branch, 'head', ''),
+    ahead: get(branch, 'ahead', 0),
+    behind: get(branch, 'behind', 0),
+    added: counts.added,
+    changed: counts.changed,
+    removed: counts.removed,
+  }
+enddef
+
+def PublishStatusDict(bufnr: number)
+  if bufnr <= 0 || !bufexists(bufnr)
+    return
+  endif
+  var dict = BuildStatusDict(bufnr)
+  var previous = getbufvar(bufnr, 'simplegit_status_dict', {})
+  if type(previous) == v:t_dict && previous == dict
+    return
+  endif
+  setbufvar(bufnr, 'simplegit_status_dict', dict)
+  # Only pay for the event when somebody listens.  It carries no payload: a
+  # consumer reads b:simplegit_status_dict of whatever window it redraws.
+  if exists('#User#SimpleGitUpdate')
+    silent doautocmd <nomodeline> User SimpleGitUpdate
+  endif
+enddef
+
+# A branch answers for a repository, not for the one buffer that asked, so
+# republish every visible file buffer sharing it.
+def PublishRepo(repo: string)
+  if repo ==# ''
+    return
+  endif
+  for win in getwininfo()
+    if getbufvar(win.bufnr, '&buftype') ==# '' && BufRepoToken(win.bufnr) ==# repo
+      PublishStatusDict(win.bufnr)
+    endif
+  endfor
+enddef
+
+def TargetBuf(buf: number): number
+  return buf > 0 && bufexists(buf) ? buf : bufnr('%')
+enddef
+
+# {head, ahead, behind, added, changed, removed} for one buffer. Every value is
+# already known; an unknown branch is reported as an empty head, never as a
+# missing key, so consumers never need to test for one.
+export def StatusDict(buf: number = 0): dict<any>
+  return BuildStatusDict(TargetBuf(buf))
+enddef
+
+# Branch name of this buffer's repository, the short sha when HEAD is
+# detached, or '' while it is still unknown.
+export def Head(buf: number = 0): string
+  return get(s_branch_cache, BufRepoToken(TargetBuf(buf)), {})->get('head', '')
+enddef
+
+# Added/changed/removed *lines* in this buffer against the index, folded from
+# the same hunks that drive the sign column.
+export def HunkSummary(buf: number = 0): dict<number>
+  return HunkCounts(TargetBuf(buf))
+enddef
+
+# Ready-made segment, for example `main ↑2 +12 ~3 -1`. Empty while the branch
+# is unknown or the buffer belongs to no repository, so a statusline can
+# concatenate it unconditionally.
+export def StatusLine(buf: number = 0): string
+  var dict = BuildStatusDict(TargetBuf(buf))
+  var head: string = get(dict, 'head', '')
+  if head ==# ''
+    return ''
+  endif
+  var parts = [head]
+  for [key, marker] in [['ahead', '↑'], ['behind', '↓'],
+      ['added', '+'], ['changed', '~'], ['removed', '-']]
+    var count: number = get(dict, key, 0)
+    if count > 0
+      parts->add(marker .. count)
+    endif
+  endfor
+  return join(parts, ' ')
+enddef
+
+# =============================================================
 # Lifecycle
 # =============================================================
 export def Enable()
@@ -2372,6 +2587,7 @@ export def Stop()
   ClearPending()
   s_blame_cache = {}
   s_hunk_cache = {}
+  s_branch_cache = {}
 enddef
 
 export def Restart()
@@ -2421,7 +2637,12 @@ export def Health()
         .. 'ms debounce, '
         .. (ConfBool('simplegit_status_auto_refresh', true) ? 'on' : 'off')
         .. (s_status_refresh_timer != 0 ? ' (pending)' : '')
-  echo '  cached buffers: ' .. len(s_blame_cache) .. ' blame, ' .. len(s_hunk_cache) .. ' hunks'
+  echo '  branch summary: '
+        .. (!s_daemon_ready ? 'unknown (handshake pending)'
+          : simplegit#core#HasCap(CAP_BRANCH_SUMMARY) ? 'supported'
+          : 'unavailable (rerun ./install.sh)')
+  echo '  cached buffers: ' .. len(s_blame_cache) .. ' blame, ' .. len(s_hunk_cache) .. ' hunks, '
+        .. len(s_branch_cache) .. ' branches'
   echo '  pending:        ' .. len(s_pending)
   echo '  crashes:        ' .. h.crashes .. ' (restarts: ' .. h.restarts .. ')'
         .. (h.breaker_open ? ' — auto-restart disabled, run :SimpleGitRestart' : '')

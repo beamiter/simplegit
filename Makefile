@@ -1,6 +1,6 @@
-.PHONY: check fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-core defcompile core-verify
+.PHONY: check fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-core defcompile core-verify
 
-check: core-verify fmt clippy test vim-test vim-integration vim-commit vim-file-ops defcompile vim-core
+check: core-verify fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline defcompile vim-core
 
 fmt:
 	cargo fmt --all -- --check
@@ -25,6 +25,12 @@ vim-commit:
 # Protocol capability fallback plus tab/window/status generation races.
 vim-file-ops:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_file_ops.vim
+
+# The public statusline API: b:simplegit_status_dict, User SimpleGitUpdate and
+# the accessors.  Statusline expressions run on every redraw, so this also
+# pins that none of them dispatches a request.
+vim-statusline:
+	vim -Nu NONE -n -i NONE -es -S tests/vim_statusline.vim
 
 # ---------------------------------------------------------------------------
 # simplecore: the vendored daemon supervisor shared by the simple* suite.

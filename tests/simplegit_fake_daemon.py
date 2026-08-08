@@ -44,6 +44,12 @@ def main():
         if isinstance(decoded, list) and all(isinstance(value, list) for value in decoded):
             status_entries = decoded
     status_count = 0
+    hunks = []
+    raw_hunks = os.environ.get("SIMPLEGIT_FAKE_HUNKS", "")
+    if raw_hunks:
+        decoded = json.loads(raw_hunks)
+        if isinstance(decoded, list):
+            hunks = decoded
 
     for line in sys.stdin:
         try:
@@ -91,6 +97,26 @@ def main():
                     "entries": entries,
                 },
                 delay,
+            )
+        elif kind == "branch":
+            emit(
+                {
+                    "type": "branch",
+                    "id": request_id,
+                    "path": request.get("path", ""),
+                    "head": os.environ.get("SIMPLEGIT_FAKE_HEAD", "fake-branch"),
+                    "ahead": int(os.environ.get("SIMPLEGIT_FAKE_AHEAD", "0")),
+                    "behind": int(os.environ.get("SIMPLEGIT_FAKE_BEHIND", "0")),
+                }
+            )
+        elif kind == "hunks":
+            emit(
+                {
+                    "type": "hunks",
+                    "id": request_id,
+                    "path": request.get("path", ""),
+                    "hunks": hunks,
+                }
             )
         elif kind == "file_op":
             schedule(

@@ -8,8 +8,9 @@ CONTENTS                                                   *simplegit-contents*
   3. Commands ................... |simplegit-commands|
   4. Mappings ................... |simplegit-mappings|
   5. Configuration .............. |simplegit-configuration|
-  6. Highlights ................. |simplegit-highlights|
-  7. Troubleshooting ............ |simplegit-troubleshooting|
+  6. Statusline API ............. |simplegit-statusline|
+  7. Highlights ................. |simplegit-highlights|
+  8. Troubleshooting ............ |simplegit-troubleshooting|
 
 ===============================================================================
 INTRODUCTION                                           *simplegit-introduction*
@@ -71,7 +72,8 @@ COMMANDS                                                   *simplegit-commands*
   Show a commit (message, stats and patch). [rev] defaults to HEAD.
 
 :SimpleGitStatus                                             *:SimpleGitStatus*
-  Show the repository branch and changed files. Inside the window: <CR>
+  Show the repository branch and changed files. The header adds `↑n`/`↓n`
+  when the branch has diverged from its upstream. Inside the window: <CR>
   opens the file, `d` opens it and diffs it against HEAD, `a` stages it,
   `u` unstages it, `A` stages every repository change, `U` unstages the
   whole repository, `c` commits, `C` amends, `R` refreshes the list, `q`
@@ -240,6 +242,65 @@ g:simplegit_debug (default 0)                               *g:simplegit_debug*
   Echo daemon/protocol diagnostics with :echomsg.
 
 ===============================================================================
+STATUSLINE API                                           *simplegit-statusline*
+
+A stable public surface for statusline plugins, so nothing has to run its own
+`git` to show a branch and a change count. Everything below reads caches
+Simplegit already maintains: the accessors are O(cached hunks), never dispatch
+a request and never block, which is what makes them safe in 'statusline',
+where they are re-evaluated on every redraw.
+
+simplegit#StatusLine([{bufnr}])                        *simplegit#StatusLine()*
+  A ready-made segment for {bufnr} (default: the current buffer), for
+  example: >
+    main ↑2 ↓1 +12 ~3 -1
+<
+  `↑`/`↓` are commits ahead of and behind the upstream; `+`/`~`/`-` are added,
+  changed and removed lines in this buffer against the index. Zero values are
+  omitted. The result is empty while the branch is still unknown and for a
+  buffer that belongs to no repository, so it can be concatenated
+  unconditionally: >
+    set statusline+=%{simplegit#StatusLine()}
+<
+simplegit#StatusDict([{bufnr}])                        *simplegit#StatusDict()*
+  The same information as a dictionary, for a custom renderer: >
+    {'head': 'main', 'ahead': 2, 'behind': 1,
+     'added': 12, 'changed': 3, 'removed': 1}
+<
+  Every key is always present. An unknown branch is an empty `head`, never a
+  missing key.
+
+simplegit#Head([{bufnr}])                                    *simplegit#Head()*
+  The branch name of {bufnr}'s repository, the short sha when HEAD is
+  detached, or an empty string while it is still unknown.
+
+simplegit#HunkSummary([{bufnr}])                      *simplegit#HunkSummary()*
+  `{'added': n, 'changed': n, 'removed': n}` — line counts folded from the
+  same hunks that drive the sign column, so they track unsaved edits exactly
+  as the signs do.
+
+b:simplegit_status_dict                              *b:simplegit_status_dict*
+  Every file buffer carries the |simplegit#StatusDict()| result, updated
+  whenever its hunks or its branch change. This is the
+  `b:gitsigns_status_dict` equivalent.
+
+User SimpleGitUpdate                                    *SimpleGitUpdate*
+  Fired after b:simplegit_status_dict changes, so a consumer can redraw: >
+    autocmd User SimpleGitUpdate redrawstatus!
+<
+  It carries no payload; read b:simplegit_status_dict of the buffer being
+  rendered. The event is raised only when something is listening for it.
+
+The branch is read once per repository — not per buffer — by a `branch`
+request that reads two refs and never walks the worktree, issued from the
+buffer lifecycle and re-read after |FocusGained| and |ShellCmdPost|. It is an
+additive protocol-5 capability: against an older daemon that does not
+advertise `branch_summary`, `head` stays empty and |simplegit#StatusLine()|
+returns an empty string rather than sending a request the daemon cannot
+answer. |:SimpleGitHealth| reports which. The hunk counts do not depend on
+that capability.
+
+===============================================================================
 HIGHLIGHTS                                               *simplegit-highlights*
 
   SimpleGitBlameVirtual      inline annotation text (links to NonText)
@@ -292,7 +353,8 @@ What it guarantees:
 - Requests are correlated to replies by id and can time out, so a wedged
   daemon never leaves a callback hanging.
 - Protocol 5 also negotiates additive capabilities. Whole-repository file
-  operations require repository_file_ops; a protocol-5 daemon without it is
+  operations require repository_file_ops and the |simplegit-statusline|
+  branch requires branch_summary; a protocol-5 daemon without either is
   still usable for every older request.
 - Hunk stage/undo, file stage/reset and commit operations share one FIFO
   index lane. They complete in request order and cannot race each other for

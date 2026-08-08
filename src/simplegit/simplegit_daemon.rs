@@ -21,6 +21,7 @@ const MAX_OUTPUT_LINES: usize = 200_000;
 const MAX_PENDING_INDEX_MUTATIONS: usize = 1024;
 const PROTOCOL_VERSION: u32 = 5;
 const CAP_REPOSITORY_FILE_OPS: &str = "repository_file_ops";
+const CAP_BRANCH_SUMMARY: &str = "branch_summary";
 const GIT_REPOSITORY_ENV_VARS: [&str; 8] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -73,6 +74,11 @@ enum Request {
     /// Branch plus changed-file list for the repository containing `path`.
     #[serde(rename = "status")]
     Status { id: u64, path: String },
+    /// Current ref and upstream distance only, for the statusline API. Unlike
+    /// `status` this reads two refs and never walks the worktree, so it is
+    /// cheap enough to run once per repository on buffer entry.
+    #[serde(rename = "branch")]
+    Branch { id: u64, path: String },
     /// Working-tree-vs-index hunks for one file (`git diff -U0`). With
     /// `content` the buffer text is diffed against the index instead of the
     /// file on disk, so signs can track unsaved edits.
@@ -201,7 +207,20 @@ enum Event {
         id: u64,
         path: String,
         branch: String,
+        /// Upstream distance, for statusline consumers. Additive fields: a
+        /// client that predates them simply never reads them.
+        ahead: i64,
+        behind: i64,
         entries: Vec<StatusEntry>,
+    },
+    #[serde(rename = "branch")]
+    Branch {
+        id: u64,
+        path: String,
+        /// Branch name, or the short sha when HEAD is detached.
+        head: String,
+        ahead: i64,
+        behind: i64,
     },
     #[serde(rename = "hunks")]
     Hunks {
@@ -289,7 +308,7 @@ impl IndexMutation {
 }
 
 fn protocol_capabilities() -> HashMap<&'static str, bool> {
-    HashMap::from([(CAP_REPOSITORY_FILE_OPS, true)])
+    HashMap::from([(CAP_REPOSITORY_FILE_OPS, true), (CAP_BRANCH_SUMMARY, true)])
 }
 
 async fn stdout_writer<W>(mut out: W, mut rx: tokio::sync::mpsc::Receiver<String>) -> io::Result<()>
@@ -763,16 +782,31 @@ async fn handle_cat(
 #[derive(Debug, Default, PartialEq, Eq)]
 struct StatusResult {
     branch: String,
+    /// Commits the branch is ahead of / behind its upstream. Both stay 0 when
+    /// the branch has no upstream, which is also what git reports for a
+    /// detached HEAD, so consumers need no separate "unknown" state.
+    ahead: i64,
+    behind: i64,
     entries: Vec<StatusEntry>,
 }
 
-/// Parse `git status --porcelain=v2 --branch` output into a branch name and a
-/// changed-file list. Rename records keep the original path in `orig`.
+/// Parse `git status --porcelain=v2 --branch` output into a branch name, its
+/// upstream distance and a changed-file list. Rename records keep the original
+/// path in `orig`.
 fn parse_status(stdout: &str) -> StatusResult {
     let mut result = StatusResult::default();
     for line in stdout.lines() {
         if let Some(value) = line.strip_prefix("# branch.head ") {
             result.branch = value.trim().to_string();
+        } else if let Some(value) = line.strip_prefix("# branch.ab ") {
+            // "+3 -1"; the header is emitted only when an upstream is set.
+            for field in value.split_ascii_whitespace() {
+                match field.split_at_checked(1) {
+                    Some(("+", count)) => result.ahead = count.parse().unwrap_or(0),
+                    Some(("-", count)) => result.behind = count.parse().unwrap_or(0),
+                    _ => {}
+                }
+            }
         } else if let Some(record) = line.strip_prefix("1 ") {
             // 1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>
             let mut fields = record.splitn(8, ' ');
@@ -836,6 +870,8 @@ async fn handle_status(id: u64, path: String, tx: EventTx, _permit: OwnedSemapho
                     id,
                     path,
                     branch: status.branch,
+                    ahead: status.ahead,
+                    behind: status.behind,
                     entries: status.entries,
                 },
             )
@@ -843,6 +879,62 @@ async fn handle_status(id: u64, path: String, tx: EventTx, _permit: OwnedSemapho
         }
         Err(message) => send_event(&tx, &Event::Error { id, message }).await,
     }
+}
+
+/// Parse `git rev-list --count --left-right <upstream>...HEAD`, which prints
+/// "<behind>\t<ahead>" -- left is the upstream side.
+fn parse_left_right(stdout: &str) -> (i64, i64) {
+    let mut fields = stdout.split_ascii_whitespace();
+    let behind = fields
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let ahead = fields
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    (ahead, behind)
+}
+
+async fn handle_branch(id: u64, path: String, tx: EventTx, _permit: OwnedSemaphorePermit) {
+    let dir = file_dir(&path);
+    // symbolic-ref reads one ref and nothing else; `git status --branch` would
+    // walk the whole worktree for data the statusline never shows.  It is also
+    // the only form that answers on an unborn branch, where `rev-parse HEAD`
+    // fails outright.
+    let head = match run_git(&dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await {
+        Ok(name) => name.trim().to_string(),
+        // Detached HEAD: name the commit, the way git's own prompt does.
+        Err(_) => match run_git(&dir, &["rev-parse", "--short", "HEAD"]).await {
+            Ok(sha) => sha.trim().to_string(),
+            Err(message) => {
+                send_event(&tx, &Event::Error { id, message }).await;
+                return;
+            }
+        },
+    };
+    // A branch without an upstream is the common case, not an error: report a
+    // distance of zero rather than failing the whole summary.
+    let (ahead, behind) = match run_git(
+        &dir,
+        &["rev-list", "--count", "--left-right", "@{upstream}...HEAD"],
+    )
+    .await
+    {
+        Ok(counts) => parse_left_right(&counts),
+        Err(_) => (0, 0),
+    };
+    send_event(
+        &tx,
+        &Event::Branch {
+            id,
+            path,
+            head,
+            ahead,
+            behind,
+        },
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1343,6 +1435,7 @@ fn request_id_and_path(req: &Request) -> (u64, Option<&str>) {
         Request::Show { id, path, .. } => (*id, Some(path)),
         Request::Cat { id, path, .. } => (*id, Some(path)),
         Request::Status { id, path } => (*id, Some(path)),
+        Request::Branch { id, path } => (*id, Some(path)),
         Request::Hunks { id, path, .. } => (*id, Some(path)),
         Request::Stage { id, path, .. } => (*id, Some(path)),
         Request::Undo { id, path, .. } => (*id, Some(path)),
@@ -1471,6 +1564,11 @@ where
                 let tx = out_tx.clone();
                 let permit = git_limiter.clone().acquire_owned().await.unwrap();
                 requests.spawn(handle_status(id, path, tx, permit));
+            }
+            Request::Branch { id, path } => {
+                let tx = out_tx.clone();
+                let permit = git_limiter.clone().acquire_owned().await.unwrap();
+                requests.spawn(handle_branch(id, path, tx, permit));
             }
             Request::Hunks { id, path, content } => {
                 let tx = out_tx.clone();
@@ -1777,6 +1875,8 @@ u UU N... 100644 100644 100644 100644 aaaa bbbb cccc conflict.rs\n\
         let result = parse_status(stdout);
         assert_eq!(result.branch, "main");
         assert_eq!(result.entries.len(), 4);
+        // No `# branch.ab` header: no upstream, not "unknown".
+        assert_eq!((result.ahead, result.behind), (0, 0));
         assert_eq!(result.entries[0].xy, ".M");
         assert_eq!(result.entries[0].path, "src/lib.rs");
         assert_eq!(result.entries[1].path, "new name.txt");
@@ -1785,6 +1885,25 @@ u UU N... 100644 100644 100644 100644 aaaa bbbb cccc conflict.rs\n\
         assert_eq!(result.entries[2].path, "conflict.rs");
         assert_eq!(result.entries[3].xy, "??");
         assert_eq!(result.entries[3].path, "untracked file.txt");
+    }
+
+    #[test]
+    fn status_reports_upstream_distance() {
+        let stdout = "\
+# branch.oid deadbeef\n\
+# branch.head feature\n\
+# branch.upstream origin/feature\n\
+# branch.ab +12 -3\n\
+1 .M N... 100644 100644 100644 aaaa bbbb src/lib.rs\n";
+        let result = parse_status(stdout);
+        assert_eq!(result.branch, "feature");
+        assert_eq!((result.ahead, result.behind), (12, 3));
+        assert_eq!(result.entries.len(), 1);
+
+        // A malformed count must not poison the rest of the header.
+        let broken = "# branch.head main\n# branch.ab +x -2\n";
+        let result = parse_status(broken);
+        assert_eq!((result.ahead, result.behind), (0, 2));
     }
 
     #[test]
@@ -1842,6 +1961,21 @@ u UU N... 100644 100644 100644 100644 aaaa bbbb cccc conflict.rs\n\
             version["capabilities"][CAP_REPOSITORY_FILE_OPS],
             serde_json::Value::Bool(true)
         );
+        assert_eq!(
+            version["capabilities"][CAP_BRANCH_SUMMARY],
+            serde_json::Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn upstream_distance_reads_left_as_behind() {
+        // git prints the left side -- the upstream -- first.
+        assert_eq!(parse_left_right("3\t7\n"), (7, 3));
+        assert_eq!(parse_left_right("0\t0\n"), (0, 0));
+        // Without an upstream git fails and the parser is never reached, but a
+        // truncated or malformed line must still not panic.
+        assert_eq!(parse_left_right(""), (0, 0));
+        assert_eq!(parse_left_right("x\ty"), (0, 0));
     }
 
     #[tokio::test]

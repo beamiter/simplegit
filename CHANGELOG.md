@@ -2,6 +2,28 @@
 
 ## Unreleased - 2026-08-08
 
+### Statusline API
+
+- 新增公开、稳定的 statusline 接口:`simplegit#StatusLine()` 直接给出
+  `main ↑2 ↓1 +12 ~3 -1`;`simplegit#StatusDict()` / `simplegit#Head()` /
+  `simplegit#HunkSummary()` 给出同一份数据的结构化形式;每个 file buffer 上
+  同步 `b:simplegit_status_dict`(对标 gitsigns 的
+  `b:gitsigns_status_dict` 与 `FugitiveStatusline()`),并在其变化时触发
+  `User SimpleGitUpdate`——仅在确有监听者时才触发。
+- 这些 accessor 全部只读已有缓存:O(cached hunks)、不派发请求、不阻塞,可以
+  安全放进每次 redraw 都会求值的 'statusline'。branch 改为按 **仓库** 读取一次
+  (不是按 buffer),由 buffer 生命周期与 `FocusGained`/`ShellCmdPost` 触发。
+- daemon 新增轻量的 `branch` 请求(capability `branch_summary`,protocol 仍为 5):
+  只读两个 ref(`symbolic-ref` + `rev-list --count --left-right`),不像
+  `git status -b` 那样遍历整个 worktree;detached HEAD 回退到 short sha,
+  unborn branch 也能正确报出分支名。旧 daemon 没有该 capability 时 fail closed:
+  `head` 为空、`StatusLine()` 返回空串,不会把它答不了的请求送上线。
+- `status` 事件补上 `ahead`/`behind`(解析 `# branch.ab`),status 窗口标题因此
+  会显示 `## main ↑2 ↓1`,并顺带把 branch 缓存喂热——开着 status 窗口时不产生
+  额外的 branch 读取。
+- 新增 `make vim-statusline` 回归:capability fail-closed、每仓库只读一次、
+  hunk 行数折叠、`b:` 变量与 User 事件,以及"求值 50 次不发任何请求"。
+
 ### CI 的 MSRV pin 修复
 
 - `.github/workflows/ci.yml` 的 `dtolnay/rust-toolchain` 停在 1.85.0,而

@@ -64,6 +64,23 @@ enddef
 execute 'edit ' .. fnameescape(root .. '/README.md')
 simplegit#Enable()
 
+# --- Statusline API against real git -----------------------------------------
+# The fake-daemon suite pins the Vim-side contract; this pins that the daemon's
+# branch summary agrees with git itself, including the detached-HEAD fallback
+# a CI checkout routinely produces.
+var expected_head = trim(system(
+  'git -C ' .. shellescape(root) .. ' symbolic-ref --quiet --short HEAD'))
+if v:shell_error != 0
+  expected_head = trim(system('git -C ' .. shellescape(root) .. ' rev-parse --short HEAD'))
+endif
+if WaitFor(() => simplegit#Head() ==# expected_head, 'branch summary matches git')
+  Check(simplegit#StatusLine() =~# '^' .. escape(expected_head, '\.*$^~[]'),
+    'statusline segment starts with the branch')
+  var dict = simplegit#StatusDict()
+  Check(sort(keys(dict)) == ['added', 'ahead', 'behind', 'changed', 'head', 'removed'],
+    'status dict has every documented key')
+endif
+
 # --- Blame sidebar -----------------------------------------------------------
 simplegit#ToggleBlame()
 if WaitFor(() => OtherWindowName() =~# '^simplegit://blame/', 'blame sidebar opens')
