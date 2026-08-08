@@ -50,6 +50,10 @@ g:simplegit_status_auto_refresh = ConfigFlag('simplegit_status_auto_refresh', 1)
 g:simplegit_status_refresh_delay = get(g:, 'simplegit_status_refresh_delay', 150)
 # Buffers above this size fall back to the on-disk diff.
 g:simplegit_live_max_bytes = get(g:, 'simplegit_live_max_bytes', 1024 * 1024)
+# Let the daemon watch each repository and push the changes made outside Vim
+# (a checkout in another terminal) instead of waiting for FocusGained.
+g:simplegit_watch = ConfigFlag('simplegit_watch', 1)
+g:simplegit_watch_interval = get(g:, 'simplegit_watch_interval', 2000)
 g:simplegit_enable_default_mappings = ConfigFlag('simplegit_enable_default_mappings', 1)
 
 # =============================================================

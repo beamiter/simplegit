@@ -22,6 +22,8 @@ endif
 
 g:simplegit_daemon_path = daemon
 g:simplegit_auto_enable = 0
+# Poll the watched repositories often enough for a test to observe a push.
+g:simplegit_watch_interval = 200
 execute 'source ' .. fnameescape(root .. '/plugin/simplegit.vim')
 
 var errors: list<string> = []
@@ -348,6 +350,16 @@ if WaitFor(() => len(PlacedSigns()) > 0, 'range fixture signs placed')
   cursor(1, 1)
   simplegit#SelectHunk()
   Check(mode() !~# '^[vV]', 'ih outside a hunk selects nothing')
+
+  # --- The daemon reports changes made outside Vim ---------------------------
+  # system() fires no autocommand: no FocusGained (which a terminal Vim may
+  # never see at all), no ShellCmdPost, no keypress. The only thing that can
+  # move these signs is the daemon noticing the index move and pushing it.
+  ResetRanged()
+  WaitFor(() => len(PlacedSigns()) > 0, 'signs before the external change')
+  Git(range_repo, 'add ranged.txt')
+  WaitFor(() => len(PlacedSigns()) == 0,
+    'a git command run outside Vim updates the signs by itself')
 endif
 bwipeout!
 delete(range_repo, 'rf')

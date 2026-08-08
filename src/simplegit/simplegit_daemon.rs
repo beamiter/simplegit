@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -24,6 +24,7 @@ const CAP_REPOSITORY_FILE_OPS: &str = "repository_file_ops";
 const CAP_BRANCH_SUMMARY: &str = "branch_summary";
 const CAP_BLAME_LINE: &str = "blame_line";
 const CAP_HUNK_RANGE: &str = "hunk_range";
+const CAP_REPO_WATCH: &str = "repo_watch";
 const GIT_REPOSITORY_ENV_VARS: [&str; 8] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -126,6 +127,16 @@ enum Request {
         path: String,
         op: String,
         file: String,
+    },
+    /// Watch the repository containing `path` and report changes to it. One
+    /// watch per repository is enough; asking again is acknowledged and
+    /// otherwise ignored.
+    #[serde(rename = "watch")]
+    Watch {
+        id: u64,
+        path: String,
+        #[serde(default)]
+        interval_ms: Option<u64>,
     },
     /// The full message of HEAD, used to pre-fill an amend so the user edits
     /// the existing message instead of retyping it.
@@ -271,6 +282,18 @@ enum Event {
         action: &'static str,
         path: String,
     },
+    /// Acknowledges a `watch`, naming the repository root that will be
+    /// reported and how often it is polled.
+    #[serde(rename = "watch")]
+    Watch {
+        id: u64,
+        path: String,
+        interval_ms: u64,
+    },
+    /// Unsolicited: something moved in a watched repository. Carries `id: 0`
+    /// because it answers no request.
+    #[serde(rename = "repo_change")]
+    RepoChange { id: u64, path: String },
     #[serde(rename = "file_op")]
     FileOp { id: u64, op: String, path: String },
     #[serde(rename = "commit_message")]
@@ -352,6 +375,7 @@ fn protocol_capabilities() -> HashMap<&'static str, bool> {
         (CAP_BRANCH_SUMMARY, true),
         (CAP_BLAME_LINE, true),
         (CAP_HUNK_RANGE, true),
+        (CAP_REPO_WATCH, true),
     ])
 }
 
@@ -995,6 +1019,145 @@ fn parse_left_right(stdout: &str) -> (i64, i64) {
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
     (ahead, behind)
+}
+
+/// The parts of a git directory whose (size, mtime) answer "did anything
+/// happen in this repository". `index` covers `git add`/`reset` and the
+/// checkout that rewrites it; `HEAD`, `refs/heads` and `packed-refs` cover
+/// branch switches and ref updates (git renames a lock file into place, which
+/// moves the containing directory's mtime); `logs/HEAD` moves on every HEAD
+/// update, which is what a commit or a rebase looks like from outside; and
+/// `MERGE_HEAD` appears and disappears around a merge or a conflict.
+///
+/// Deliberately not the worktree: walking it is what makes file watchers
+/// expensive, and every worktree change a user makes arrives through Vim's own
+/// events anyway. This exists for the changes made *behind* Vim's back, and
+/// all of those go through the git directory.
+const WATCHED_GIT_PATHS: [&str; 6] = [
+    "HEAD",
+    "index",
+    "packed-refs",
+    "refs/heads",
+    "logs/HEAD",
+    "MERGE_HEAD",
+];
+const MAX_WATCHED_REPOSITORIES: usize = 32;
+const MIN_WATCH_INTERVAL_MS: u64 = 200;
+const DEFAULT_WATCH_INTERVAL_MS: u64 = 2000;
+
+async fn repository_fingerprint(git_dir: &Path) -> Vec<(u64, u128)> {
+    let mut marks = Vec::with_capacity(WATCHED_GIT_PATHS.len());
+    for name in WATCHED_GIT_PATHS {
+        // A missing path is a state too (no MERGE_HEAD is the normal case), so
+        // it gets a fingerprint of its own rather than being skipped.
+        marks.push(match tokio::fs::metadata(git_dir.join(name)).await {
+            Ok(meta) => {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|when| when.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|since| since.as_nanos())
+                    .unwrap_or(0);
+                (meta.len(), mtime)
+            }
+            Err(_) => (0, 0),
+        });
+    }
+    marks
+}
+
+/// Poll one repository until the client goes away. Polling rather than inotify
+/// keeps the dependency list at serde plus tokio and behaves the same on every
+/// platform; the cost is a handful of stats per interval per repository.
+async fn watch_repository(root: String, git_dir: PathBuf, interval: Duration, tx: EventTx) {
+    let mut previous = repository_fingerprint(&git_dir).await;
+    loop {
+        tokio::time::sleep(interval).await;
+        if tx.is_closed() {
+            return;
+        }
+        let current = repository_fingerprint(&git_dir).await;
+        if current != previous {
+            previous = current;
+            send_event(
+                &tx,
+                &Event::RepoChange {
+                    id: 0,
+                    path: root.clone(),
+                },
+            )
+            .await;
+        }
+    }
+}
+
+async fn handle_watch(
+    id: u64,
+    path: String,
+    interval_ms: Option<u64>,
+    watched: Arc<std::sync::Mutex<HashSet<String>>>,
+    tx: EventTx,
+    _permit: OwnedSemaphorePermit,
+) {
+    let dir = file_dir(&path);
+    let root = match run_git(&dir, &["rev-parse", "--show-toplevel"]).await {
+        Ok(root) => root.trim().to_string(),
+        Err(message) => {
+            send_event(&tx, &Event::Error { id, message }).await;
+            return;
+        }
+    };
+    let git_dir = match run_git(&dir, &["rev-parse", "--absolute-git-dir"]).await {
+        Ok(git_dir) => PathBuf::from(git_dir.trim()),
+        Err(message) => {
+            send_event(&tx, &Event::Error { id, message }).await;
+            return;
+        }
+    };
+    let interval_ms = interval_ms
+        .unwrap_or(DEFAULT_WATCH_INTERVAL_MS)
+        .max(MIN_WATCH_INTERVAL_MS);
+    // Decide under the lock and act outside it: the guard is not Send, and
+    // everything below this point awaits.
+    let (fresh, full) = {
+        let mut watched = match watched.lock() {
+            Ok(watched) => watched,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !watched.contains(&root) && watched.len() >= MAX_WATCHED_REPOSITORIES {
+            (false, true)
+        } else {
+            (watched.insert(root.clone()), false)
+        }
+    };
+    if full {
+        send_event(
+            &tx,
+            &Event::Error {
+                id,
+                message: format!("already watching {MAX_WATCHED_REPOSITORIES} repositories"),
+            },
+        )
+        .await;
+        return;
+    }
+    send_event(
+        &tx,
+        &Event::Watch {
+            id,
+            path: root.clone(),
+            interval_ms,
+        },
+    )
+    .await;
+    if fresh {
+        tokio::spawn(watch_repository(
+            root,
+            git_dir,
+            Duration::from_millis(interval_ms),
+            tx,
+        ));
+    }
 }
 
 async fn handle_branch(id: u64, path: String, tx: EventTx, _permit: OwnedSemaphorePermit) {
@@ -1674,6 +1837,7 @@ fn request_id_and_path(req: &Request) -> (u64, Option<&str>) {
         Request::FileOp { id, path, .. } => (*id, Some(path)),
         Request::Commit { id, path, .. } => (*id, Some(path)),
         Request::CommitMessage { id, path } => (*id, Some(path)),
+        Request::Watch { id, path, .. } => (*id, Some(path)),
     }
 }
 
@@ -1696,6 +1860,11 @@ where
     ));
     let mut requests = JoinSet::new();
     let mut input_error = None;
+    // Repositories already being polled, so a second `watch` for the same root
+    // -- one arrives per repository per Vim session, and every restart repeats
+    // them -- acknowledges instead of spawning another poller.
+    let watched_repositories: Arc<std::sync::Mutex<HashSet<String>>> =
+        Arc::new(std::sync::Mutex::new(HashSet::new()));
 
     loop {
         let line = match read_request_line(&mut input).await {
@@ -1806,6 +1975,22 @@ where
                 let tx = out_tx.clone();
                 let permit = git_limiter.clone().acquire_owned().await.unwrap();
                 requests.spawn(handle_branch(id, path, tx, permit));
+            }
+            Request::Watch {
+                id,
+                path,
+                interval_ms,
+            } => {
+                let tx = out_tx.clone();
+                let permit = git_limiter.clone().acquire_owned().await.unwrap();
+                requests.spawn(handle_watch(
+                    id,
+                    path,
+                    interval_ms,
+                    watched_repositories.clone(),
+                    tx,
+                    permit,
+                ));
             }
             Request::Hunks { id, path, content } => {
                 let tx = out_tx.clone();

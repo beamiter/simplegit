@@ -2,6 +2,27 @@
 
 ## Unreleased - 2026-08-08
 
+### 新增:daemon 主动上报仓库变化,不再等 `FocusGained`
+
+- 别的终端里 `git checkout` 之后,signs / blame / 分支全是错的,要等 `FocusGained`
+  或 `ShellCmdPost` 才纠正——而 `ShellCmdPost` 只覆盖 Vim 自己跑的命令,
+  `FocusGained` 在不上报焦点的终端里**根本不会触发**(tmux 里一个 pane 跑 Vim、
+  隔壁 pane 跑 git,正是这个场景)。
+- daemon 现在按仓库轮询 git 目录(HEAD、index、refs/heads、packed-refs、
+  logs/HEAD、MERGE_HEAD;不碰工作树——工作树的变化 Vim 自己知道),变化时推送一条
+  不对应任何请求的 `repo_change`。Vim 侧把它当成"作用域限定到该仓库的
+  FocusGained":只刷新属于这个仓库的可见 buffer,别的仓库一动不动。
+- 每个仓库注册一次 watch(不是每个 buffer),每个 daemon 最多 32 个;新能力
+  `repo_watch`,旧 daemon 上什么都不发。新选项 `g:simplegit_watch`(默认开)、
+  `g:simplegit_watch_interval`(默认 2000ms,低于 200ms 会被 daemon 抬到 200ms),
+  `:SimpleGitHealth` 新增 `repo watch` 一行。轮询而不用 inotify:依赖仍然只有
+  serde + tokio,各平台行为一致,代价是每个仓库每轮 6 个 stat。
+- 测试:新增 `make vim-watch`(fixture 可按需推送任意非请求事件),覆盖每仓库只注册
+  一次、推送后确实重读、另一个仓库的变化不影响本 buffer、未注册的 root 被忽略、
+  daemon 重启后重新注册、关掉开关后线上什么都没有;`make vim-integration` 再用真
+  daemon 跑一遍:`system()` 里跑 `git add`(不触发任何 autocommand),断言 signs
+  自己消失。
+
 ### 新增:按范围 stage/revert/preview hunk,以及 `ih` / `ah` text object
 
 - `:SimpleGitHunkStage` / `:SimpleGitHunkUndo` / `:SimpleGitHunkPreview` 现在接受

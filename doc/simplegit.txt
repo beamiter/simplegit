@@ -273,6 +273,26 @@ g:simplegit_status_auto_refresh (default 1)
   refreshes after SimpleGit's own mutations remain available; disabling the
   plugin is always a hard boundary and cannot restart the daemon.
 
+g:simplegit_watch (default 1)                                 *g:simplegit_watch*
+  Let the daemon watch each repository a buffer belongs to and report changes
+  made outside Vim -- a `git checkout`, `commit`, `rebase` or `add` in another
+  terminal -- so signs, blame and the branch update by themselves.
+  Without it those changes are only noticed on FocusGained or ShellCmdPost:
+  ShellCmdPost only covers commands Vim itself ran, and FocusGained never
+  fires at all in a terminal that does not report focus, which is exactly the
+  tmux-pane-next-to-Vim case.
+  The daemon polls the repository's git directory (HEAD, index, refs/heads,
+  packed-refs, logs/HEAD, MERGE_HEAD) -- never the worktree, whose changes
+  Vim already knows about. One watch is registered per repository, at most 32
+  per daemon. A change is applied only to the buffers of the repository that
+  reported it.
+  Requires a daemon advertising the `repo_watch` capability; against an older
+  one nothing is sent and |:SimpleGitHealth| says so.
+
+g:simplegit_watch_interval (default 2000)          *g:simplegit_watch_interval*
+  Milliseconds between polls of a watched repository. Values below 200 are
+  raised to 200 by the daemon. The cost of one poll is six stats.
+
 g:simplegit_live_max_bytes (default 1048576)       *g:simplegit_live_max_bytes*
   Buffers larger than this fall back to the on-disk diff until saved.
   Below it, the unsaved text is handed to git through a temporary file in a
@@ -300,7 +320,9 @@ a request and never block, which is what makes them safe in 'statusline',
 where they are re-evaluated on every redraw. They do not touch the filesystem
 either: which repository a buffer belongs to is resolved once for that buffer
 and remembered, then re-resolved only after |FocusGained| / |ShellCmdPost|,
-where a clone or `git init` could have moved the answer.
+where a clone or `git init` could have moved the answer. A repository change
+pushed by the daemon (see |g:simplegit_watch|) does not move it: a checkout
+cannot change which repository a file belongs to.
 
 simplegit#StatusLine([{bufnr}])                        *simplegit#StatusLine()*
   A ready-made segment for {bufnr} (default: the current buffer), for
@@ -356,7 +378,9 @@ User SimpleGitUpdate                                    *SimpleGitUpdate*
 
 The branch is read once per repository — not per buffer — by a `branch`
 request that reads two refs and never walks the worktree, issued from the
-buffer lifecycle and re-read after |FocusGained| and |ShellCmdPost|. It is an
+buffer lifecycle and re-read after |FocusGained| and |ShellCmdPost|, or as
+soon as the daemon reports a change to that repository (|g:simplegit_watch|).
+It is an
 additive protocol-5 capability: against an older daemon that does not
 advertise `branch_summary`, `head` stays empty and |simplegit#StatusLine()|
 returns an empty string rather than sending a request the daemon cannot

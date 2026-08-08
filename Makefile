@@ -1,6 +1,6 @@
-.PHONY: check fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame vim-views vim-hunks vim-core defcompile core-verify
+.PHONY: check fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame vim-views vim-hunks vim-watch vim-core defcompile core-verify
 
-check: core-verify fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame vim-views vim-hunks defcompile vim-core
+check: core-verify fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame vim-views vim-hunks vim-watch defcompile vim-core
 
 fmt:
 	cargo fmt --all -- --check
@@ -45,6 +45,11 @@ vim-views:
 # Hunk navigation and preview requested while a refresh is already in flight.
 vim-hunks:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_hunks.vim
+
+# Repository watch: per-repository registration, the unsolicited repo_change
+# event, and that a change in one repository leaves the others alone.
+vim-watch:
+	vim -Nu NONE -n -i NONE -es -S tests/vim_watch.vim
 
 # ---------------------------------------------------------------------------
 # simplecore: the vendored daemon supervisor shared by the simple* suite.

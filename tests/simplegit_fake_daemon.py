@@ -32,6 +32,31 @@ def delays_from_env(name):
     return [int(value) for value in raw.split(",") if value]
 
 
+def push_watcher(path):
+    """Emit unsolicited events on demand.
+
+    Some daemon events answer no request (repo_change), so a test needs a way
+    to make one happen at a chosen moment.  Each line the test writes to
+    SIMPLEGIT_FAKE_PUSH_FILE is one JSON event; the file is consumed, so the
+    same path can be used again for the next push.
+    """
+    while True:
+        time.sleep(0.025)
+        try:
+            with open(path, "r", encoding="utf-8") as pushes:
+                lines = pushes.read().splitlines()
+            os.remove(path)
+        except OSError:
+            continue
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                emit(json.loads(line))
+            except ValueError:
+                pass
+
+
 def main():
     log_path = os.environ.get("SIMPLEGIT_FAKE_LOG", "")
     file_op_delay = int(os.environ.get("SIMPLEGIT_FAKE_FILE_OP_DELAY_MS", "0"))
@@ -58,6 +83,9 @@ def main():
         "time": int(os.environ.get("SIMPLEGIT_FAKE_BLAME_TIME", "1700000000")),
         "summary": "initial import",
     }
+    push_file = os.environ.get("SIMPLEGIT_FAKE_PUSH_FILE", "")
+    if push_file:
+        threading.Thread(target=push_watcher, args=(push_file,), daemon=True).start()
     branch_count = 0
     branch_delays = delays_from_env("SIMPLEGIT_FAKE_BRANCH_DELAYS")
     branch_heads = [
@@ -241,6 +269,17 @@ def main():
                     "behind": int(os.environ.get("SIMPLEGIT_FAKE_BEHIND", "0")),
                 },
                 delay,
+            )
+        elif kind == "watch":
+            # The fixture echoes the request path as the repository root, so a
+            # test knows exactly what a repo_change has to name.
+            emit(
+                {
+                    "type": "watch",
+                    "id": request_id,
+                    "path": request.get("path", ""),
+                    "interval_ms": request.get("interval_ms", 2000),
+                }
             )
         elif kind == "hunks":
             schedule(

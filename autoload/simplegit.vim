@@ -69,6 +69,7 @@ const CAP_REPOSITORY_FILE_OPS = 'repository_file_ops'
 const CAP_BRANCH_SUMMARY = 'branch_summary'
 const CAP_BLAME_LINE = 'blame_line'
 const CAP_HUNK_RANGE = 'hunk_range'
+const CAP_REPO_WATCH = 'repo_watch'
 
 # =============================================================
 # Small helpers
@@ -219,6 +220,11 @@ def ClearPending()
   s_hunk_inflight = {}
   s_hunk_pending_action = {}
   s_branch_inflight = {}
+  # A restarted daemon watches nothing, so every repository has to register
+  # again; without this the plugin would believe it was still being told about
+  # changes it can no longer hear.
+  s_watch_requested = {}
+  s_watch_roots = {}
 enddef
 
 def OnDaemonExit(code: number, restarting: bool)
@@ -312,6 +318,13 @@ def OnDaemonEvent(ev: dict<any>)
     OnVersion(ev)
     return
   endif
+  if ev.type ==# 'repo_change'
+    # Unsolicited: the daemon noticed something move in a watched repository.
+    # It answers no request, so it has no correlatable id and has to be handled
+    # before the pending lookup below rejects it as stale.
+    OnRepoChange(ev)
+    return
+  endif
   var id = get(ev, 'id', 0)
   if type(id) != v:t_number
     DebugLog('daemon response without a numeric id')
@@ -346,6 +359,8 @@ def OnDaemonEvent(ev: dict<any>)
     OnStatus(ctx, ev)
   elseif ev.type ==# 'branch'
     OnBranch(ctx, ev)
+  elseif ev.type ==# 'watch'
+    OnWatch(ctx, ev)
   elseif ev.type ==# 'hunks'
     OnHunks(ctx, ev)
   elseif ev.type ==# 'hunk_op'
@@ -760,18 +775,33 @@ enddef
 # Refresh every visible file buffer after Git changes, not only the current
 # one. Mutation callbacks share this without inheriting FocusGained's status
 # auto-refresh policy.
-def RefreshVisibleGitState()
+#
+# With a repository token, only buffers belonging to that repository are
+# refreshed: that is what a pushed repo_change reports, and a change in one
+# checkout says nothing about the file open next to it.
+def RefreshVisibleGitState(repo_filter: string = '')
   if !s_enabled
     return
   endif
   # A commit, checkout or pull moves the branch as readily as the hunks, and a
   # `git init`, clone or submodule add moves where a buffer's repository even
   # begins -- so the remembered repository tokens go too.  This is the one
-  # event that can invalidate them, and it is rare enough to pay for.
-  InvalidateBranches()
-  s_repo_token_cache = {}
+  # event that can invalidate them, and it is rare enough to pay for.  A
+  # repository-scoped change cannot move any of those boundaries, so it keeps
+  # the tokens.
+  InvalidateBranches(repo_filter)
+  if repo_filter ==# ''
+    s_repo_token_cache = {}
+  endif
   for win in getwininfo()
     if getbufvar(win.bufnr, '&buftype') !=# ''
+      continue
+    endif
+    if repo_filter !=# '' && BufRepoToken(win.bufnr) !=# repo_filter
+      # Not this repository -- but a branch read that was on the wire when the
+      # generation moved has been abandoned, so give it a chance to be re-asked
+      # instead of leaving that buffer without a branch.
+      EnsureBranch(win.bufnr)
       continue
     endif
     InvalidateBlame(win.bufnr)
@@ -2002,6 +2032,7 @@ export def RefreshHunks(reloaded: bool = false)
   # g:simplegit_signs is 0: no hunks are ever requested then, and the one
   # branch reply that would have published it had already landed.
   EnsureBranch(bufnr)
+  EnsureWatch(bufnr)
   PublishStatusDict(bufnr)
   if !SignsEnabled()
     return
@@ -2830,13 +2861,21 @@ var s_branch_inflight: dict<bool> = {}
 # never ask again.
 var s_branch_generation: number = 0
 
-# Forget every cached branch and abandon the reads still in flight.
-def InvalidateBranches()
+# Forget cached branches -- one repository's, or every one -- and abandon the
+# reads still in flight.
+def InvalidateBranches(repo: string = '')
   s_branch_generation += 1
-  s_branch_cache = {}
+  if repo ==# ''
+    s_branch_cache = {}
+  elseif has_key(s_branch_cache, repo)
+    remove(s_branch_cache, repo)
+  endif
   # Dropping the in-flight marks (rather than keeping them until their replies
   # land) is what lets EnsureBranch() re-ask immediately; the abandoned replies
-  # are recognised by their generation and discarded.
+  # are recognised by their generation and discarded.  They are dropped for
+  # every repository even when only one was invalidated: the generation is
+  # global, so no reply that is already on the wire can be trusted any more.
+  # The repositories that kept their cached value simply do not re-ask.
   s_branch_inflight = {}
 enddef
 
@@ -2940,6 +2979,81 @@ def OnBranch(ctx: dict<any>, ev: dict<any>)
   var repo = get(ctx, 'repo_token', '')
   RecordBranch(repo, head, ahead, behind)
   PublishRepo(repo)
+enddef
+
+# =============================================================
+# Repository watch
+#
+# `git checkout` in another terminal changes what every open buffer in that
+# repository looks like, and Vim never hears about it: FocusGained only fires
+# in a GUI or a terminal that reports focus, and ShellCmdPost only covers the
+# commands Vim itself ran.  In a tmux pane next to a plain terminal Vim the
+# signs simply stayed wrong.  So the daemon polls the git directory of each
+# repository it is asked about and pushes an unsolicited repo_change; this side
+# treats it exactly like a FocusGained scoped to that one repository.
+# =============================================================
+
+# repo token -> true once a watch has been asked for (the answer, success or
+# capability refusal, is not re-asked; a daemon restart clears it).
+var s_watch_requested: dict<bool> = {}
+# Repository root as the daemon spells it -> our own repo token.  repo_change
+# names the root, and only the ack can tie the two identities together.
+var s_watch_roots: dict<string> = {}
+
+def WatchEnabled(): bool
+  return ConfBool('simplegit_watch', true)
+enddef
+
+# One watch per repository, registered from the buffer lifecycle beside the
+# branch read.
+def EnsureWatch(bufnr: number)
+  if !s_enabled || !WatchEnabled()
+    return
+  endif
+  var repo = BufRepoToken(bufnr)
+  if repo ==# '' || has_key(s_watch_requested, repo)
+    return
+  endif
+  var interval = ConfNum('simplegit_watch_interval', 2000)
+  var ctx: dict<any> = {kind: 'watch', interactive: false, repo_token: repo,
+    requires_capability: CAP_REPO_WATCH}
+  if Dispatch({type: 'watch', path: fnamemodify(BufFilePath(bufnr), ':h'),
+      interval_ms: interval}, ctx)
+    # Set even when the capability gate refused: an older daemon cannot watch
+    # anything, and asking again on every BufEnter would only repeat that.
+    s_watch_requested[repo] = true
+  endif
+enddef
+
+def OnWatch(ctx: dict<any>, ev: dict<any>)
+  var root = get(ev, 'path', '')
+  var repo = get(ctx, 'repo_token', '')
+  if type(root) != v:t_string || root ==# '' || repo ==# ''
+    DebugLog('ignored malformed watch response')
+    return
+  endif
+  if len(s_watch_roots) >= 64 && !has_key(s_watch_roots, root)
+    remove(s_watch_roots, keys(s_watch_roots)[0])
+  endif
+  s_watch_roots[root] = repo
+enddef
+
+def OnRepoChange(ev: dict<any>)
+  if !s_enabled || !WatchEnabled()
+    return
+  endif
+  var root = get(ev, 'path', '')
+  if type(root) != v:t_string || !has_key(s_watch_roots, root)
+    # A root we never registered, or one from before a restart: refreshing on
+    # it would touch buffers we cannot attribute.
+    DebugLog('ignored repo_change for an unknown repository')
+    return
+  endif
+  var repo = s_watch_roots[root]
+  if ConfBool('simplegit_status_auto_refresh', true) && HasOpenStatus(repo)
+    ScheduleStatusRefresh(false, repo)
+  endif
+  RefreshVisibleGitState(repo)
 enddef
 
 def HunkCounts(bufnr: number): dict<number>
@@ -3167,6 +3281,12 @@ export def Health()
         .. (!s_daemon_ready ? 'unknown (handshake pending)'
           : simplegit#core#HasCap(CAP_HUNK_RANGE) ? 'supported'
           : 'unavailable (rerun ./install.sh)')
+  echo '  repo watch:     '
+        .. (!WatchEnabled() ? 'off (g:simplegit_watch)'
+          : !s_daemon_ready ? 'unknown (handshake pending)'
+          : !simplegit#core#HasCap(CAP_REPO_WATCH) ? 'unavailable (rerun ./install.sh)'
+          : len(s_watch_roots) .. ' repositories, every '
+            .. ConfNum('simplegit_watch_interval', 2000) .. 'ms')
   echo '  cached buffers: ' .. len(s_blame_cache) .. ' blame, ' .. len(s_hunk_cache) .. ' hunks, '
         .. len(s_branch_cache) .. ' branches'
   echo '  pending:        ' .. len(s_pending)

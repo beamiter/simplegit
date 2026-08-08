@@ -97,6 +97,12 @@ Status is latest-request-wins, including the first asynchronous open. A
 commit message is likewise generation-guarded: a second `:write` is refused
 while the commit is pending, and text typed after the first `:write` is kept
 open for a deliberate follow-up instead of being discarded by the reply.
+Changes made outside Vim — a `git checkout`, `commit` or `rebase` in another
+terminal — are reported by the daemon itself: it polls each repository's git
+directory and pushes a change event, so signs, blame and the branch update
+without waiting for `FocusGained`, which a terminal Vim may never receive.
+See `g:simplegit_watch`.
+
 While a status view is open, `FocusGained` and `ShellCmdPost` refresh it
 automatically after a 150 ms debounce. Bursts coalesce, only the existing
 window/repository is updated, and an asynchronous reply never changes the
@@ -140,6 +146,8 @@ let g:simplegit_log_limit = 200        " commits per :SimpleGitLog page
 let g:simplegit_signs = 1              " sign-column hunk markers
 let g:simplegit_max_signs = 500        " place no signs above this count
 let g:simplegit_hunk_delay = 300       " live-diff debounce while typing (ms)
+let g:simplegit_watch = 1              " daemon reports changes made outside Vim
+let g:simplegit_watch_interval = 2000  " how often it polls each repository (ms)
 let g:simplegit_status_auto_refresh = 1 " refresh open status after Focus/Shell
 let g:simplegit_status_refresh_delay = 150 " external status refresh debounce
 let g:simplegit_live_max_bytes = 1048576 " live-diff buffer size cap
