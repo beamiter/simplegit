@@ -271,7 +271,10 @@ A stable public surface for statusline plugins, so nothing has to run its own
 `git` to show a branch and a change count. Everything below reads caches
 Simplegit already maintains: the accessors are O(cached hunks), never dispatch
 a request and never block, which is what makes them safe in 'statusline',
-where they are re-evaluated on every redraw.
+where they are re-evaluated on every redraw. They do not touch the filesystem
+either: which repository a buffer belongs to is resolved once for that buffer
+and remembered, then re-resolved only after |FocusGained| / |ShellCmdPost|,
+where a clone or `git init` could have moved the answer.
 
 simplegit#StatusLine([{bufnr}])                        *simplegit#StatusLine()*
   A ready-made segment for {bufnr} (default: the current buffer), for
@@ -312,7 +315,11 @@ simplegit#BlameAnnotation([{bufnr} [, {lnum}]])  *simplegit#BlameAnnotation()*
 b:simplegit_status_dict                              *b:simplegit_status_dict*
   Every file buffer carries the |simplegit#StatusDict()| result, updated
   whenever its hunks or its branch change. This is the
-  `b:gitsigns_status_dict` equivalent.
+  `b:gitsigns_status_dict` equivalent. It is published from the buffer
+  lifecycle, so it is there with |g:simplegit_signs| off and on
+  |:SimpleGitToggleSigns| alike — with the sign column off the line counts
+  stay at zero until something else reads that buffer's hunks, such as
+  `]g` or |:SimpleGitHunkPreview|, because nothing refreshes them for signs.
 
 User SimpleGitUpdate                                    *SimpleGitUpdate*
   Fired after b:simplegit_status_dict changes, so a consumer can redraw: >

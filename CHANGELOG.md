@@ -25,6 +25,31 @@
 - `make vim-commit` 新增回归:跨 tab 二次 `:SimpleGitCommit` 不移动焦点、不新开
   buffer、原 message 逐行不变;放弃之后下一次拿到的是干净模板。
 
+### 修复:statusline accessor 其实在做文件系统 I/O
+
+- 文档承诺这些 accessor"只读缓存、不派发请求、不阻塞",但每次调用都要经
+  `BufRepoToken()` → `RepoToken()`:`resolve()` 对路径的每一段做一次 readlink,
+  再逐级向上 `isdirectory()`/`filereadable()` 找 `.git`。实测一个几层深的文件
+  每次求值约 33 个 syscall、0.27 ms,而 'statusline' 是每次 redraw、每个窗口、
+  每个插入模式按键都要求值的——在 NFS/sshfs 上这就是 redraw 卡顿。返回空串的
+  情况下这笔开销照付不误。
+- 现在按 buffer 记住仓库 token(以 buffer 名为键,所以 buffer 号被回收也不会
+  串味),仅在 `FocusGained`/`ShellCmdPost` 这类外部变更时整体失效。同一测量
+  从 66021 个 syscall / 0.53 s(2000 次调用)降到 54 个 / 0.011 s。
+- `make vim-statusline` 新增回归:把 `.git` 移开之后 accessor 仍答得出分支,
+  即"它没有再去问文件系统"。
+
+### 修复:`g:simplegit_signs = 0` 时没有 `b:simplegit_status_dict`
+
+- 文档说"每个 file buffer 都带 `b:simplegit_status_dict`",但 buffer 路径上唯一
+  的发布点在 `SignsEnabled()` 之后:关掉 signs 时不会请求 hunks,于是除了恰好赶上
+  branch 回复的第一个 buffer 之外,其余 buffer 上这个变量根本不存在,按文档写的
+  `%{b:simplegit_status_dict.head}` 每次都是 E121。
+- 现在 `RefreshHunks()` 在 `EnsureBranch()` 之后、signs 判断之前就发布,与 signs
+  开关无关。关掉 signs 时行数保持 0(没人去读 hunks),`head` 照常。
+- `make vim-statusline` 新增回归:signs 关闭后打开的 buffer 必须带上该变量与分支,
+  且不产生任何 hunks 请求。
+
 ### 修复:第一次按 `]g` 会被吞掉
 
 - `RequestHunks()` 在已有请求 in-flight 时直接 `return true`,只置 stale 位,

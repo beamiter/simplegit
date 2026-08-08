@@ -758,8 +758,12 @@ def RefreshVisibleGitState()
   if !s_enabled
     return
   endif
-  # A commit, checkout or pull moves the branch as readily as the hunks.
+  # A commit, checkout or pull moves the branch as readily as the hunks, and a
+  # `git init`, clone or submodule add moves where a buffer's repository even
+  # begins -- so the remembered repository tokens go too.  This is the one
+  # event that can invalidate them, and it is rare enough to pay for.
   s_branch_cache = {}
+  s_repo_token_cache = {}
   for win in getwininfo()
     if getbufvar(win.bufnr, '&buftype') !=# ''
       continue
@@ -1889,8 +1893,13 @@ export def RefreshHunks()
   if BufFilePath(bufnr) ==# ''
     return
   endif
-  # The statusline API publishes a branch even where the sign column is off.
+  # The statusline API publishes a branch even where the sign column is off --
+  # and b:simplegit_status_dict with it.  Publishing only from the hunk reply
+  # left every buffer after the first without the variable whenever
+  # g:simplegit_signs is 0: no hunks are ever requested then, and the one
+  # branch reply that would have published it had already landed.
   EnsureBranch(bufnr)
+  PublishStatusDict(bufnr)
   if !SignsEnabled()
     return
   endif
@@ -2701,17 +2710,53 @@ enddef
 # buffer dict plus autoload accessors, so a statusline plugin can render
 # `main +12 ~3 -1` without running its own git.  Statusline expressions are
 # re-evaluated on every redraw, so every accessor here is O(cached hunks),
-# never dispatches and never blocks.  The branch is refreshed once per
-# repository from the buffer lifecycle instead — see EnsureBranch().
+# never dispatches, never touches the filesystem and never blocks.  The branch
+# is refreshed once per repository from the buffer lifecycle instead — see
+# EnsureBranch() — and a buffer resolves its repository once, see
+# BufRepoToken().
 # =============================================================
 
 # repo token -> {head: string, ahead: number, behind: number}
 var s_branch_cache: dict<dict<any>> = {}
 var s_branch_inflight: dict<bool> = {}
 
+# bufnr -> {name, token}: which repository a buffer belongs to, remembered.
+#
+# Every accessor below starts here, and RepoToken() is not cheap: resolve() is
+# one readlink per path component and the marker walk stats every ancestor
+# directory, roughly 33 syscalls for a file a few directories deep.  Paid on
+# every redraw -- which is what 'statusline' means -- that is a stall on any
+# network filesystem, and it was paid even when the accessor went on to return
+# an empty string.  A buffer does not change repository, so it is answered once.
+var s_repo_token_cache: dict<dict<string>> = {}
+
 def BufRepoToken(bufnr: number): string
+  if bufnr <= 0 || !bufexists(bufnr) || getbufvar(bufnr, '&buftype') !=# ''
+    return ''
+  endif
+  # A wiped buffer number is handed out again, so the name the answer was
+  # computed from is part of the key rather than something to invalidate on.
+  var name = get(get(getbufinfo(bufnr), 0, {}), 'name', '')
+  if name ==# ''
+    return ''
+  endif
+  var key = string(bufnr)
+  var remembered = get(s_repo_token_cache, key, {})
+  if get(remembered, 'name', '') ==# name
+    return remembered.token
+  endif
   var path = BufFilePath(bufnr)
-  return path ==# '' ? '' : RepoToken(fnamemodify(path, ':h'))
+  if path ==# ''
+    # Not on disk yet -- a new file, or one deleted underneath us.  Nothing to
+    # remember: the answer may still change once it is written.
+    return ''
+  endif
+  var token = RepoToken(fnamemodify(path, ':h'))
+  if len(s_repo_token_cache) >= 256 && !has_key(s_repo_token_cache, key)
+    remove(s_repo_token_cache, keys(s_repo_token_cache)[0])
+  endif
+  s_repo_token_cache[key] = {name: name, token: token}
+  return token
 enddef
 
 def RecordBranch(repo: string, head: string, ahead: number, behind: number)

@@ -158,6 +158,48 @@ WaitFor(() => len(Requests('branch')) > before_external,
   'a checkout-style external change re-reads the branch')
 WaitFor(() => simplegit#Head() ==# 'fake-branch', 'the branch is republished')
 
+# --- The accessors read caches, not the filesystem --------------------------
+# 'statusline' re-evaluates these on every redraw, so "reads caches" has to
+# cover the filesystem too: resolving which repository a buffer belongs to used
+# to cost one readlink per path component plus a stat of every ancestor
+# directory on every single call -- a stall on anything networked, and paid
+# even when the answer was ''.  Proof by making the filesystem lie: with the
+# marker moved away, a re-resolved token would name repo/sub and lose the
+# branch, which is cached under the repository root.
+mkdir(repo .. '/sub', 'p')
+writefile(['deep'], repo .. '/sub/deep.txt')
+execute 'edit ' .. fnameescape(repo .. '/sub/deep.txt')
+WaitFor(() => simplegit#Head() ==# 'fake-branch', 'the branch answers for a nested file')
+rename(repo .. '/.git', repo .. '/.git-moved')
+assert_equal('fake-branch', simplegit#Head(),
+  'a buffer resolves its repository once, not on every redraw')
+assert_equal('fake-branch', get(simplegit#StatusDict(), 'head', ''),
+  'the dict accessor reads the same remembered token')
+assert_equal('fake-branch ↑2 ↓1', simplegit#StatusLine(),
+  'and so does the ready-made segment')
+rename(repo .. '/.git-moved', repo .. '/.git')
+
+# --- The buffer dict is published where the sign column is off --------------
+# b:simplegit_status_dict is documented on every file buffer, and consumers
+# index it directly.  With g:simplegit_signs off no hunks are ever requested,
+# so the hunk reply that used to be its only publisher never arrives, and every
+# buffer after the first one carried no variable at all.
+simplegit#ToggleSigns()
+# Let the requests the previous sections issued with signs still on reach the
+# log, so the count below is about this buffer and nothing else.
+sleep 300m
+var hunks_before = len(Requests('hunks'))
+writefile(['fourth'], repo .. '/fourth.txt')
+execute 'edit ' .. fnameescape(repo .. '/fourth.txt')
+sleep 200m
+assert_true(exists('b:simplegit_status_dict'),
+  'a buffer opened with the sign column off still carries the dict')
+assert_equal('fake-branch', get(b:simplegit_status_dict, 'head', ''),
+  'and it carries the branch of its repository')
+assert_equal(hunks_before, len(Requests('hunks')),
+  'without the sign column nothing asks the daemon for hunks')
+simplegit#ToggleSigns()
+
 simplegit#Disable()
 WaitFor(() => !simplegit#core#IsRunning(), 'statusline daemon stops')
 delete(repo, 'rf')
