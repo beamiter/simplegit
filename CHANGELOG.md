@@ -2,6 +2,16 @@
 
 ## Unreleased - 2026-08-08
 
+### 修复:`color.ui = always` 会把 ANSI 转义码渲染进 scratch buffer
+
+- 只有 diff 那几条路径带了 `--no-color`;`blame` / `log` / `graph_log` / `show` /
+  `status` 都没有。而 `color.ui = always`(为了把 git 接到 pager 而设,很常见)
+  即使 stdout 不是 tty 也照样上色,于是 commit graph 里出现字面量
+  `\e[31m|`、图形列对不齐、sha 的 syntax match 也不再匹配。
+- 改为在 `git_command()` 里统一加 `-c color.ui=false`,位置在子命令之前:以后
+  新增的子命令不可能漏掉这一条。
+- 新增单元测试直接断言 argv,而不是断言某一条子命令——重点就是"没人能绕开"。
+
 ### 修复:`g:simplegit_version` 停在 0.3.0
 
 - crate 和 daemon 报 0.5.0,而用户唯一能在不启动 daemon 的情况下读到、也是写进

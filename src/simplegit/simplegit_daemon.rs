@@ -439,6 +439,14 @@ fn file_name(path: &str) -> Result<String, String> {
 fn git_command(dir: &Path, args: &[&str]) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("git");
     command
+        // `color.ui = always` is a common setting for people who pipe git
+        // through a pager, and git honours it even when stdout is not a tty.
+        // Everything we parse or render would then carry ANSI escapes: the
+        // commit graph shows a literal "\x1b[31m|", its columns stop lining up
+        // and the sha syntax match stops matching. Only the diff paths passed
+        // --no-color, so putting it here covers blame, log, show and status
+        // too, and no subcommand added later can forget it.
+        .args(["-c", "color.ui=false"])
         .args(args)
         .current_dir(dir)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -2218,6 +2226,25 @@ mod tests {
     use super::*;
 
     const UNCOMMITTED_SHA: &str = "0000000000000000000000000000000000000000";
+
+    #[test]
+    fn every_git_invocation_disables_colour() {
+        // A user with `color.ui = always` would otherwise get ANSI escapes in
+        // the log, blame and status buffers: git honours that setting even
+        // when stdout is a pipe. Asserted on the argv rather than on one
+        // subcommand, because the point is that no caller can opt out.
+        let command = git_command(Path::new("."), &["log", "--graph"]);
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["-c", "color.ui=false", "log", "--graph"],
+            "colour must be disabled before the subcommand"
+        );
+    }
 
     struct ErrorAfterInput {
         bytes: Vec<u8>,
