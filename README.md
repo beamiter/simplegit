@@ -148,7 +148,7 @@ See `:help simplegit` for the full reference, highlight groups, and troubleshoot
 
 ## Development
 
-`make check` runs the quality gate: `cargo fmt --check`, `cargo clippy -D warnings`, Rust protocol/parser/FIFO tests, and headless Vim smoke, real-Git, old-daemon capability and asynchronous UI-race tests. CI runs the same gate plus an installer/handshake verification.
+`make check` runs the quality gate: `cargo fmt --check`, `cargo clippy -D warnings`, Rust protocol/parser/FIFO tests, the vendored simplecore bundle checksum, and headless Vim suites — smoke, real-Git integration, commit flow, old-daemon capability and status races, the statusline API, per-line blame, asynchronously opened views, hunk navigation, the supervisor regression suite and a `:defcompile` of every Vim9 function. CI runs the same gate plus an installer/handshake verification; its MSRV job derives the expected toolchain from `Cargo.toml`.
 
 ## License
 
