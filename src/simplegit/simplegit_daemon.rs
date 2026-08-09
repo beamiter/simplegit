@@ -436,17 +436,51 @@ fn file_name(path: &str) -> Result<String, String> {
         .ok_or_else(|| format!("path has no file name: {path}"))
 }
 
+/// Colour is decided per command by `color.<slot>`, and `color.ui` is only the
+/// fallback those slots default to -- so `color.ui=false` alone does *not* turn
+/// colour off for a user who set the more specific key. Measured on git 2.43:
+/// with `color.diff=always`, `-c color.ui=false git show` still emits escapes,
+/// and `git branch` still does under `color.branch=always`. Every slot that can
+/// force colour on therefore has to be named. `color.decorate` is not one of
+/// them: its sub-keys hold colour names, not always/never, so decorations
+/// follow the log's own colour decision, which `color.diff` here settles.
+const GIT_COLOUR_ARGS: [&str; 22] = [
+    "-c",
+    "color.ui=false",
+    "-c",
+    "color.advice=false",
+    "-c",
+    "color.branch=false",
+    "-c",
+    "color.diff=false",
+    "-c",
+    "color.grep=false",
+    "-c",
+    "color.interactive=false",
+    "-c",
+    "color.push=false",
+    "-c",
+    "color.remote=false",
+    "-c",
+    "color.showBranch=false",
+    "-c",
+    "color.status=false",
+    "-c",
+    "color.transport=false",
+];
+
 fn git_command(dir: &Path, args: &[&str]) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("git");
     command
-        // `color.ui = always` is a common setting for people who pipe git
-        // through a pager, and git honours it even when stdout is not a tty.
-        // Everything we parse or render would then carry ANSI escapes: the
-        // commit graph shows a literal "\x1b[31m|", its columns stop lining up
-        // and the sha syntax match stops matching. Only the diff paths passed
-        // --no-color, so putting it here covers blame, log, show and status
-        // too, and no subcommand added later can forget it.
-        .args(["-c", "color.ui=false"])
+        // `color.ui = always` (and its per-command siblings) is a common
+        // setting for people who pipe git through a pager, and git honours it
+        // even when stdout is not a tty. Everything we parse or render would
+        // then carry ANSI escapes: the commit graph shows a literal
+        // "\x1b[31m|", its columns stop lining up and the sha syntax match
+        // stops matching. Only the diff paths passed --no-color, so putting it
+        // here covers blame, log, show and status too, and no subcommand added
+        // later can forget it.
+        .args(GIT_COLOUR_ARGS)
         .args(args)
         .current_dir(dir)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -2228,22 +2262,122 @@ mod tests {
     const UNCOMMITTED_SHA: &str = "0000000000000000000000000000000000000000";
 
     #[test]
-    fn every_git_invocation_disables_colour() {
-        // A user with `color.ui = always` would otherwise get ANSI escapes in
-        // the log, blame and status buffers: git honours that setting even
-        // when stdout is a pipe. Asserted on the argv rather than on one
-        // subcommand, because the point is that no caller can opt out.
+    fn every_git_invocation_disables_colour_before_the_subcommand() {
+        // Only the ordering is worth asserting on the argv: the settings have
+        // to precede the subcommand, or git parses them as its arguments.
+        // Whether the settings are the *right* ones is decided by
+        // `no_reply_carries_ansi_escapes` below, against real git output.
         let command = git_command(Path::new("."), &["log", "--graph"]);
         let args: Vec<String> = command
             .as_std()
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
+        let (colour, subcommand) = args.split_at(GIT_COLOUR_ARGS.len());
+        assert_eq!(colour, GIT_COLOUR_ARGS, "colour is disabled first");
+        assert_eq!(subcommand, ["log", "--graph"], "then the subcommand");
+    }
+
+    /// Every reply the daemon sends is either parsed or rendered verbatim into
+    /// a scratch buffer, so a single ANSI escape breaks it. This asserts that
+    /// on the output rather than on the argv, because the argv version passed
+    /// while `:SimpleGitShow` was still returning escapes: `-c color.ui=false`
+    /// looks like it covers everything, but git resolves `color.<slot>` first
+    /// and only falls back to `color.ui`, so a user with `color.diff = always`
+    /// kept getting a coloured `show`.
+    #[tokio::test]
+    async fn no_reply_carries_ansi_escapes() {
+        use std::process::Command;
+        use tokio::io::AsyncReadExt;
+
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let repo = temp_fixture_dir("colour-repo");
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        // Every per-command slot a user can turn on, not just color.ui: the
+        // bug was that the specific keys win over the general one.
+        for slot in ["ui", "branch", "diff", "grep", "showBranch", "status"] {
+            git(&["config", &format!("color.{slot}"), "always"]);
+        }
+        for slot in [
+            "advice",
+            "interactive",
+            "pager",
+            "push",
+            "remote",
+            "transport",
+        ] {
+            git(&["config", &format!("color.{slot}"), "true"]);
+        }
+        std::fs::write(repo.join("sample.txt"), "before\nkeep\n").unwrap();
+        git(&["add", "sample.txt"]);
+        git(&["commit", "-q", "-m", "initial"]);
+        std::fs::write(repo.join("sample.txt"), "after\nkeep\n").unwrap();
+        git(&["add", "sample.txt"]);
+        git(&["commit", "-q", "-m", "second"]);
+        std::fs::write(repo.join("sample.txt"), "third\nkeep\n").unwrap();
+
+        let file = repo.join("sample.txt");
+        let requests = [
+            serde_json::json!({"type": "show", "id": 1, "path": file, "rev": "HEAD"}),
+            serde_json::json!({"type": "log", "id": 2, "path": file, "limit": 10}),
+            serde_json::json!({"type": "graph_log", "id": 3, "path": file, "limit": 10}),
+            serde_json::json!({"type": "blame", "id": 4, "path": file}),
+            serde_json::json!({"type": "blame_line", "id": 5, "path": file, "lnum": 1}),
+            serde_json::json!({"type": "status", "id": 6, "path": file}),
+            serde_json::json!({"type": "branch", "id": 7, "path": file}),
+            serde_json::json!({"type": "hunks", "id": 8, "path": file}),
+            serde_json::json!({"type": "cat", "id": 9, "path": file, "rev": "HEAD"}),
+        ];
+        let input = requests
+            .iter()
+            .map(|request| format!("{request}\n"))
+            .collect::<String>();
+        let (mut client, server) = tokio::io::duplex(256 * 1024);
+        run(input.as_bytes(), server).await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+
+        let mut answered = Vec::new();
+        for line in response.lines() {
+            let reply: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(
+                !line.contains("\\u001b") && !line.contains('\u{1b}'),
+                "reply carries ANSI escapes: {line}"
+            );
+            assert_ne!(
+                reply["type"], "error",
+                "request failed instead of answering: {line}"
+            );
+            if let Some(id) = reply["id"].as_u64() {
+                answered.push(id);
+            }
+        }
+        answered.sort_unstable();
         assert_eq!(
-            args,
-            vec!["-c", "color.ui=false", "log", "--graph"],
-            "colour must be disabled before the subcommand"
+            answered,
+            (1..=requests.len() as u64).collect::<Vec<_>>(),
+            "every request must have been answered, or nothing was inspected"
         );
+
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 
     struct ErrorAfterInput {
