@@ -230,10 +230,22 @@ if WaitFor(() => len(PlacedSigns()) > 0, 'hunk signs placed')
   setline(1, 'one live')
   simplegit#ScheduleHunks()
   WaitFor(() => SignAt(1) ==# 'SimpleGitChange', 'live diff marks unsaved edit')
-  silent edit!
+  Check(simplegit#HunkSummary().changed == 1, 'live diff counts the unsaved edit')
   # ...and stop describing them once the edit is thrown away. A reload
   # replaces the text the cached hunks were computed from, so the answer has
   # to be asked for again rather than repainted.
+  #
+  # Waiting for the signs alone does not pin this: a ScheduleHunks() debounce
+  # is still in flight from the edit above, it re-asks the daemon within
+  # g:simplegit_hunk_delay of the reload, and WaitFor's budget is far longer
+  # than that -- measured, the signs correct themselves ~300ms later even with
+  # the invalidation removed, and raising the delay here does not help because
+  # that timer was armed while it was still 300.  So pin the cache instead:
+  # BufReadPost drops it synchronously, which makes the summary empty on the
+  # statement after `:edit!`, before any timer can have run.
+  silent edit!
+  Check(simplegit#HunkSummary() == {added: 0, changed: 0, removed: 0},
+    'a reload drops the cached hunks of the discarded edit')
   WaitFor(() => SignAt(1) ==# '', 'a reload drops the signs of the discarded edit')
 
   # Status window: stage and unstage whole files in place.

@@ -2012,7 +2012,12 @@ enddef
 # disk: `:edit!` to throw an edit away, the reload after a hunk revert,
 # 'autoread' picking up an external checkout.  The cached hunks describe the
 # text that was just replaced, and without dropping them this function takes
-# the "already answered" branch below and repaints the stale signs forever.
+# the "already answered" branch below and repaints those stale signs.  A reload
+# also fires TextChanged, so the debounce in ScheduleHunks() usually re-asks
+# about g:simplegit_hunk_delay later and the wrong signs correct themselves --
+# but only where there are timers, and only if the buffer is still current when
+# one fires, since it refreshes bufnr('%') at that moment.  Leave the buffer
+# before then and nothing asks again: every later BufEnter repaints the cache.
 export def RefreshHunks(reloaded: bool = false)
   if !s_enabled
     return

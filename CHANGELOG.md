@@ -8,9 +8,17 @@
   `status` 都没有。而 `color.ui = always`(为了把 git 接到 pager 而设,很常见)
   即使 stdout 不是 tty 也照样上色,于是 commit graph 里出现字面量
   `\e[31m|`、图形列对不齐、sha 的 syntax match 也不再匹配。
-- 改为在 `git_command()` 里统一加 `-c color.ui=false`,位置在子命令之前:以后
-  新增的子命令不可能漏掉这一条。
-- 新增单元测试直接断言 argv,而不是断言某一条子命令——重点就是"没人能绕开"。
+- 改为在 `git_command()` 里统一关闭颜色,位置在子命令之前:以后新增的子命令不可能
+  漏掉这一条。
+- 只关 `color.ui` 不够:git 先看 `color.<slot>`,`color.ui` 只是这些 slot 的默认
+  值,所以设了 `color.diff = always` 的用户在 `-c color.ui=false` 之下 `:SimpleGitShow`
+  照样是带转义码的(`git branch` 之于 `color.branch` 同理)。现在把每一个能强行
+  打开颜色的 slot 都点名关掉。`color.decorate` 不在其列:它的子键存的是颜色名而不是
+  always/never,decoration 跟随 log 自己的颜色判定,而那个判定由 `color.diff` 决定。
+- 新增单元测试在一个把所有 color slot 都打开的临时仓库里跑 `show` / `log` /
+  `graph_log` / `blame` / `blame_line` / `status` / `branch` / `hunks` / `cat`,断言
+  **回包里**没有转义码。原来那条只断言 argv 的测试正是因此漏掉了上面这个 bug,现在
+  它只负责断言顺序(设置必须排在子命令前面)。
 
 ### 修复:`g:simplegit_version` 停在 0.3.0
 
@@ -69,12 +77,17 @@
 - `BufReadPost` 走的是 `RefreshHunks()`,而它只在缓存为空时才去问 daemon,否则
   直接用旧结果重画。于是任何一次「buffer 被重新读入」——`:edit!` 丢弃修改、
   `git checkout` 之后 `'autoread'` 重新载入、revert hunk 之后的自动重载——都还在
-  按被替换掉的那份文本画 signs,而且因为缓存非空,以后每一次 `BufEnter` 都会把
-  同一批过时的 signs 再画一遍,直到下一次保存或外部事件为止。blame 缓存同理。
+  按被替换掉的那份文本画 signs。实测这批过时的 signs 多数时候会在约
+  `g:simplegit_hunk_delay`(默认 300ms)之后自己纠正:重新读入同样触发
+  `TextChanged`,它 debounce 之后又问了一次 daemon。但那只是搭了便车:没有
+  `+timers` 的 Vim 上 `ScheduleHunks()` 直接返回,而计时器触发时问的是**当时**的
+  当前 buffer,在它触发之前切走就没人再问了——缓存非空,之后每一次 `BufEnter` 都
+  只是把同一批过时的 signs 再画一遍。blame 缓存同理。
 - `BufReadPost` 与 `BufEnter` 现在分开:前者说的是「这段文本被换掉了」,会先让
   hunk/blame 缓存失效再刷新;后者只是「你正在看它」,保持原样。
 - `make vim-integration` 新增回归:live diff 标出未保存修改之后 `:edit!` 丢弃它,
-  断言那一行的 sign 会消失。
+  断言 `simplegit#HunkSummary()` 在**下一条语句**上就已经归零。只等 sign 消失锁不住
+  这个修复——上面那个 debounce 会在 `WaitFor` 的预算之内把它救回来。
 
 ### 修复:in-flight 的 branch 读会吞掉一次外部 checkout
 
