@@ -69,6 +69,51 @@ def Last(kind: string): dict<any>
   return get(Requests(kind), -1, {})
 enddef
 
+# Requests picked by the path they name rather than by their position in the
+# log.  A file buffer issues two hunk reads -- BufReadPost and BufEnter -- and
+# the second is deferred until the first reply lands, so it can be logged
+# after the section that provoked it has already cleared the log.  Selecting
+# by path (and, where two buffers spell the same path, by whether the request
+# carries a transport) is what makes an assertion here about the request it
+# means rather than about whichever request happened to arrive last.
+def RequestsFor(kind: string, path: string): list<dict<any>>
+  return filter(Requests(kind), (_, r) => get(r, 'path', '') ==# path)
+enddef
+
+def LastFor(kind: string, path: string): dict<any>
+  return get(RequestsFor(kind, path), -1, {})
+enddef
+
+def RemoteFor(kind: string, path: string): list<dict<any>>
+  return filter(RequestsFor(kind, path), (_, r) => !empty(get(r, 'exec', [])))
+enddef
+
+def LocalFor(kind: string, path: string): list<dict<any>>
+  return filter(RequestsFor(kind, path), (_, r) => empty(get(r, 'exec', [])))
+enddef
+
+# Clear the log to start a section, once the traffic of the previous one has
+# stopped: a straggling request logged after the delete belongs to the section
+# that is over, and would otherwise be read as this section's first request.
+def Reset(timeout_ms: number = 2000)
+  var seen = -1
+  var stable = 0
+  for _ in range(timeout_ms / 25)
+    var count = filereadable(request_log) ? len(readfile(request_log)) : 0
+    if count == seen
+      stable += 25
+      if stable >= 150
+        break
+      endif
+    else
+      seen = count
+      stable = 0
+    endif
+    sleep 25m
+  endfor
+  delete(request_log)
+enddef
+
 def ScratchBuf(name: string): number
   for info in getbufinfo()
     if info.name ==# name
@@ -178,29 +223,34 @@ assert_equal(repo .. '/local.txt', get(Last('hunks'), 'path', ''))
 WaitFor(() => simplegit#Head() ==# 'remote-main', 'the local branch is published')
 
 # --- A remote:// buffer routes every request through the workspace ----------
-delete(request_log)
+Reset()
 var remote_buf = OpenRemote('/srv/app/src/main.rs', ['fn main() {}', 'two', 'three'])
 assert_equal('acwrite', &buftype)
-WaitFor(() => len(Requests('hunks')) >= 1, 'a remote buffer is read for hunks')
-var hunks_req = Last('hunks')
+WaitFor(() => !empty(RequestsFor('hunks', '/srv/app/src/main.rs')),
+  'a remote buffer is read for hunks')
+var hunks_req = LastFor('hunks', '/srv/app/src/main.rs')
 assert_equal('/srv/app/src/main.rs', get(hunks_req, 'path', ''),
   'the plain remote path goes on the wire, not the URI')
 assert_equal(ARGV, get(hunks_req, 'exec', []), 'hunks carry the exec prefix')
 assert_equal('/srv/app/src', get(hunks_req, 'cwd', ''), 'hunks name the remote directory')
-WaitFor(() => len(Requests('branch')) >= 1, 'a remote buffer asks for its branch')
-var branch_req = Last('branch')
+WaitFor(() => !empty(RequestsFor('branch', '/srv/app/src')),
+  'a remote buffer asks for its branch')
+var branch_req = LastFor('branch', '/srv/app/src')
 assert_equal('/srv/app/src', get(branch_req, 'path', ''), 'branch names the directory')
 assert_equal('/srv/app/src', get(branch_req, 'cwd', ''), 'branch cwd is that directory')
 assert_equal(ARGV, get(branch_req, 'exec', []), 'branch carries the exec prefix')
-WaitFor(() => len(Requests('watch')) >= 1, 'a remote buffer asks for a watch')
-assert_equal(ARGV, get(Last('watch'), 'exec', []), 'watch carries the exec prefix')
+WaitFor(() => !empty(RequestsFor('watch', '/srv/app/src')),
+  'a remote buffer asks for a watch')
+assert_equal(ARGV, get(LastFor('watch', '/srv/app/src'), 'exec', []),
+  'watch carries the exec prefix')
 sleep 100m
 # The fixture refuses it the way the real daemon does; nothing breaks and the
 # refusal is final for this repository.
 execute 'edit ' .. fnameescape(repo .. '/local.txt')
 execute 'buffer ' .. remote_buf
 sleep 200m
-assert_equal(1, len(Requests('watch')), 'a refused remote watch is not asked again')
+assert_equal(1, len(RequestsFor('watch', '/srv/app/src')),
+  'a refused remote watch is not asked again')
 
 # The statusline API works for the remote buffer as for a local one.
 WaitFor(() => simplegit#Head(remote_buf) ==# 'remote-main', 'the remote branch is published')
@@ -278,12 +328,14 @@ assert_equal('/srv/app/src', get(Last('stage'), 'cwd', ''))
 assert_equal(2, get(Last('stage'), 'lnum', 0))
 
 # --- Status from a remote buffer, and opening an entry -----------------------
-delete(request_log)
+Reset()
 simplegit#Status()
-WaitFor(() => len(Requests('status')) >= 1, 'status is requested')
-assert_equal('/srv/app/src', get(Last('status'), 'path', ''), 'status names the remote directory')
-assert_equal('/srv/app/src', get(Last('status'), 'cwd', ''))
-assert_equal(ARGV, get(Last('status'), 'exec', []), 'status carries the prefix')
+WaitFor(() => !empty(RequestsFor('status', '/srv/app/src')), 'status is requested')
+assert_equal('/srv/app/src', get(LastFor('status', '/srv/app/src'), 'path', ''),
+  'status names the remote directory')
+assert_equal('/srv/app/src', get(LastFor('status', '/srv/app/src'), 'cwd', ''))
+assert_equal(ARGV, get(LastFor('status', '/srv/app/src'), 'exec', []),
+  'status carries the prefix')
 WaitFor(() => bufname('%') ==# 'simplegit://status', 'the status view opens')
 assert_equal('remote:///srv/app/src', get(b:, 'simplegit_dir', ''),
   'the status view remembers the remote directory')
@@ -299,7 +351,8 @@ assert_equal('add', get(Last('file_op'), 'op', ''))
 assert_equal('sample.txt', get(Last('file_op'), 'file', ''), 'the entry stays repository-relative')
 assert_equal('/srv/app/src', get(Last('file_op'), 'cwd', ''))
 assert_equal(ARGV, get(Last('file_op'), 'exec', []), 'file_op carries the prefix')
-WaitFor(() => len(Requests('status')) >= 2, 'the view refreshes after the mutation')
+WaitFor(() => len(RequestsFor('status', '/srv/app/src')) >= 2,
+  'the view refreshes after the mutation')
 # <CR> opens the entry as a remote:// buffer: there is no local git to ask
 # for the root, the reply carried it.
 cursor(2, 1)
@@ -309,7 +362,7 @@ WaitFor(() => bufname('%') ==# 'remote:///srv/app/sample.txt',
 assert_equal('remote:///srv/app/sample.txt', bufname('%'))
 
 # --- Commit from a remote buffer ---------------------------------------------
-delete(request_log)
+Reset()
 execute 'buffer ' .. remote_buf
 simplegit#Commit()
 WaitFor(() => bufname('%') ==# 'simplegit://commit', 'the commit buffer opens')
@@ -328,15 +381,19 @@ WaitFor(() => ScratchBuf('simplegit://commit') == -1, 'the commit buffer closes 
 # --- Two repositories that spell the same directory stay apart ---------------
 # A remote checkout at the same absolute path as a local one shares nothing:
 # the remote token is namespaced.
-delete(request_log)
+Reset()
 mkdir(repo .. '/src', 'p')
 writefile(['local main'], repo .. '/src/main.rs')
 execute 'edit ' .. fnameescape(repo .. '/src/main.rs')
-WaitFor(() => len(Requests('branch')) == 1, 'the local file asks for its branch')
+WaitFor(() => !empty(LocalFor('branch', repo .. '/src')),
+  'the local file asks for its branch')
 var twin = OpenRemote(repo .. '/src/main.rs', ['remote main'])
-WaitFor(() => len(Requests('branch')) == 2,
+# The token is namespaced, so the remote twin cannot be answered out of the
+# branch the local one just cached: it asks for itself, through the workspace.
+WaitFor(() => !empty(RemoteFor('branch', repo .. '/src')),
   'the remote twin of that path asks for its own branch')
-assert_equal(ARGV, get(Last('branch'), 'exec', []), 'and asks it remotely')
+assert_equal(ARGV, get(get(RemoteFor('branch', repo .. '/src'), -1, {}), 'exec', []),
+  'and asks it remotely')
 execute 'bwipeout! ' .. twin
 
 # --- SimpleRemote events -----------------------------------------------------
@@ -344,11 +401,11 @@ execute 'bwipeout! ' .. twin
 # remote buffers are re-read, local ones are left alone.
 execute 'buffer ' .. remote_buf
 only!
-sleep 200m
-delete(request_log)
+Reset()
 Fire('SimpleRemoteFilesChanged', {changes: [{path: '/srv/app/src/other.rs', type: 'created'}],
   workspace: g:simpleremote_workspace})
-WaitFor(() => len(Requests('hunks')) >= 1 && len(Requests('branch')) >= 1,
+WaitFor(() => !empty(RequestsFor('hunks', '/srv/app/src/main.rs'))
+    && !empty(RequestsFor('branch', '/srv/app/src')),
   'a files-changed event re-reads the remote buffer')
 assert_equal('/srv/app/src/main.rs', get(Last('hunks'), 'path', ''))
 assert_equal(0, len(filter(Requests('hunks'), (_, r) => !has_key(r, 'exec'))),
@@ -356,7 +413,7 @@ assert_equal(0, len(filter(Requests('hunks'), (_, r) => !has_key(r, 'exec'))),
 
 # A disconnect: the workspace is gone before the event fires, requests are
 # refused quietly, nothing reaches the wire.
-delete(request_log)
+Reset()
 unlet g:simpleremote_workspace
 var before = Messages()
 Fire('SimpleRemoteDisconnected', {reason: 'disconnect'})
@@ -367,19 +424,21 @@ assert_equal(0, CountMatches(strpart(Messages(), len(before)), 'no SimpleRemote 
 # Reconnect: caches are dropped and the buffer is read again on the new host.
 g:simpleremote_workspace = Workspace({id: 2})
 Fire('SimpleRemoteConnected', {snapshot: g:simpleremote_workspace})
-WaitFor(() => len(Requests('hunks')) >= 1, 'a connect re-reads the visible remote buffer')
-assert_equal(ARGV, get(Last('hunks'), 'exec', []))
-WaitFor(() => len(Requests('branch')) >= 1, 'and its branch')
+WaitFor(() => !empty(RequestsFor('hunks', '/srv/app/src/main.rs')),
+  'a connect re-reads the visible remote buffer')
+assert_equal(ARGV, get(LastFor('hunks', '/srv/app/src/main.rs'), 'exec', []))
+WaitFor(() => !empty(RequestsFor('branch', '/srv/app/src')), 'and its branch')
 
 # A BufferRead for a re-filled buffer is its BufReadPost.
-delete(request_log)
+Reset()
 Fire('SimpleRemoteBufferRead', {type: 'buffer-read', bufnr: remote_buf,
   path: '/srv/app/src/main.rs', workspace: g:simpleremote_workspace})
-WaitFor(() => len(Requests('hunks')) >= 1, 'a re-read remote buffer is diffed again')
+WaitFor(() => !empty(RequestsFor('hunks', '/srv/app/src/main.rs')),
+  'a re-read remote buffer is diffed again')
 
 # --- Refusals: an old daemon, no git on the host, no transport, 'never' -------
 # No remote_exec capability: nothing goes on the wire, said once.
-delete(request_log)
+Reset()
 $SIMPLEGIT_FAKE_CAPS = 'repository_file_ops,branch_summary,blame_line,hunk_range,repo_watch'
 simplegit#Stop()
 WaitFor(() => !simplegit#core#IsRunning(), 'daemon stops before the old-daemon run')
@@ -406,7 +465,7 @@ assert_equal(1, CountMatches(strpart(Messages(), len(before)), 'remote git needs
   'and not again on the next buffer entry')
 
 # A capable daemon but no git on the host, per the probe.
-delete(request_log)
+Reset()
 $SIMPLEGIT_FAKE_CAPS = 'repository_file_ops,branch_summary,blame_line,hunk_range,repo_watch,remote_exec'
 simplegit#Stop()
 WaitFor(() => !simplegit#core#IsRunning(), 'daemon stops before the no-git run')
@@ -436,8 +495,7 @@ g_argv = []
 before = Messages()
 g:simpleremote_workspace = Workspace({id: 4})
 Fire('SimpleRemoteConnected', {snapshot: g:simpleremote_workspace})
-sleep 200m
-delete(request_log)
+Reset()
 execute 'edit ' .. fnameescape(repo .. '/local.txt')
 execute 'buffer ' .. remote_buf
 sleep 300m
@@ -450,8 +508,7 @@ g_argv = copy(ARGV)
 g:simplegit_remote_git = 'never'
 g:simpleremote_workspace = Workspace({id: 5})
 Fire('SimpleRemoteConnected', {snapshot: g:simpleremote_workspace})
-sleep 200m
-delete(request_log)
+Reset()
 var quiet = GitSaid()
 execute 'edit ' .. fnameescape(repo .. '/local.txt')
 execute 'buffer ' .. remote_buf
@@ -471,28 +528,29 @@ mkdir(mount .. '/src', 'p')
 writefile(['mounted'], mount .. '/src/lib.rs')
 g:simpleremote_workspace = Workspace({id: 6, local_root: mount, mode: 'sshfs'})
 Fire('SimpleRemoteConnected', {snapshot: g:simpleremote_workspace})
-delete(request_log)
+Reset()
 execute 'edit ' .. fnameescape(mount .. '/src/lib.rs')
 b:simpleremote_path = '/srv/app/src/lib.rs'
 b:simpleremote_workspace_id = 6
 # 'auto' (the default): local git over the mount, as before.
 execute 'edit ' .. fnameescape(repo .. '/local.txt')
 execute 'buffer ' .. bufnr(mount .. '/src/lib.rs')
-WaitFor(() => len(filter(Requests('hunks'), (_, r) => get(r, 'path', '') ==# mount .. '/src/lib.rs')) >= 1,
+WaitFor(() => !empty(RequestsFor('hunks', mount .. '/src/lib.rs')),
   "'auto' reads a projected buffer with local git")
-assert_false(has_key(Last('hunks'), 'exec'), "'auto' sends no prefix for a projected buffer")
+assert_false(has_key(LastFor('hunks', mount .. '/src/lib.rs'), 'exec'),
+  "'auto' sends no prefix for a projected buffer")
 
 g:simplegit_remote_git = 'always'
 Fire('SimpleRemoteWorkspaceChanged', {snapshot: g:simpleremote_workspace})
-WaitFor(() => len(filter(Requests('hunks'), (_, r) => get(r, 'path', '') ==# '/srv/app/src/lib.rs')) >= 1,
+WaitFor(() => !empty(RequestsFor('hunks', '/srv/app/src/lib.rs')),
   "'always' reads a projected buffer through the workspace")
-var projected = Last('hunks')
+var projected = LastFor('hunks', '/srv/app/src/lib.rs')
 assert_equal(ARGV, get(projected, 'exec', []), "'always' carries the prefix")
 assert_equal('/srv/app/src', get(projected, 'cwd', ''), "'always' names the remote directory")
-WaitFor(() => len(filter(Requests('branch'), (_, r) => get(r, 'cwd', '') ==# '/srv/app/src')) >= 1,
+WaitFor(() => !empty(RemoteFor('branch', '/srv/app/src')),
   "'always' asks the branch remotely")
 # The status view of a projected workspace opens entries as local files.
-delete(request_log)
+Reset()
 simplegit#Status()
 WaitFor(() => bufname('%') ==# 'simplegit://status', 'the projected status view opens')
 assert_equal('remote:///srv/app/src', get(b:, 'simplegit_dir', ''))
@@ -503,10 +561,11 @@ WaitFor(() => bufname('%') ==# mount .. '/sample.txt',
 # Once the workspace is gone the marker no longer means anything.
 unlet g:simpleremote_workspace
 Fire('SimpleRemoteDisconnected', {reason: 'disconnect'})
-delete(request_log)
+Reset()
 execute 'edit ' .. fnameescape(mount .. '/src/lib.rs')
-WaitFor(() => len(Requests('hunks')) >= 1, 'a projected buffer is read after the disconnect')
-assert_false(has_key(Last('hunks'), 'exec'),
+WaitFor(() => !empty(RequestsFor('hunks', mount .. '/src/lib.rs')),
+  'a projected buffer is read after the disconnect')
+assert_false(has_key(LastFor('hunks', mount .. '/src/lib.rs'), 'exec'),
   'and with local git: the marker outlived the workspace it belonged to')
 g:simplegit_remote_git = 'auto'
 
