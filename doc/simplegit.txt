@@ -479,9 +479,12 @@ When remote git cannot be used the reason is said once, and repeated only to
 an explicit command; |:SimpleGitHealth| shows it on its "remote git" line:
 
   "remote git needs SimpleRemote"            SimpleRemote is not installed
-  "no SimpleRemote workspace is connected"   never announced: between a
-                                             disconnect and the next
-                                             connection this is not news
+  "no SimpleRemote workspace is connected"   never announced by a background
+                                             refresh: between a disconnect
+                                             and the next connection this is
+                                             not news. A command you typed
+                                             is still told why it did
+                                             nothing
   "git is not installed on the remote host"  from SimpleRemote's runtime
                                              probe, which reports the git it
                                              found

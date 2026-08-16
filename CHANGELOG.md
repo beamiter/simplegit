@@ -42,6 +42,30 @@
   驱动整条链路,断言远端 buffer 的每个请求都带 exec/cwd、本地 buffer 一个都不带,
   以及断连、无 git、无 argv 传输、老 daemon 与 `never` 各自的拒绝路径。
 
+### 修复:断连之后第一条显式命令什么都不说
+
+- `RefuseRemote()` 只在一个理由第一次出现时打印一行,并顺手把这一次的
+  `ctx.interactive` 关掉,免得同一句话说两遍。但 "no SimpleRemote workspace is
+  connected" 这个理由本来就不打印(断连是用户自己做的,不是新闻),于是第一次被它
+  拒绝的请求两句都没有。如果那一次恰好是用户敲的命令,结果就是按键消失:没有暂存、
+  没有视图、也没有一个字。断连时可见的是 status 视图就正好落进这个窗口——它不是文件
+  buffer,断连的刷新根本不碰它,所以在上面按 `a` 是这轮断连里的第一次拒绝。
+- 现在只有真的说了那一行才关掉 `interactive`:后台刷新依旧从不宣布断连,用户敲的
+  命令则每次都被告知为什么什么都没发生。doc 里 "never announced" 的措辞一并改正。
+- `make vim-remote` 新增回归:断连时把一个远端仓库的 status 视图留在屏幕上,按 `a`
+  必须换来一行回答(第二次也一样),并且线上一个请求都没发。
+
+### 修复:`make vim-remote` 每五次左右失败一次
+
+- 一个文件 buffer 打开时会发两次 hunks 读:BufReadPost 一次、BufEnter 一次,而第二次
+  被 `s_hunk_stale` 推迟到第一次的回包落地之后才发。测试在"本地 buffer 不带传输"
+  一节末尾立刻 `delete(request_log)`,那条推迟的本地请求于是写在了删除之后;下一节的
+  `Last('hunks')` 取到的就是它,于是拿远端路径去比本地临时文件。30 次里失败 7 次,
+  `make check` 因此不是一道可信的闸门。
+- 测试改成按 path(两个 buffer 拼出同一个路径时再按有没有 exec 前缀)挑请求,而不是
+  按它在日志里的位置;每一节开头改用 `Reset()`:先等流量停下来再清日志,上一节的尾巴
+  不会被下一节读成自己的第一条请求。改后连测 45 次全绿。
+
 ### 修复:`color.ui = always` 会把 ANSI 转义码渲染进 scratch buffer
 
 - 只有 diff 那几条路径带了 `--no-color`;`blame` / `log` / `graph_log` / `show` /

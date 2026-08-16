@@ -258,10 +258,11 @@ def RemoteUnavailable(): string
   endif
   var workspace = get(g:, 'simpleremote_workspace', {})
   if type(workspace) != v:t_dict || empty(workspace)
-    # Deliberately first among the real obstacles, and the one reason that is
-    # never announced: between a disconnect and the next connection every
-    # remote buffer still asks, and none of that is news to whoever
-    # disconnected.
+    # Deliberately first among the real obstacles, and the one reason no
+    # background refresh ever announces: between a disconnect and the next
+    # connection every remote buffer still asks, and none of that is news to
+    # whoever disconnected.  A command the user typed is still answered --
+    # see RefuseRemote().
     return 'no SimpleRemote workspace is connected'
   endif
   # A probe that has finished always reports a `git` key -- empty when the
@@ -295,11 +296,15 @@ def RefuseRemote(ctx: dict<any>, reason: string)
   var deliver: dict<any> = copy(ctx)
   if !has_key(s_remote_warned, reason)
     s_remote_warned[reason] = true
-    # A disconnect explains itself; the rest is worth one line.
+    # A disconnect explains itself, so that reason is never announced on its
+    # own account; the rest is worth one line.  Only a reason that was just
+    # said suppresses the interactive delivery below, or the first explicit
+    # command after a disconnect would print nothing at all: no view, no
+    # message, keypress gone.
     if reason !~# 'no SimpleRemote workspace'
       Warn(reason)
+      deliver.interactive = false
     endif
-    deliver.interactive = false
   endif
   # Always from a timer, never inline: the caller marks its request as in
   # flight only after Dispatch() returns, so an error delivered before that

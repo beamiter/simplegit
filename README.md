@@ -144,7 +144,7 @@ With [SimpleRemote](https://github.com/beamiter/simpleremote) connected to an SS
 - Debounces are longer, because each request is a round trip: `g:simplegit_remote_blame_delay` and `g:simplegit_remote_hunk_delay` (750 ms each). The live buffer-vs-index diff reads the index through the workspace and diffs locally, so unsaved text is never shipped across.
 - `g:simplegit_remote_git`: `'auto'` (default, `remote://` buffers only), `'always'` (projected sshfs / bind-mount / mapped files as well, so `git status` stops walking the mount), `'never'`.
 
-None of this requires SimpleRemote: without it every buffer is local. When remote git cannot be used — no workspace, no git on the host, no argv-safe transport, or a daemon that predates the `remote_exec` capability — the reason is said once and shown by `:SimpleGitHealth`, and nothing is sent. See `:help simplegit-remote`.
+None of this requires SimpleRemote: without it every buffer is local. When remote git cannot be used — no workspace, no git on the host, no argv-safe transport, or a daemon that predates the `remote_exec` capability — the reason is said once and shown by `:SimpleGitHealth`, and nothing is sent. A background refresh never announces a disconnect, but a command you typed is always told why it did nothing. See `:help simplegit-remote`.
 
 ## Configuration
 

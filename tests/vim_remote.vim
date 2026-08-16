@@ -421,6 +421,16 @@ sleep 300m
 assert_equal(0, len(Requests('hunks')), 'nothing is sent for a remote buffer while disconnected')
 assert_equal(0, CountMatches(strpart(Messages(), len(before)), 'no SimpleRemote workspace'),
   'a disconnect is not announced by SimpleGit')
+# A command the user typed is answered all the same: the reason no refresh
+# announces is still the reason this command did nothing, and a command that
+# opens no view and says nothing is a keypress gone.
+before = Messages()
+simplegit#History()
+sleep 200m
+assert_equal(1, CountMatches(strpart(Messages(), len(before)), 'no SimpleRemote workspace is connected'),
+  'an explicit command on a remote buffer is told why it did nothing')
+assert_equal(-1, ScratchBuf('simplegit://history/main.rs'), 'and opens no history view')
+assert_equal(0, len(Requests('log')), 'while nothing reached the wire')
 # Reconnect: caches are dropped and the buffer is read again on the new host.
 g:simpleremote_workspace = Workspace({id: 2})
 Fire('SimpleRemoteConnected', {snapshot: g:simpleremote_workspace})
@@ -435,6 +445,37 @@ Fire('SimpleRemoteBufferRead', {type: 'buffer-read', bufnr: remote_buf,
   path: '/srv/app/src/main.rs', workspace: g:simpleremote_workspace})
 WaitFor(() => !empty(RequestsFor('hunks', '/srv/app/src/main.rs')),
   'a re-read remote buffer is diffed again')
+
+# The *first* request refused after a disconnect is the one that has to be
+# answered too.  A status view is not a file buffer, so the disconnect leaves
+# it un-refreshed: staging an entry from it reaches the refusal first, and a
+# keypress that stages nothing, sends nothing and says nothing is a keypress
+# gone.
+Reset()
+simplegit#Status()
+WaitFor(() => bufname('%') ==# 'simplegit://status', 'the status view of the remote repository opens')
+only!
+sleep 200m
+unlet g:simpleremote_workspace
+Fire('SimpleRemoteDisconnected', {reason: 'disconnect'})
+sleep 200m
+Reset()
+before = Messages()
+cursor(2, 1)
+execute "normal a"
+sleep 200m
+assert_equal(1, CountMatches(strpart(Messages(), len(before)), 'no SimpleRemote workspace is connected'),
+  'the first request refused after a disconnect is answered, not swallowed')
+assert_equal(0, len(Requests('file_op')), 'and nothing reached the wire')
+execute "normal a"
+sleep 200m
+assert_equal(2, CountMatches(strpart(Messages(), len(before)), 'no SimpleRemote workspace is connected'),
+  'and so is the next one')
+g:simpleremote_workspace = Workspace({id: 2})
+Fire('SimpleRemoteConnected', {snapshot: g:simpleremote_workspace})
+sleep 200m
+execute 'buffer ' .. remote_buf
+only!
 
 # --- Refusals: an old daemon, no git on the host, no transport, 'never' -------
 # No remote_exec capability: nothing goes on the wire, said once.
