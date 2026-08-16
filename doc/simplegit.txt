@@ -9,8 +9,9 @@ CONTENTS                                                   *simplegit-contents*
   4. Mappings ................... |simplegit-mappings|
   5. Configuration .............. |simplegit-configuration|
   6. Statusline API ............. |simplegit-statusline|
-  7. Highlights ................. |simplegit-highlights|
-  8. Troubleshooting ............ |simplegit-troubleshooting|
+  7. Remote workspaces .......... |simplegit-remote|
+  8. Highlights ................. |simplegit-highlights|
+  9. Troubleshooting ............ |simplegit-troubleshooting|
 
 ===============================================================================
 INTRODUCTION                                           *simplegit-introduction*
@@ -300,6 +301,12 @@ g:simplegit_live_max_bytes (default 1048576)       *g:simplegit_live_max_bytes*
   path) created for that one diff and removed again, files and directory
   alike, as soon as it returns.
 
+g:simplegit_remote_git (default 'auto')                *g:simplegit_remote_git*
+g:simplegit_remote_blame_delay (default 750)   *g:simplegit_remote_blame_delay*
+g:simplegit_remote_hunk_delay (default 750)     *g:simplegit_remote_hunk_delay*
+  Which buffers of a SimpleRemote workspace run git on the workspace host,
+  and how long their debounces are. See |simplegit-remote|.
+
 g:simplegit_daemon_path (default '')                  *g:simplegit_daemon_path*
   Absolute path of the daemon binary; overrides runtimepath discovery.
 
@@ -386,6 +393,112 @@ advertise `branch_summary`, `head` stays empty and |simplegit#StatusLine()|
 returns an empty string rather than sending a request the daemon cannot
 answer. |:SimpleGitHealth| reports which. The hunk counts do not depend on
 that capability.
+
+===============================================================================
+REMOTE WORKSPACES                                            *simplegit-remote*
+
+SimpleRemote opens an SSH host or a Docker container as a workspace. Its files
+reach Vim in one of two shapes:
+
+  virtual     buffers named `remote:///abs/path` with 'buftype' acwrite,
+              filled asynchronously and marked with b:vimrc_remote
+  projected   ordinary local files under the workspace's local_root (sshfs, a
+              Docker bind mount, an explicit mapping), marked with
+              b:simpleremote_path
+
+Local git can say nothing at all about a virtual buffer -- there is no file on
+this machine -- and about a projected one only by walking the mount. SimpleGit
+therefore runs git *on the workspace host*: each request carries the argv
+prefix from `g:SimpleRemoteExecArgv()` and the directory git must run in, and
+the daemon executes >
+
+  <prefix> git -C <remote dir> <arguments>
+<
+instead of its own local git. The daemon still runs here and still owns the
+timeouts, the concurrency and the parsing; only the git process moves, which
+is why nothing has to be reimplemented for a workspace. Prefixed requests draw
+from their own, smaller concurrency pool and their own index queue, so a
+connection that has stalled cannot hold up the local repositories.
+
+Everything that works in a local buffer works in a remote one: the inline
+annotation, the blame sidebar, |:SimpleGitHistory|, |:SimpleGitLog|,
+|:SimpleGitDiff|, |:SimpleGitShow|, the sign column with hunk navigation,
+preview, stage and undo, |:SimpleGitStatus| (whose entries open the remote
+file, or the projected one where there is a mount), |:SimpleGitCommit| and the
+statusline API. |b:simplegit_status_dict| and |SimpleGitUpdate| are published
+for remote buffers exactly as for local ones.
+
+Two things differ:
+
+- The repository watch (|g:simplegit_watch|) is refused for a remote
+  workspace: the daemon would have to poll a git directory it has no
+  filesystem for. It says so once per repository and SimpleGit does not ask
+  again. Remote buffers are instead re-read on User SimpleRemoteFilesChanged
+  -- what SimpleRemote's tree, uploads and API writes report -- on top of the
+  usual FocusGained and ShellCmdPost.
+- The debounces are longer, because every request is a round trip:
+  |g:simplegit_remote_blame_delay| and |g:simplegit_remote_hunk_delay| stand
+  in for |g:simplegit_blame_delay| and |g:simplegit_hunk_delay|. The live
+  buffer-vs-index diff reads the index through the workspace and diffs the two
+  sides locally, so an unsaved buffer is never shipped across.
+
+Repository identity is namespaced: a remote directory is remembered as
+`remote://<dir>`, so a checkout at /home/me/app on the host never shares a
+branch, a watch or a status view with one at the same path here.
+
+Which buffers use it:
+
+g:simplegit_remote_git (default 'auto')
+  'auto'    remote:// buffers run git on the workspace host; projected files
+            keep local git over the mount.
+  'always'  projected buffers go to the host as well, so `git status` and the
+            live diff stop walking the mount. Their paths are translated with
+            SimpleRemote's own mapping, and a status entry still opens the
+            local file behind it.
+  'never'   nothing is ever routed to a workspace; a remote:// buffer then
+            simply has no git, as before this existed.
+
+g:simplegit_remote_blame_delay (default 750)
+g:simplegit_remote_hunk_delay (default 750)
+  Milliseconds of rest before a remote buffer's annotation and live diff are
+  requested.
+
+SimpleGit follows these SimpleRemote events; without SimpleRemote nothing
+fires them and the autocommands cost nothing:
+
+  SimpleRemoteBufferRead        a remote:// buffer was (re)filled: its hunks
+                                and blame are read again. BufReadPost does not
+                                fire for those buffers -- their read is a
+                                BufReadCmd -- so this stands in for it
+  SimpleRemoteConnected         everything remembered about the previous
+  SimpleRemoteWorkspaceChanged  workspace is dropped and the visible buffers
+  SimpleRemoteDisconnected      are read again
+  SimpleRemoteFilesChanged      files changed outside a buffer write
+
+When remote git cannot be used the reason is said once, and repeated only to
+an explicit command; |:SimpleGitHealth| shows it on its "remote git" line:
+
+  "remote git needs SimpleRemote"            SimpleRemote is not installed
+  "no SimpleRemote workspace is connected"   never announced: between a
+                                             disconnect and the next
+                                             connection this is not news
+  "git is not installed on the remote host"  from SimpleRemote's runtime
+                                             probe, which reports the git it
+                                             found
+  "no argv-safe transport"                   plain ssh without the
+                                             simpleremote-daemon re-joins
+                                             arguments through the login
+                                             shell, so no argv survives it
+  "remote git needs a newer daemon"          the daemon does not advertise
+                                             `remote_exec`; rerun ./install.sh
+
+The transport is an additive extension of protocol 5: a request may carry
+`exec` (the argv prefix, empty for local git) and `cwd` (the directory git
+runs in, which the daemon must not guess from its own filesystem for a path
+that lives elsewhere), and a daemon that supports them advertises the
+`remote_exec` capability. Vim fails closed against a daemon that does not:
+nothing is sent, rather than local git being run on a path that only exists
+on the other machine.
 
 ===============================================================================
 HIGHLIGHTS                                               *simplegit-highlights*

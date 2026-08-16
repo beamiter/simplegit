@@ -25,6 +25,19 @@ const CAP_BRANCH_SUMMARY: &str = "branch_summary";
 const CAP_BLAME_LINE: &str = "blame_line";
 const CAP_HUNK_RANGE: &str = "hunk_range";
 const CAP_REPO_WATCH: &str = "repo_watch";
+/// Requests may carry an `exec` argv prefix and an explicit `cwd`, so git can
+/// run on another machine (see [`GitTarget`]).  A client gates on this rather
+/// than sending a prefix an older daemon would silently ignore -- which would
+/// run *local* git on a remote path and report "not a git repository".
+const CAP_REMOTE_EXEC: &str = "remote_exec";
+/// Prefixed requests get their own, smaller pool: an SSH session that has
+/// stalled must not hold the permits local repositories are waiting for.
+const MAX_CONCURRENT_REMOTE_GIT_REQUESTS: usize = 2;
+/// And their own bound on what may queue for that pool.  Everything above it
+/// is refused outright, so a connection that went away cannot pile up fifteen
+/// seconds of timeout per request behind itself.
+const MAX_QUEUED_REMOTE_GIT_REQUESTS: usize = 32;
+const MAX_EXEC_PREFIX_ELEMENTS: usize = 16;
 const GIT_REPOSITORY_ENV_VARS: [&str; 8] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -43,12 +56,27 @@ enum Request {
     Version { id: u64 },
     /// Whole-file blame, for the sidebar.
     #[serde(rename = "blame")]
-    Blame { id: u64, path: String },
+    Blame {
+        id: u64,
+        path: String,
+        #[serde(default)]
+        exec: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+    },
     /// Blame for a single line (`git blame -L`). The inline annotation shows
     /// one line at a time, and blaming the whole file to render it costs
     /// seconds on a large file with deep history.
     #[serde(rename = "blame_line")]
-    BlameLine { id: u64, path: String, lnum: u32 },
+    BlameLine {
+        id: u64,
+        path: String,
+        lnum: u32,
+        #[serde(default)]
+        exec: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+    },
     /// Commit history that touched one file.
     #[serde(rename = "log")]
     Log {
@@ -56,6 +84,10 @@ enum Request {
         path: String,
         #[serde(default)]
         limit: u32,
+        #[serde(default)]
+        exec: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
     },
     /// Repository-wide commit graph (`git log --graph`), with paging.
     #[serde(rename = "graph_log")]
@@ -66,6 +98,10 @@ enum Request {
         limit: u32,
         #[serde(default)]
         skip: u32,
+        #[serde(default)]
+        exec: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
     },
     /// A commit (message plus patch), optionally restricted to one file.
     #[serde(rename = "show")]
@@ -75,18 +111,44 @@ enum Request {
         rev: String,
         #[serde(default)]
         file: Option<String>,
+        #[serde(default)]
+        exec: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
     },
     /// File contents at a revision, for diff-against-rev.
     #[serde(rename = "cat")]
-    Cat { id: u64, path: String, rev: String },
+    Cat {
+        id: u64,
+        path: String,
+        rev: String,
+        #[serde(default)]
+        exec: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+    },
     /// Branch plus changed-file list for the repository containing `path`.
     #[serde(rename = "status")]
-    Status { id: u64, path: String },
+    Status {
+        id: u64,
+        path: String,
+        #[serde(default)]
+        exec: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+    },
     /// Current ref and upstream distance only, for the statusline API. Unlike
     /// `status` this reads two refs and never walks the worktree, so it is
     /// cheap enough to run once per repository on buffer entry.
     #[serde(rename = "branch")]
-    Branch { id: u64, path: String },
+    Branch {
+        id: u64,
+        path: String,
+        #[serde(default)]
+        exec: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+    },
     /// Working-tree-vs-index hunks for one file (`git diff -U0`). With
     /// `content` the buffer text is diffed against the index instead of the
     /// file on disk, so signs can track unsaved edits.
@@ -96,6 +158,10 @@ enum Request {
         path: String,
         #[serde(default)]
         content: Option<String>,
+        #[serde(default)]
+        exec: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
     },
     /// Stage the hunk covering line `lnum` (`git apply --cached`). With
     /// `last_lnum` set, every hunk overlapping `lnum..=last_lnum` goes in one
@@ -108,6 +174,10 @@ enum Request {
         lnum: u32,
         #[serde(default)]
         last_lnum: Option<u32>,
+        #[serde(default)]
+        exec: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
     },
     /// Revert the hunk covering line `lnum` (or the `lnum..=last_lnum` range)
     /// in the working tree.
@@ -118,6 +188,10 @@ enum Request {
         lnum: u32,
         #[serde(default)]
         last_lnum: Option<u32>,
+        #[serde(default)]
+        exec: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
     },
     /// Stage or unstage one file or the whole repository. Repository-wide
     /// operations use "add_all"/"reset_all" and ignore `file`.
@@ -127,6 +201,10 @@ enum Request {
         path: String,
         op: String,
         file: String,
+        #[serde(default)]
+        exec: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
     },
     /// Watch the repository containing `path` and report changes to it. One
     /// watch per repository is enough; asking again is acknowledged and
@@ -137,11 +215,22 @@ enum Request {
         path: String,
         #[serde(default)]
         interval_ms: Option<u64>,
+        #[serde(default)]
+        exec: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
     },
     /// The full message of HEAD, used to pre-fill an amend so the user edits
     /// the existing message instead of retyping it.
     #[serde(rename = "commit_message")]
-    CommitMessage { id: u64, path: String },
+    CommitMessage {
+        id: u64,
+        path: String,
+        #[serde(default)]
+        exec: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+    },
     /// Commit what is staged. The message arrives over stdin rather than as an
     /// argv entry, so it can contain newlines and needs no shell quoting.
     #[serde(rename = "commit")]
@@ -154,7 +243,63 @@ enum Request {
         /// JSON boolean rather than rejecting the whole request.
         #[serde(default, deserialize_with = "lenient_bool")]
         amend: bool,
+        #[serde(default)]
+        exec: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
     },
+}
+
+/// Where a request's git runs.  Every path-carrying request may add two
+/// optional fields on top of `path`:
+///
+/// * `exec` -- an argv prefix.  Empty (the default) means the local `git` in
+///   this process's PATH.  Non-empty means the git of some other machine,
+///   reached through the given program: the daemon runs
+///   `<exec...> git -C <cwd> <args>` and lets the prefix carry argv and stdin
+///   across.  SimpleRemote's `simpleremote-daemon exec ... --` is the intended
+///   prefix (it quotes each element for the remote shell individually), so
+///   `commit -F -` and `apply` keep working through it unchanged.
+/// * `cwd` -- the directory git runs in.  Without it the daemon guesses from
+///   `path` by asking the *local* filesystem whether it is a directory, which
+///   is meaningless for a path that lives elsewhere; a remote request must
+///   therefore always carry it.
+///
+/// Both are additive: a client that predates them sends neither and gets the
+/// local behaviour it always had.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitTarget {
+    exec: Vec<String>,
+    dir: PathBuf,
+}
+
+impl GitTarget {
+    fn local(dir: PathBuf) -> Self {
+        Self {
+            exec: Vec::new(),
+            dir,
+        }
+    }
+
+    fn from_request(path: &str, cwd: Option<String>, exec: Vec<String>) -> Self {
+        let dir = match cwd {
+            Some(cwd) if !cwd.is_empty() => PathBuf::from(cwd),
+            _ => file_dir(path),
+        };
+        Self { exec, dir }
+    }
+
+    fn is_remote(&self) -> bool {
+        !self.exec.is_empty()
+    }
+
+    /// The same machine, another directory.
+    fn with_dir(&self, dir: PathBuf) -> Self {
+        Self {
+            exec: self.exec.clone(),
+            dir,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Clone, Default, PartialEq, Eq)]
@@ -254,6 +399,9 @@ enum Event {
     Status {
         id: u64,
         path: String,
+        /// Repository root the entries are relative to; empty when git could
+        /// not say.  Additive, like `ahead`/`behind`.
+        root: String,
         branch: String,
         /// Upstream distance, for statusline consumers. Additive fields: a
         /// client that predates them simply never reads them.
@@ -327,24 +475,28 @@ enum IndexMutation {
     HunkStage {
         id: u64,
         path: String,
+        target: GitTarget,
         lnum: u32,
         last_lnum: u32,
     },
     HunkUndo {
         id: u64,
         path: String,
+        target: GitTarget,
         lnum: u32,
         last_lnum: u32,
     },
     FileOp {
         id: u64,
         path: String,
+        target: GitTarget,
         op: String,
         file: String,
     },
     Commit {
         id: u64,
         path: String,
+        target: GitTarget,
         message: String,
         amend: bool,
     },
@@ -376,6 +528,7 @@ fn protocol_capabilities() -> HashMap<&'static str, bool> {
         (CAP_BLAME_LINE, true),
         (CAP_HUNK_RANGE, true),
         (CAP_REPO_WATCH, true),
+        (CAP_REMOTE_EXEC, true),
     ])
 }
 
@@ -469,7 +622,25 @@ const GIT_COLOUR_ARGS: [&str; 22] = [
     "color.transport=false",
 ];
 
-fn git_command(dir: &Path, args: &[&str]) -> tokio::process::Command {
+fn git_command(target: &GitTarget, args: &[&str]) -> tokio::process::Command {
+    if let Some((program, prefix)) = target.exec.split_first() {
+        // Another machine's git, reached through the prefix.  `-C` names the
+        // directory on *that* side, so no current_dir here: the prefix runs
+        // wherever this daemon does, and the directory need not exist locally
+        // at all.  The environment is left alone as well -- GIT_OPTIONAL_LOCKS
+        // and the GIT_DIR family would only reach the local ssh/docker client,
+        // never the git it starts.
+        let mut command = tokio::process::Command::new(program);
+        command
+            .args(prefix)
+            .arg("git")
+            .arg("-C")
+            .arg(&target.dir)
+            .args(GIT_COLOUR_ARGS)
+            .args(args)
+            .kill_on_drop(true);
+        return command;
+    }
     let mut command = tokio::process::Command::new("git");
     command
         // `color.ui = always` (and its per-command siblings) is a common
@@ -482,7 +653,7 @@ fn git_command(dir: &Path, args: &[&str]) -> tokio::process::Command {
         // later can forget it.
         .args(GIT_COLOUR_ARGS)
         .args(args)
-        .current_dir(dir)
+        .current_dir(&target.dir)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .kill_on_drop(true);
     for variable in GIT_REPOSITORY_ENV_VARS {
@@ -491,8 +662,12 @@ fn git_command(dir: &Path, args: &[&str]) -> tokio::process::Command {
     command
 }
 
-async fn run_git_coded(dir: &Path, args: &[&str], ok_codes: &[i32]) -> Result<String, String> {
-    let output = tokio::time::timeout(GIT_TIMEOUT, git_command(dir, args).output())
+async fn run_git_coded(
+    target: &GitTarget,
+    args: &[&str],
+    ok_codes: &[i32],
+) -> Result<String, String> {
+    let output = tokio::time::timeout(GIT_TIMEOUT, git_command(target, args).output())
         .await
         .map_err(|_| {
             format!(
@@ -516,12 +691,16 @@ async fn run_git_coded(dir: &Path, args: &[&str], ok_codes: &[i32]) -> Result<St
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-async fn run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    run_git_coded(dir, args, &[]).await
+async fn run_git(target: &GitTarget, args: &[&str]) -> Result<String, String> {
+    run_git_coded(target, args, &[]).await
 }
 
-async fn run_git_with_input(dir: &Path, args: &[&str], input: String) -> Result<String, String> {
-    let mut command = git_command(dir, args);
+async fn run_git_with_input(
+    target: &GitTarget,
+    args: &[&str],
+    input: String,
+) -> Result<String, String> {
+    let mut command = git_command(target, args);
     command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -635,14 +814,19 @@ fn parse_blame(stdout: &str) -> BlameResult {
     result
 }
 
-async fn handle_blame(id: u64, path: String, tx: EventTx, _permit: OwnedSemaphorePermit) {
-    let dir = file_dir(&path);
+async fn handle_blame(
+    id: u64,
+    path: String,
+    target: GitTarget,
+    tx: EventTx,
+    _permit: OwnedSemaphorePermit,
+) {
     // --porcelain repeats only the sha for a commit already described, where
     // --line-porcelain repeats the whole header block per line: on a file with
     // few distinct commits that is an order of magnitude less stdout to write,
     // read and JSON-decode on Vim's main thread.
     let result = match file_name(&path) {
-        Ok(name) => run_git(&dir, &["blame", "--porcelain", "--", &name])
+        Ok(name) => run_git(&target, &["blame", "--porcelain", "--", &name])
             .await
             .map(|stdout| parse_blame(&stdout)),
         Err(message) => Err(message),
@@ -670,14 +854,14 @@ async fn handle_blame(id: u64, path: String, tx: EventTx, _permit: OwnedSemaphor
 async fn handle_blame_line(
     id: u64,
     path: String,
+    target: GitTarget,
     lnum: u32,
     tx: EventTx,
     _permit: OwnedSemaphorePermit,
 ) {
-    let dir = file_dir(&path);
     let range = format!("-L{lnum},{lnum}");
     let result = match file_name(&path) {
-        Ok(name) => run_git(&dir, &["blame", "--porcelain", &range, "--", &name])
+        Ok(name) => run_git(&target, &["blame", "--porcelain", &range, "--", &name])
             .await
             .map(|stdout| parse_blame(&stdout)),
         Err(message) => Err(message),
@@ -732,14 +916,20 @@ fn parse_log(stdout: &str) -> Vec<LogEntry> {
         .collect()
 }
 
-async fn handle_log(id: u64, path: String, limit: u32, tx: EventTx, _permit: OwnedSemaphorePermit) {
-    let dir = file_dir(&path);
+async fn handle_log(
+    id: u64,
+    path: String,
+    target: GitTarget,
+    limit: u32,
+    tx: EventTx,
+    _permit: OwnedSemaphorePermit,
+) {
     let limit = if limit == 0 { 200 } else { limit.min(10_000) };
     let count = format!("-n{limit}");
     let result = match file_name(&path) {
         Ok(name) => {
             run_git(
-                &dir,
+                &target,
                 &[
                     "log",
                     "--follow",
@@ -808,17 +998,17 @@ fn parse_graph_log(stdout: &str) -> Vec<GraphRow> {
 async fn handle_graph_log(
     id: u64,
     path: String,
+    target: GitTarget,
     limit: u32,
     skip: u32,
     tx: EventTx,
     _permit: OwnedSemaphorePermit,
 ) {
-    let dir = file_dir(&path);
     let limit = if limit == 0 { 200 } else { limit.min(10_000) };
     let count = format!("-n{limit}");
     let skip_arg = format!("--skip={skip}");
     let result = run_git(
-        &dir,
+        &target,
         &[
             "log",
             "--graph",
@@ -863,13 +1053,12 @@ fn validate_rev(rev: &str) -> Result<(), String> {
 
 async fn handle_show(
     id: u64,
-    path: String,
+    target: GitTarget,
     rev: String,
     file: Option<String>,
     tx: EventTx,
     _permit: OwnedSemaphorePermit,
 ) {
-    let dir = file_dir(&path);
     let result = match validate_rev(&rev) {
         Ok(()) => {
             let mut args = vec![
@@ -892,7 +1081,7 @@ async fn handle_show(
                 args.push("--");
                 args.push(&name);
             }
-            run_git(&dir, &args).await
+            run_git(&target, &args).await
         }
         Err(message) => Err(message),
     };
@@ -914,17 +1103,17 @@ async fn handle_show(
 async fn handle_cat(
     id: u64,
     path: String,
+    target: GitTarget,
     rev: String,
     tx: EventTx,
     _permit: OwnedSemaphorePermit,
 ) {
-    let dir = file_dir(&path);
     let result = async {
         validate_rev(&rev)?;
         let name = file_name(&path)?;
-        let prefix = run_git(&dir, &["rev-parse", "--show-prefix"]).await?;
+        let prefix = run_git(&target, &["rev-parse", "--show-prefix"]).await?;
         let spec = format!("{}:{}{}", rev, prefix.trim_end_matches('\n'), name);
-        run_git(&dir, &["show", &spec]).await
+        run_git(&target, &["show", &spec]).await
     }
     .await;
     match result {
@@ -1016,10 +1205,15 @@ fn parse_status(stdout: &str) -> StatusResult {
     result
 }
 
-async fn handle_status(id: u64, path: String, tx: EventTx, _permit: OwnedSemaphorePermit) {
-    let dir = file_dir(&path);
+async fn handle_status(
+    id: u64,
+    path: String,
+    target: GitTarget,
+    tx: EventTx,
+    _permit: OwnedSemaphorePermit,
+) {
     let result = run_git(
-        &dir,
+        &target,
         &[
             "status",
             "--porcelain=v2",
@@ -1031,11 +1225,20 @@ async fn handle_status(id: u64, path: String, tx: EventTx, _permit: OwnedSemapho
     match result {
         Ok(stdout) => {
             let status = parse_status(&stdout);
+            // The entries are repository-relative, so a client that wants to
+            // open one needs the root.  It used to run its own `git rev-parse`
+            // for that, which cannot work when the repository is elsewhere;
+            // best effort, an empty root means "work it out yourself".
+            let root = run_git(&target, &["rev-parse", "--show-toplevel"])
+                .await
+                .map(|root| root.trim_end_matches('\n').to_string())
+                .unwrap_or_default();
             send_event(
                 &tx,
                 &Event::Status {
                     id,
                     path,
+                    root,
                     branch: status.branch,
                     ahead: status.ahead,
                     behind: status.behind,
@@ -1135,21 +1338,40 @@ async fn watch_repository(root: String, git_dir: PathBuf, interval: Duration, tx
 
 async fn handle_watch(
     id: u64,
-    path: String,
+    target: GitTarget,
     interval_ms: Option<u64>,
     watched: Arc<std::sync::Mutex<HashSet<String>>>,
     tx: EventTx,
     _permit: OwnedSemaphorePermit,
 ) {
-    let dir = file_dir(&path);
-    let root = match run_git(&dir, &["rev-parse", "--show-toplevel"]).await {
+    if target.is_remote() {
+        // The fingerprint below stats the git directory with the local
+        // filesystem, which for a repository on another machine is a constant
+        // "nothing there" -- a watch would be acknowledged and never fire.
+        // Polling it through the prefix instead would cost one SSH round trip
+        // per repository per interval for as long as the daemon lives, and a
+        // connection that goes away would leave those pollers stalling; the
+        // client already refreshes remote buffers on FocusGained, ShellCmdPost
+        // and SimpleRemote's own change events, so say so and let it treat the
+        // refusal as final rather than pay that.
+        send_event(
+            &tx,
+            &Event::Error {
+                id,
+                message: "repository watch is unavailable for remote workspaces".to_string(),
+            },
+        )
+        .await;
+        return;
+    }
+    let root = match run_git(&target, &["rev-parse", "--show-toplevel"]).await {
         Ok(root) => root.trim().to_string(),
         Err(message) => {
             send_event(&tx, &Event::Error { id, message }).await;
             return;
         }
     };
-    let git_dir = match run_git(&dir, &["rev-parse", "--absolute-git-dir"]).await {
+    let git_dir = match run_git(&target, &["rev-parse", "--absolute-git-dir"]).await {
         Ok(git_dir) => PathBuf::from(git_dir.trim()),
         Err(message) => {
             send_event(&tx, &Event::Error { id, message }).await;
@@ -1202,16 +1424,21 @@ async fn handle_watch(
     }
 }
 
-async fn handle_branch(id: u64, path: String, tx: EventTx, _permit: OwnedSemaphorePermit) {
-    let dir = file_dir(&path);
+async fn handle_branch(
+    id: u64,
+    path: String,
+    target: GitTarget,
+    tx: EventTx,
+    _permit: OwnedSemaphorePermit,
+) {
     // symbolic-ref reads one ref and nothing else; `git status --branch` would
     // walk the whole worktree for data the statusline never shows.  It is also
     // the only form that answers on an unborn branch, where `rev-parse HEAD`
     // fails outright.
-    let head = match run_git(&dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await {
+    let head = match run_git(&target, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await {
         Ok(name) => name.trim().to_string(),
         // Detached HEAD: name the commit, the way git's own prompt does.
-        Err(_) => match run_git(&dir, &["rev-parse", "--short", "HEAD"]).await {
+        Err(_) => match run_git(&target, &["rev-parse", "--short", "HEAD"]).await {
             Ok(sha) => sha.trim().to_string(),
             Err(message) => {
                 send_event(&tx, &Event::Error { id, message }).await;
@@ -1222,7 +1449,7 @@ async fn handle_branch(id: u64, path: String, tx: EventTx, _permit: OwnedSemapho
     // A branch without an upstream is the common case, not an error: report a
     // distance of zero rather than failing the whole summary.
     let (ahead, behind) = match run_git(
-        &dir,
+        &target,
         &["rev-list", "--count", "--left-right", "@{upstream}...HEAD"],
     )
     .await
@@ -1408,12 +1635,11 @@ fn extract_hunk_patch(stdout: &str, lnum: u32, revert: bool) -> Option<String> {
     extract_hunk_patches(stdout, lnum, lnum, revert)
 }
 
-async fn disk_hunk_diff(path: &str) -> Result<String, String> {
-    let dir = file_dir(path);
+async fn disk_hunk_diff(path: &str, target: &GitTarget) -> Result<String, String> {
     let name = file_name(path)?;
     let mut args: Vec<&str> = DIFF_ARGS.to_vec();
     args.extend(["--", name.as_str()]);
-    run_git(&dir, &args).await
+    run_git(target, &args).await
 }
 
 /// Diff unsaved buffer contents against the index: materialize both sides as
@@ -1482,27 +1708,38 @@ async fn write_private(path: &Path, contents: &str) -> Result<(), String> {
         .map_err(|error| format!("failed to write temp file: {error}"))
 }
 
-async fn buffer_hunk_diff(id: u64, path: &str, content: &str) -> Result<String, String> {
-    buffer_hunk_diff_in(&std::env::temp_dir(), id, path, content).await
+async fn buffer_hunk_diff(
+    id: u64,
+    path: &str,
+    target: &GitTarget,
+    content: &str,
+) -> Result<String, String> {
+    buffer_hunk_diff_in(&std::env::temp_dir(), id, path, target, content).await
 }
 
 /// `base` is where the private scratch directory is created; only the tests
 /// pass anything other than the system temp directory, so that they can assert
 /// on what a live diff leaves behind without racing every other test.
+///
+/// The index side is read through `target` -- for a remote repository that is
+/// where the index is -- and both sides are then materialised *here*, so the
+/// `diff --no-index` over the two scratch files is always local git: the files
+/// exist on this machine only, and shipping the buffer text across for every
+/// keystroke burst would be the wrong trade anyway.
 async fn buffer_hunk_diff_in(
     base: &Path,
     id: u64,
     path: &str,
+    target: &GitTarget,
     content: &str,
 ) -> Result<String, String> {
     if content.len() > MAX_CONTENT_BYTES {
         return Err("buffer too large for a live diff".to_string());
     }
-    let dir = file_dir(path);
     let name = file_name(path)?;
-    let prefix = run_git(&dir, &["rev-parse", "--show-prefix"]).await?;
+    let prefix = run_git(target, &["rev-parse", "--show-prefix"]).await?;
     let spec = format!(":{}{}", prefix.trim_end_matches('\n'), name);
-    let index_text = run_git(&dir, &["show", &spec]).await?;
+    let index_text = run_git(target, &["show", &spec]).await?;
 
     let scratch = create_scratch_dir(base)?;
     let index_file = scratch.join(format!("{id}.index"));
@@ -1521,7 +1758,16 @@ async fn buffer_hunk_diff_in(
             let buffer_arg = buffer_file.to_string_lossy().into_owned();
             args.push(&index_arg);
             args.push(&buffer_arg);
-            run_git_coded(&dir, &args, &[1]).await
+            // Local git in the repository directory when that is where we
+            // are, so its diff configuration still applies; a remote
+            // repository has no local directory to run in, so the scratch
+            // directory stands in.
+            let local = if target.is_remote() {
+                GitTarget::local(scratch.clone())
+            } else {
+                GitTarget::local(target.dir.clone())
+            };
+            run_git_coded(&local, &args, &[1]).await
         }
         Err(message) => Err(message),
     };
@@ -1536,13 +1782,14 @@ async fn buffer_hunk_diff_in(
 async fn handle_hunks(
     id: u64,
     path: String,
+    target: GitTarget,
     content: Option<String>,
     tx: EventTx,
     _permit: OwnedSemaphorePermit,
 ) {
     let result = match content {
-        Some(text) => buffer_hunk_diff(id, &path, &text).await,
-        None => disk_hunk_diff(&path).await,
+        Some(text) => buffer_hunk_diff(id, &path, &target, &text).await,
+        None => disk_hunk_diff(&path, &target).await,
     };
     match result {
         Ok(stdout) => {
@@ -1563,15 +1810,15 @@ async fn handle_hunks(
 async fn handle_file_op(
     id: u64,
     path: String,
+    target: GitTarget,
     op: String,
     file: String,
     tx: EventTx,
     _permit: OwnedSemaphorePermit,
 ) {
-    let dir = file_dir(&path);
     let result = async {
         let args = file_op_args(&op, &file)?;
-        run_git(&dir, &args).await
+        run_git(&target, &args).await
     }
     .await;
     match result {
@@ -1592,9 +1839,14 @@ fn file_op_args<'a>(op: &str, file: &'a str) -> Result<Vec<&'a str>, String> {
     }
 }
 
-async fn handle_commit_message(id: u64, path: String, tx: EventTx, _permit: OwnedSemaphorePermit) {
-    let dir = file_dir(&path);
-    match run_git(&dir, &["log", "-1", "--pretty=%B"]).await {
+async fn handle_commit_message(
+    id: u64,
+    path: String,
+    target: GitTarget,
+    tx: EventTx,
+    _permit: OwnedSemaphorePermit,
+) {
+    match run_git(&target, &["log", "-1", "--pretty=%B"]).await {
         Ok(text) => {
             let lines = text
                 .trim_end()
@@ -1610,12 +1862,12 @@ async fn handle_commit_message(id: u64, path: String, tx: EventTx, _permit: Owne
 async fn handle_commit(
     id: u64,
     path: String,
+    target: GitTarget,
     message: String,
     amend: bool,
     tx: EventTx,
     _permit: OwnedSemaphorePermit,
 ) {
-    let dir = file_dir(&path);
     let result = async {
         if message.trim().is_empty() {
             return Err("empty commit message; nothing committed".to_string());
@@ -1627,15 +1879,15 @@ async fn handle_commit(
         if amend {
             args.push("--amend");
         }
-        let summary = run_git_with_input(&dir, &args, message).await?;
+        let summary = run_git_with_input(&target, &args, message).await?;
 
         // Report what actually landed rather than echoing back the request.
-        let sha = run_git(&dir, &["rev-parse", "--short", "HEAD"])
+        let sha = run_git(&target, &["rev-parse", "--short", "HEAD"])
             .await
             .unwrap_or_default()
             .trim()
             .to_string();
-        let subject = run_git(&dir, &["log", "-1", "--pretty=%s"])
+        let subject = run_git(&target, &["log", "-1", "--pretty=%s"])
             .await
             .unwrap_or_default()
             .trim()
@@ -1661,21 +1913,23 @@ async fn handle_commit(
     }
 }
 
+/// `range` is the buffer line range `(lnum, last_lnum)` the hunks are picked
+/// from.
 async fn handle_hunk_op(
     id: u64,
     path: String,
-    lnum: u32,
-    last_lnum: u32,
+    target: GitTarget,
+    range: (u32, u32),
     revert: bool,
     tx: EventTx,
     _permit: OwnedSemaphorePermit,
 ) {
-    let dir = file_dir(&path);
+    let (lnum, last_lnum) = range;
     let result = async {
         let name = file_name(&path)?;
         let mut args: Vec<&str> = DIFF_ARGS.to_vec();
         args.extend(["--", name.as_str()]);
-        let diff = run_git(&dir, &args).await?;
+        let diff = run_git(&target, &args).await?;
         let patch = extract_hunk_patches(&diff, lnum, last_lnum, revert).ok_or_else(|| {
             if last_lnum > lnum {
                 "no hunk in the selected range".to_string()
@@ -1685,8 +1939,8 @@ async fn handle_hunk_op(
         })?;
         // Patch paths are repository-relative; apply from the root so hunks in
         // any subdirectory resolve.
-        let root = run_git(&dir, &["rev-parse", "--show-toplevel"]).await?;
-        let root = PathBuf::from(root.trim_end_matches('\n'));
+        let root = run_git(&target, &["rev-parse", "--show-toplevel"]).await?;
+        let root = target.with_dir(PathBuf::from(root.trim_end_matches('\n')));
         let apply: &[&str] = if revert {
             &[
                 "apply",
@@ -1735,6 +1989,45 @@ fn validate_request_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The same bounds for the argv prefix and the explicit working directory:
+/// each element is one argv entry, so a NUL could not even be passed to exec,
+/// and a prefix longer than sixteen words is nobody's transport.
+fn validate_request_target(exec: &[String], cwd: Option<&str>) -> Result<(), String> {
+    if exec.len() > MAX_EXEC_PREFIX_ELEMENTS {
+        return Err(format!(
+            "exec prefix exceeds {MAX_EXEC_PREFIX_ELEMENTS} elements"
+        ));
+    }
+    for element in exec {
+        if element.is_empty() {
+            return Err("exec prefix element must not be empty".to_string());
+        }
+        if element.len() > MAX_REQUEST_PATH_BYTES {
+            return Err(format!(
+                "exec prefix element exceeds {MAX_REQUEST_PATH_BYTES} bytes"
+            ));
+        }
+        if element.contains('\0') {
+            return Err("exec prefix element must not contain NUL".to_string());
+        }
+    }
+    match cwd {
+        Some(cwd) => {
+            validate_request_path(cwd).map_err(|message| message.replace("request path", "cwd"))?
+        }
+        // Without a prefix the directory is derived from `path` as it always
+        // was.  With one it cannot be: the daemon would have to ask its own
+        // filesystem about a path that lives on another machine, and the
+        // answer -- "not a directory, so take the parent" -- is silently one
+        // level off for every repository-wide request.  Fail closed instead.
+        None if !exec.is_empty() => {
+            return Err("an exec prefix requires an explicit cwd".to_string());
+        }
+        None => {}
+    }
+    Ok(())
+}
+
 async fn report_request_completion(result: Result<(), JoinError>, tx: &EventTx) {
     if let Err(error) = result {
         send_event(
@@ -1773,29 +2066,56 @@ async fn run_index_mutations(
             IndexMutation::HunkStage {
                 id,
                 path,
+                target,
                 lnum,
                 last_lnum,
             } => {
-                handle_hunk_op(id, path, lnum, last_lnum, false, tx.clone(), permit).await;
+                handle_hunk_op(
+                    id,
+                    path,
+                    target,
+                    (lnum, last_lnum),
+                    false,
+                    tx.clone(),
+                    permit,
+                )
+                .await;
             }
             IndexMutation::HunkUndo {
                 id,
                 path,
+                target,
                 lnum,
                 last_lnum,
             } => {
-                handle_hunk_op(id, path, lnum, last_lnum, true, tx.clone(), permit).await;
+                handle_hunk_op(
+                    id,
+                    path,
+                    target,
+                    (lnum, last_lnum),
+                    true,
+                    tx.clone(),
+                    permit,
+                )
+                .await;
             }
-            IndexMutation::FileOp { id, path, op, file } => {
-                handle_file_op(id, path, op, file, tx.clone(), permit).await;
+            IndexMutation::FileOp {
+                id,
+                path,
+                target,
+                op,
+                file,
+            } => {
+                handle_file_op(id, path, target, op, file, tx.clone(), permit).await;
             }
             IndexMutation::Commit {
                 id,
                 path,
+                target,
                 message,
                 amend,
             } => {
-                handle_commit(id, path, message, amend, tx.clone(), permit).await;
+                handle_commit(id, path, target, message, amend, tx.clone(), permit).await;
             }
             #[cfg(test)]
             IndexMutation::Probe {
@@ -1862,24 +2182,225 @@ where
     }
 }
 
-fn request_id_and_path(req: &Request) -> (u64, Option<&str>) {
+/// The path a request names plus the exec/cwd pair that decides where its git
+/// runs, borrowed from the request for validation.
+struct Located<'a> {
+    path: &'a str,
+    exec: &'a [String],
+    cwd: Option<&'a str>,
+}
+
+/// The request id plus, for every request that names a path, where it points.
+fn request_id_and_path(req: &Request) -> (u64, Option<Located<'_>>) {
+    macro_rules! target {
+        ($id:expr, $path:expr, $exec:expr, $cwd:expr) => {
+            (
+                *$id,
+                Some(Located {
+                    path: $path.as_str(),
+                    exec: $exec.as_slice(),
+                    cwd: $cwd.as_deref(),
+                }),
+            )
+        };
+    }
     match req {
         Request::Version { id } => (*id, None),
-        Request::Blame { id, path } => (*id, Some(path)),
-        Request::BlameLine { id, path, .. } => (*id, Some(path)),
-        Request::Log { id, path, .. } => (*id, Some(path)),
-        Request::GraphLog { id, path, .. } => (*id, Some(path)),
-        Request::Show { id, path, .. } => (*id, Some(path)),
-        Request::Cat { id, path, .. } => (*id, Some(path)),
-        Request::Status { id, path } => (*id, Some(path)),
-        Request::Branch { id, path } => (*id, Some(path)),
-        Request::Hunks { id, path, .. } => (*id, Some(path)),
-        Request::Stage { id, path, .. } => (*id, Some(path)),
-        Request::Undo { id, path, .. } => (*id, Some(path)),
-        Request::FileOp { id, path, .. } => (*id, Some(path)),
-        Request::Commit { id, path, .. } => (*id, Some(path)),
-        Request::CommitMessage { id, path } => (*id, Some(path)),
-        Request::Watch { id, path, .. } => (*id, Some(path)),
+        Request::Blame {
+            id,
+            path,
+            exec,
+            cwd,
+        } => target!(id, path, exec, cwd),
+        Request::BlameLine {
+            id,
+            path,
+            exec,
+            cwd,
+            ..
+        } => target!(id, path, exec, cwd),
+        Request::Log {
+            id,
+            path,
+            exec,
+            cwd,
+            ..
+        } => target!(id, path, exec, cwd),
+        Request::GraphLog {
+            id,
+            path,
+            exec,
+            cwd,
+            ..
+        } => target!(id, path, exec, cwd),
+        Request::Show {
+            id,
+            path,
+            exec,
+            cwd,
+            ..
+        } => target!(id, path, exec, cwd),
+        Request::Cat {
+            id,
+            path,
+            exec,
+            cwd,
+            ..
+        } => target!(id, path, exec, cwd),
+        Request::Status {
+            id,
+            path,
+            exec,
+            cwd,
+        } => target!(id, path, exec, cwd),
+        Request::Branch {
+            id,
+            path,
+            exec,
+            cwd,
+        } => target!(id, path, exec, cwd),
+        Request::Hunks {
+            id,
+            path,
+            exec,
+            cwd,
+            ..
+        } => target!(id, path, exec, cwd),
+        Request::Stage {
+            id,
+            path,
+            exec,
+            cwd,
+            ..
+        } => target!(id, path, exec, cwd),
+        Request::Undo {
+            id,
+            path,
+            exec,
+            cwd,
+            ..
+        } => target!(id, path, exec, cwd),
+        Request::FileOp {
+            id,
+            path,
+            exec,
+            cwd,
+            ..
+        } => target!(id, path, exec, cwd),
+        Request::Commit {
+            id,
+            path,
+            exec,
+            cwd,
+            ..
+        } => target!(id, path, exec, cwd),
+        Request::CommitMessage {
+            id,
+            path,
+            exec,
+            cwd,
+        } => target!(id, path, exec, cwd),
+        Request::Watch {
+            id,
+            path,
+            exec,
+            cwd,
+            ..
+        } => target!(id, path, exec, cwd),
+    }
+}
+
+/// Counts the prefixed requests waiting for or holding a remote permit, so a
+/// stalled connection is refused new work instead of queueing it forever.
+struct RemoteQueueSlot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl RemoteQueueSlot {
+    fn try_take(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        let mut current = counter.load(Ordering::Acquire);
+        loop {
+            if current >= MAX_QUEUED_REMOTE_GIT_REQUESTS {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self(counter.clone())),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for RemoteQueueSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Which pool a request draws its permit from, and how.
+///
+/// Local requests take their permit *before* being spawned, exactly as they
+/// always did: the read loop pauses when four are in flight, which is the
+/// back-pressure that keeps a burst of cursor movement from forking a hundred
+/// gits.  A remote request must not pause that loop -- one SSH session that
+/// has hung would then stall every local repository behind it -- so it is
+/// spawned first and takes a permit from its own, smaller pool inside the
+/// task.  What may wait for that pool is bounded by [`RemoteQueueSlot`].
+struct GitPools {
+    local: Arc<Semaphore>,
+    remote: Arc<Semaphore>,
+    remote_queued: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl GitPools {
+    fn new() -> Self {
+        Self {
+            local: Arc::new(Semaphore::new(MAX_CONCURRENT_GIT_REQUESTS)),
+            remote: Arc::new(Semaphore::new(MAX_CONCURRENT_REMOTE_GIT_REQUESTS)),
+            remote_queued: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// Run `handler` with a permit from the local or the remote pool.
+    async fn spawn<F, Fut>(
+        &self,
+        requests: &mut JoinSet<()>,
+        id: u64,
+        remote: bool,
+        tx: EventTx,
+        handler: F,
+    ) where
+        F: FnOnce(OwnedSemaphorePermit) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if !remote {
+            let permit = self.local.clone().acquire_owned().await.unwrap();
+            requests.spawn(handler(permit));
+            return;
+        }
+        let Some(slot) = RemoteQueueSlot::try_take(&self.remote_queued) else {
+            send_event(
+                &tx,
+                &Event::Error {
+                    id,
+                    message: format!(
+                        "remote git is busy: {MAX_QUEUED_REMOTE_GIT_REQUESTS} requests already waiting"
+                    ),
+                },
+            )
+            .await;
+            return;
+        };
+        let pool = self.remote.clone();
+        requests.spawn(async move {
+            let _slot = slot;
+            let permit = pool.acquire_owned().await.unwrap();
+            handler(permit).await;
+        });
     }
 }
 
@@ -1892,13 +2413,24 @@ where
 
     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<String>(1024);
     let writer = tokio::spawn(stdout_writer(output, out_rx));
-    let git_limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_GIT_REQUESTS));
+    let pools = GitPools::new();
+    // Two index lanes, one per machine class: mutations of a local index and
+    // of a remote one cannot race each other for the same index.lock, and a
+    // remote commit waiting on a slow connection has no business holding up a
+    // local `git add`.  Each lane stays FIFO within itself.
     let (index_tx, index_rx) =
         tokio::sync::mpsc::channel::<IndexMutation>(MAX_PENDING_INDEX_MUTATIONS);
     let index_worker = tokio::spawn(run_index_mutations(
         index_rx,
         out_tx.clone(),
-        git_limiter.clone(),
+        pools.local.clone(),
+    ));
+    let (remote_index_tx, remote_index_rx) =
+        tokio::sync::mpsc::channel::<IndexMutation>(MAX_PENDING_INDEX_MUTATIONS);
+    let remote_index_worker = tokio::spawn(run_index_mutations(
+        remote_index_rx,
+        out_tx.clone(),
+        pools.remote.clone(),
     ));
     let mut requests = JoinSet::new();
     let mut input_error = None;
@@ -1947,13 +2479,21 @@ where
             }
         };
 
-        let (id, path) = request_id_and_path(&req);
-        if let Some(path) = path
-            && let Err(message) = validate_request_path(path)
-        {
-            send_event(&out_tx, &Event::Error { id, message }).await;
-            continue;
-        }
+        let (id, located) = request_id_and_path(&req);
+        let target = match located {
+            Some(Located { path, exec, cwd }) => {
+                if let Err(message) =
+                    validate_request_path(path).and_then(|()| validate_request_target(exec, cwd))
+                {
+                    send_event(&out_tx, &Event::Error { id, message }).await;
+                    continue;
+                }
+                GitTarget::from_request(path, cwd.map(str::to_string), exec.to_vec())
+            }
+            None => GitTarget::local(PathBuf::from(".")),
+        };
+        let remote = target.is_remote();
+        let index_lane = if remote { &remote_index_tx } else { &index_tx };
 
         match req {
             Request::Version { id } => {
@@ -1968,88 +2508,112 @@ where
                 )
                 .await;
             }
-            Request::Blame { id, path } => {
+            Request::Blame { id, path, .. } => {
                 let tx = out_tx.clone();
-                let permit = git_limiter.clone().acquire_owned().await.unwrap();
-                requests.spawn(handle_blame(id, path, tx, permit));
+                pools
+                    .spawn(&mut requests, id, remote, tx.clone(), move |permit| {
+                        handle_blame(id, path, target, tx, permit)
+                    })
+                    .await;
             }
-            Request::BlameLine { id, path, lnum } => {
+            Request::BlameLine { id, path, lnum, .. } => {
                 let tx = out_tx.clone();
-                let permit = git_limiter.clone().acquire_owned().await.unwrap();
-                requests.spawn(handle_blame_line(id, path, lnum, tx, permit));
+                pools
+                    .spawn(&mut requests, id, remote, tx.clone(), move |permit| {
+                        handle_blame_line(id, path, target, lnum, tx, permit)
+                    })
+                    .await;
             }
-            Request::Log { id, path, limit } => {
+            Request::Log {
+                id, path, limit, ..
+            } => {
                 let tx = out_tx.clone();
-                let permit = git_limiter.clone().acquire_owned().await.unwrap();
-                requests.spawn(handle_log(id, path, limit, tx, permit));
+                pools
+                    .spawn(&mut requests, id, remote, tx.clone(), move |permit| {
+                        handle_log(id, path, target, limit, tx, permit)
+                    })
+                    .await;
             }
             Request::GraphLog {
                 id,
                 path,
                 limit,
                 skip,
+                ..
             } => {
                 let tx = out_tx.clone();
-                let permit = git_limiter.clone().acquire_owned().await.unwrap();
-                requests.spawn(handle_graph_log(id, path, limit, skip, tx, permit));
+                pools
+                    .spawn(&mut requests, id, remote, tx.clone(), move |permit| {
+                        handle_graph_log(id, path, target, limit, skip, tx, permit)
+                    })
+                    .await;
             }
-            Request::Show {
-                id,
-                path,
-                rev,
-                file,
-            } => {
+            Request::Show { id, rev, file, .. } => {
                 let tx = out_tx.clone();
-                let permit = git_limiter.clone().acquire_owned().await.unwrap();
-                requests.spawn(handle_show(id, path, rev, file, tx, permit));
+                pools
+                    .spawn(&mut requests, id, remote, tx.clone(), move |permit| {
+                        handle_show(id, target, rev, file, tx, permit)
+                    })
+                    .await;
             }
-            Request::Cat { id, path, rev } => {
+            Request::Cat { id, path, rev, .. } => {
                 let tx = out_tx.clone();
-                let permit = git_limiter.clone().acquire_owned().await.unwrap();
-                requests.spawn(handle_cat(id, path, rev, tx, permit));
+                pools
+                    .spawn(&mut requests, id, remote, tx.clone(), move |permit| {
+                        handle_cat(id, path, target, rev, tx, permit)
+                    })
+                    .await;
             }
-            Request::Status { id, path } => {
+            Request::Status { id, path, .. } => {
                 let tx = out_tx.clone();
-                let permit = git_limiter.clone().acquire_owned().await.unwrap();
-                requests.spawn(handle_status(id, path, tx, permit));
+                pools
+                    .spawn(&mut requests, id, remote, tx.clone(), move |permit| {
+                        handle_status(id, path, target, tx, permit)
+                    })
+                    .await;
             }
-            Request::Branch { id, path } => {
+            Request::Branch { id, path, .. } => {
                 let tx = out_tx.clone();
-                let permit = git_limiter.clone().acquire_owned().await.unwrap();
-                requests.spawn(handle_branch(id, path, tx, permit));
+                pools
+                    .spawn(&mut requests, id, remote, tx.clone(), move |permit| {
+                        handle_branch(id, path, target, tx, permit)
+                    })
+                    .await;
             }
             Request::Watch {
-                id,
-                path,
-                interval_ms,
+                id, interval_ms, ..
             } => {
                 let tx = out_tx.clone();
-                let permit = git_limiter.clone().acquire_owned().await.unwrap();
-                requests.spawn(handle_watch(
-                    id,
-                    path,
-                    interval_ms,
-                    watched_repositories.clone(),
-                    tx,
-                    permit,
-                ));
+                let watched = watched_repositories.clone();
+                pools
+                    .spawn(&mut requests, id, remote, tx.clone(), move |permit| {
+                        handle_watch(id, target, interval_ms, watched, tx, permit)
+                    })
+                    .await;
             }
-            Request::Hunks { id, path, content } => {
+            Request::Hunks {
+                id, path, content, ..
+            } => {
                 let tx = out_tx.clone();
-                let permit = git_limiter.clone().acquire_owned().await.unwrap();
-                requests.spawn(handle_hunks(id, path, content, tx, permit));
+                pools
+                    .spawn(&mut requests, id, remote, tx.clone(), move |permit| {
+                        handle_hunks(id, path, target, content, tx, permit)
+                    })
+                    .await;
             }
             Request::Stage {
                 id,
                 path,
                 lnum,
                 last_lnum,
+                ..
             } => {
                 let last_lnum = last_lnum.unwrap_or(lnum).max(lnum);
-                if index_tx
+                if index_lane
                     .send(IndexMutation::HunkStage {
                         id,
                         path,
+                        target,
                         lnum,
                         last_lnum,
                     })
@@ -2071,12 +2635,14 @@ where
                 path,
                 lnum,
                 last_lnum,
+                ..
             } => {
                 let last_lnum = last_lnum.unwrap_or(lnum).max(lnum);
-                if index_tx
+                if index_lane
                     .send(IndexMutation::HunkUndo {
                         id,
                         path,
+                        target,
                         lnum,
                         last_lnum,
                     })
@@ -2093,13 +2659,21 @@ where
                     .await;
                 }
             }
-            Request::FileOp { id, path, op, file } => {
+            Request::FileOp {
+                id, path, op, file, ..
+            } => {
                 if let Err(message) = validate_request_path(&file) {
                     send_event(&out_tx, &Event::Error { id, message }).await;
                     continue;
                 }
-                if index_tx
-                    .send(IndexMutation::FileOp { id, path, op, file })
+                if index_lane
+                    .send(IndexMutation::FileOp {
+                        id,
+                        path,
+                        target,
+                        op,
+                        file,
+                    })
                     .await
                     .is_err()
                 {
@@ -2113,21 +2687,26 @@ where
                     .await;
                 }
             }
-            Request::CommitMessage { id, path } => {
+            Request::CommitMessage { id, path, .. } => {
                 let tx = out_tx.clone();
-                let permit = git_limiter.clone().acquire_owned().await.unwrap();
-                requests.spawn(handle_commit_message(id, path, tx, permit));
+                pools
+                    .spawn(&mut requests, id, remote, tx.clone(), move |permit| {
+                        handle_commit_message(id, path, target, tx, permit)
+                    })
+                    .await;
             }
             Request::Commit {
                 id,
                 path,
                 message,
                 amend,
+                ..
             } => {
-                if index_tx
+                if index_lane
                     .send(IndexMutation::Commit {
                         id,
                         path,
+                        target,
                         message,
                         amend,
                     })
@@ -2148,7 +2727,9 @@ where
     }
 
     drop(index_tx);
+    drop(remote_index_tx);
     report_request_completion(index_worker.await, &out_tx).await;
+    report_request_completion(remote_index_worker.await, &out_tx).await;
     while let Some(result) = requests.join_next().await {
         report_request_completion(result, &out_tx).await;
     }
@@ -2267,7 +2848,7 @@ mod tests {
         // to precede the subcommand, or git parses them as its arguments.
         // Whether the settings are the *right* ones is decided by
         // `no_reply_carries_ansi_escapes` below, against real git output.
-        let command = git_command(Path::new("."), &["log", "--graph"]);
+        let command = git_command(&GitTarget::local(PathBuf::from(".")), &["log", "--graph"]);
         let args: Vec<String> = command
             .as_std()
             .get_args()
@@ -2276,6 +2857,302 @@ mod tests {
         let (colour, subcommand) = args.split_at(GIT_COLOUR_ARGS.len());
         assert_eq!(colour, GIT_COLOUR_ARGS, "colour is disabled first");
         assert_eq!(subcommand, ["log", "--graph"], "then the subcommand");
+    }
+
+    fn command_argv(command: &tokio::process::Command) -> (String, Vec<String>) {
+        let std = command.as_std();
+        (
+            std.get_program().to_string_lossy().into_owned(),
+            std.get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect(),
+        )
+    }
+
+    /// With an exec prefix the argv is `<prefix> git -C <dir> <colour> <sub>`,
+    /// run wherever the daemon runs: no current_dir, because the directory
+    /// exists on the other machine, and no GIT_* environment, because it
+    /// would only reach the local ssh client.
+    #[test]
+    fn an_exec_prefix_wraps_git_and_names_the_directory_remotely() {
+        let target = GitTarget {
+            exec: vec![
+                "/opt/simpleremote-daemon".to_string(),
+                "exec".to_string(),
+                "--kind".to_string(),
+                "ssh".to_string(),
+                "--target".to_string(),
+                "devbox".to_string(),
+                "--root".to_string(),
+                "/srv/app".to_string(),
+                "--".to_string(),
+            ],
+            dir: PathBuf::from("/srv/app/src"),
+        };
+        let command = git_command(&target, &["status", "--porcelain=v2"]);
+        let (program, args) = command_argv(&command);
+        assert_eq!(program, "/opt/simpleremote-daemon");
+        let mut expected: Vec<String> = target.exec[1..].to_vec();
+        expected.extend(["git", "-C", "/srv/app/src"].map(str::to_string));
+        expected.extend(GIT_COLOUR_ARGS.map(str::to_string));
+        expected.extend(["status", "--porcelain=v2"].map(str::to_string));
+        assert_eq!(args, expected);
+        assert!(
+            command.as_std().get_current_dir().is_none(),
+            "a remote directory is never used as the local working directory"
+        );
+        let env: Vec<_> = command.as_std().get_envs().collect();
+        assert!(
+            env.is_empty(),
+            "the local environment is left alone for a prefixed command: {env:?}"
+        );
+
+        // And the local form still pins its directory and scrubs the
+        // repository environment, so the two cannot be confused.
+        let local = git_command(&GitTarget::local(PathBuf::from("/tmp")), &["status"]);
+        assert_eq!(local.as_std().get_program(), "git");
+        assert_eq!(local.as_std().get_current_dir(), Some(Path::new("/tmp")));
+        assert!(
+            local
+                .as_std()
+                .get_envs()
+                .any(|(key, value)| key == "GIT_OPTIONAL_LOCKS" && value.is_some())
+        );
+    }
+
+    /// `exec` and `cwd` are additive: absent, a request means what it always
+    /// meant; present, `cwd` replaces the local is-it-a-directory guess.
+    #[test]
+    fn requests_deserialize_with_and_without_a_target() {
+        let plain: Request = serde_json::from_str(r#"{"type":"blame","id":1,"path":"/x/y.txt"}"#)
+            .expect("a request without exec/cwd still parses");
+        let (id, located) = request_id_and_path(&plain);
+        let located = located.expect("blame names a path");
+        assert_eq!(id, 1);
+        assert_eq!(located.path, "/x/y.txt");
+        assert!(located.exec.is_empty());
+        assert_eq!(located.cwd, None);
+        let target = GitTarget::from_request(located.path, None, Vec::new());
+        assert!(!target.is_remote());
+        assert_eq!(
+            target.dir,
+            PathBuf::from("/x"),
+            "the parent of a non-directory"
+        );
+
+        let prefixed: Request = serde_json::from_str(
+            r#"{"type":"hunks","id":2,"path":"/srv/app/a.rs","exec":["ssh","host"],"cwd":"/srv/app"}"#,
+        )
+        .expect("a request with exec/cwd parses");
+        let (id, located) = request_id_and_path(&prefixed);
+        let located = located.expect("hunks names a path");
+        assert_eq!(id, 2);
+        assert_eq!(located.exec, ["ssh", "host"]);
+        assert_eq!(located.cwd, Some("/srv/app"));
+        let target = GitTarget::from_request(
+            located.path,
+            located.cwd.map(str::to_string),
+            located.exec.to_vec(),
+        );
+        assert!(target.is_remote());
+        assert_eq!(
+            target.dir,
+            PathBuf::from("/srv/app"),
+            "cwd wins over the guess"
+        );
+        assert_eq!(
+            target.with_dir(PathBuf::from("/srv")).exec,
+            target.exec,
+            "with_dir keeps the prefix"
+        );
+
+        // A directory request (status, commit) carries an explicit cwd on the
+        // remote side because the daemon cannot stat it; locally the guess is
+        // still what an old client relies on.
+        let status: Request = serde_json::from_str(
+            r#"{"type":"status","id":3,"path":"/","exec":["docker","exec","-i","c"],"cwd":"/work"}"#,
+        )
+        .unwrap();
+        let (_, located) = request_id_and_path(&status);
+        assert_eq!(located.unwrap().cwd, Some("/work"));
+
+        // Version carries no path and therefore no target.
+        let version: Request = serde_json::from_str(r#"{"type":"version","id":0}"#).unwrap();
+        assert!(request_id_and_path(&version).1.is_none());
+    }
+
+    #[test]
+    fn exec_prefixes_are_bounded() {
+        assert!(validate_request_target(&[], None).is_ok());
+        assert!(validate_request_target(&["ssh".to_string()], Some("/x")).is_ok());
+        let too_many: Vec<String> = (0..=MAX_EXEC_PREFIX_ELEMENTS)
+            .map(|index| format!("arg{index}"))
+            .collect();
+        assert!(validate_request_target(&too_many, None).is_err());
+        assert!(validate_request_target(&[String::new()], None).is_err());
+        assert!(validate_request_target(&["a\0b".to_string()], None).is_err());
+        assert!(validate_request_target(&["x".repeat(MAX_REQUEST_PATH_BYTES + 1)], None).is_err());
+        assert!(validate_request_target(&[], Some("")).is_err());
+        assert!(validate_request_target(&[], Some("/a\0b")).is_err());
+        // A prefix without a working directory is refused: the guess the
+        // local filesystem would make is meaningless for a remote path.
+        assert!(validate_request_target(&["ssh".to_string()], None).is_err());
+    }
+
+    /// The whole request path with a prefix, against real git: `env` is a
+    /// prefix that runs whatever follows it locally, so `env git -C dir ...`
+    /// exercises the prefixed argv shape end to end.  Reads, the live diff
+    /// (index through the prefix, `diff --no-index` local), an index mutation
+    /// through the remote lane and the refused watch are all covered.
+    #[tokio::test]
+    async fn prefixed_requests_run_git_through_the_prefix() {
+        use std::process::Command;
+        use tokio::io::AsyncReadExt;
+
+        if Command::new("git").arg("--version").output().is_err()
+            || Command::new("env").arg("true").output().is_err()
+        {
+            return;
+        }
+        let repo = temp_fixture_dir("prefixed-repo");
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        std::fs::write(
+            repo.join("sub/sample.txt"),
+            "before
+keep
+",
+        )
+        .unwrap();
+        git(&["add", "sub/sample.txt"]);
+        git(&["commit", "-q", "-m", "initial"]);
+        std::fs::write(
+            repo.join("sub/sample.txt"),
+            "after
+keep
+",
+        )
+        .unwrap();
+
+        // The path the "remote" side sees is the same path here; what matters
+        // is that the daemon never consults its own filesystem for `cwd` and
+        // runs git through the prefix rather than directly.
+        let file = repo.join("sub/sample.txt");
+        let dir = repo.join("sub");
+        let exec = ["env"];
+        let requests = [
+            serde_json::json!({"type": "blame", "id": 1, "path": file, "exec": exec, "cwd": dir}),
+            serde_json::json!({"type": "blame_line", "id": 2, "path": file, "lnum": 2, "exec": exec, "cwd": dir}),
+            serde_json::json!({"type": "status", "id": 3, "path": dir, "exec": exec, "cwd": dir}),
+            serde_json::json!({"type": "branch", "id": 4, "path": dir, "exec": exec, "cwd": dir}),
+            serde_json::json!({"type": "hunks", "id": 5, "path": file, "exec": exec, "cwd": dir}),
+            serde_json::json!({"type": "hunks", "id": 6, "path": file, "content": "before
+keep
+live
+", "exec": exec, "cwd": dir}),
+            serde_json::json!({"type": "cat", "id": 7, "path": file, "rev": "HEAD", "exec": exec, "cwd": dir}),
+            serde_json::json!({"type": "watch", "id": 8, "path": dir, "exec": exec, "cwd": dir}),
+            serde_json::json!({"type": "log", "id": 10, "path": file, "exec": exec, "cwd": dir}),
+        ];
+        // The reads run concurrently with each other; the stage that would
+        // change what they see goes through a second daemon run below.
+        let stage = [
+            serde_json::json!({"type": "stage", "id": 9, "path": file, "lnum": 1, "exec": exec, "cwd": dir}),
+        ];
+        let mut replies: HashMap<u64, serde_json::Value> = HashMap::new();
+        for batch in [&requests[..], &stage[..]] {
+            let input = batch
+                .iter()
+                .map(|request| format!("{request}\n"))
+                .collect::<String>();
+            let (mut client, server) = tokio::io::duplex(256 * 1024);
+            run(input.as_bytes(), server).await.unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).await.unwrap();
+            for line in response.lines() {
+                let reply: serde_json::Value = serde_json::from_str(line).unwrap();
+                if let Some(id) = reply["id"].as_u64() {
+                    replies.insert(id, reply);
+                }
+            }
+        }
+        for id in 1..=10u64 {
+            assert!(replies.contains_key(&id), "request {id} was answered");
+        }
+        assert_eq!(replies[&1]["type"], "blame", "{}", replies[&1]);
+        assert_eq!(replies[&1]["lines"].as_array().unwrap().len(), 2);
+        assert_eq!(replies[&2]["type"], "blame_line", "{}", replies[&2]);
+        assert_eq!(replies[&2]["summary"], "initial");
+        assert_eq!(replies[&3]["type"], "status", "{}", replies[&3]);
+        assert_eq!(
+            replies[&3]["root"],
+            serde_json::Value::String(
+                std::fs::canonicalize(&repo)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            "status reports the repository root"
+        );
+        assert_eq!(replies[&4]["type"], "branch", "{}", replies[&4]);
+        assert!(!replies[&4]["head"].as_str().unwrap().is_empty());
+        assert_eq!(replies[&5]["type"], "hunks", "{}", replies[&5]);
+        assert_eq!(replies[&5]["hunks"].as_array().unwrap().len(), 1);
+        assert_eq!(replies[&6]["type"], "hunks", "{}", replies[&6]);
+        assert_eq!(
+            replies[&6]["hunks"][0]["lines"][1], "+live",
+            "the live diff reads the index through the prefix and diffs locally"
+        );
+        assert_eq!(replies[&7]["type"], "cat", "{}", replies[&7]);
+        assert_eq!(replies[&7]["lines"][0], "before");
+        assert_eq!(replies[&8]["type"], "error", "{}", replies[&8]);
+        assert!(
+            replies[&8]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unavailable for remote workspaces"),
+            "{}",
+            replies[&8]
+        );
+        assert_eq!(replies[&9]["type"], "hunk_op", "{}", replies[&9]);
+        assert_eq!(replies[&10]["type"], "log", "{}", replies[&10]);
+        // The stage went through the remote index lane and really applied.
+        let staged = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["diff", "--cached", "--name-only"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&staged.stdout).trim(),
+            "sub/sample.txt"
+        );
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    /// The version handshake advertises the prefix support, which is what the
+    /// client gates on: an older daemon would ignore `exec` and run local git
+    /// on a path that only exists somewhere else.
+    #[test]
+    fn remote_exec_is_advertised() {
+        assert_eq!(protocol_capabilities().get(CAP_REMOTE_EXEC), Some(&true));
     }
 
     /// Every reply the daemon sends is either parsed or rendered verbatim into
@@ -2535,9 +3412,15 @@ mod tests {
 
         let base = temp_fixture_dir("scratch-reap-base");
         let file = repo.join("sample.txt");
-        let diff = buffer_hunk_diff_in(&base, 7, &file.to_string_lossy(), "after\n")
-            .await
-            .expect("live diff against the index");
+        let diff = buffer_hunk_diff_in(
+            &base,
+            7,
+            &file.to_string_lossy(),
+            &GitTarget::local(repo.clone()),
+            "after\n",
+        )
+        .await
+        .expect("live diff against the index");
         assert!(
             diff.contains("+after"),
             "the live diff still reports the unsaved change: {diff}"

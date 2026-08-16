@@ -70,6 +70,12 @@ const CAP_BRANCH_SUMMARY = 'branch_summary'
 const CAP_BLAME_LINE = 'blame_line'
 const CAP_HUNK_RANGE = 'hunk_range'
 const CAP_REPO_WATCH = 'repo_watch'
+const CAP_REMOTE_EXEC = 'remote_exec'
+# How SimpleRemote names a file that lives in a remote workspace, and how this
+# plugin spells every path it hands around for one: `remote:///abs/path`.  A
+# path in that form is routed to the git of the workspace's host (see
+# Dispatch()); a bare path is a local file, exactly as before.
+const REMOTE_PREFIX = 'remote://'
 
 # =============================================================
 # Small helpers
@@ -107,14 +113,236 @@ def IsWin(): bool
   return has('win32') || has('win64')
 enddef
 
+# =============================================================
+# Remote workspaces (SimpleRemote)
+#
+# A SimpleRemote workspace is an SSH host or a Docker container.  Its files
+# reach Vim either as `remote:///abs/path` buffers (virtual mode: buftype
+# acwrite, filled asynchronously, marked with b:vimrc_remote) or, when the
+# workspace is projected through sshfs / a bind mount / an explicit mapping,
+# as ordinary local files marked with b:simpleremote_path.  Local git cannot
+# see a virtual buffer's file at all and sees a projected one only through the
+# mount, so such buffers send their requests to the git *on the workspace
+# host*: the daemon runs `<g:SimpleRemoteExecArgv()> git -C <dir> ...`.
+#
+# Nothing here requires SimpleRemote to be installed: every touch point is
+# feature-detected, and without it every buffer is local.
+# =============================================================
+def IsRemotePath(path: string): bool
+  return strpart(path, 0, len(REMOTE_PREFIX)) ==# REMOTE_PREFIX
+enddef
+
+# `/abs/path` for `remote:///abs/path`; a local path unchanged.
+def RemotePlainPath(path: string): string
+  return IsRemotePath(path) ? strpart(path, len(REMOTE_PREFIX)) : path
+enddef
+
+# The directory of a path, for both spellings.  fnamemodify(':h') is not
+# enough on its own: it turns 'remote:///top.txt' into 'remote:', so the
+# remote form is taken apart, modified as a plain path and put back together.
+def PathDir(path: string): string
+  if IsRemotePath(path)
+    return REMOTE_PREFIX .. fnamemodify(RemotePlainPath(path), ':h')
+  endif
+  return fnamemodify(path, ':h')
+enddef
+
+def JoinPath(dir: string, name: string): string
+  return dir =~# '/$' ? dir .. name : dir .. '/' .. name
+enddef
+
+# g:simplegit_remote_git: which buffers use the workspace's git.
+#   'auto'    remote:// buffers -- they have no local file (default)
+#   'always'  those, plus projected buffers marked with b:simpleremote_path,
+#             so the git of the host runs instead of local git over the mount
+#   'never'   none; remote:// buffers then have no git at all, as before
+def RemoteMode(): string
+  var mode = get(g:, 'simplegit_remote_git', 'auto')
+  return type(mode) == v:t_string && index(['auto', 'always', 'never'], mode) >= 0
+    ? mode : 'auto'
+enddef
+
+# The absolute path, on the workspace host, of the file a buffer's git work
+# is about -- or '' for a buffer whose git runs locally.
+def BufRemotePath(bufnr: number): string
+  var mode = RemoteMode()
+  if mode ==# 'never'
+    return ''
+  endif
+  var info = getbufvar(bufnr, 'vimrc_remote', {})
+  if type(info) == v:t_dict
+    var path = get(info, 'path', '')
+    if type(path) == v:t_string && path =~# '^/'
+      return path
+    endif
+  endif
+  if mode ==# 'always' && getbufvar(bufnr, '&buftype') ==# ''
+    # A projected file of the workspace that is connected *now*; the marker
+    # outlives a disconnect, and then local git over the mount is all there
+    # is again.
+    var projected = getbufvar(bufnr, 'simpleremote_path', '')
+    var workspace = get(g:, 'simpleremote_workspace', {})
+    if type(projected) == v:t_string && projected =~# '^/'
+          && type(workspace) == v:t_dict
+          && get(workspace, 'id', -1) == getbufvar(bufnr, 'simpleremote_workspace_id', -2)
+      return projected
+    endif
+  endif
+  return ''
+enddef
+
+def BufIsRemote(bufnr: number): bool
+  return bufexists(bufnr) && BufRemotePath(bufnr) !=# ''
+enddef
+
+# Whether a workspace decided anything about this buffer -- a remote:// buffer
+# or a projected file SimpleRemote marked -- regardless of whether one is
+# connected *now*.  BufIsRemote() answers "route its git remotely today";
+# this answers "what was remembered for it depends on a workspace", which is
+# what has to be forgotten when one comes, goes or is replaced.
+def BufWorkspaceTied(bufnr: number): bool
+  if !bufexists(bufnr)
+    return false
+  endif
+  var info = getbufvar(bufnr, 'vimrc_remote', {})
+  if type(info) == v:t_dict && !empty(info)
+    return true
+  endif
+  var projected = getbufvar(bufnr, 'simpleremote_path', '')
+  if type(projected) == v:t_string && projected !=# ''
+    return true
+  endif
+  return IsRemotePath(bufname(bufnr))
+enddef
+
+# A buffer git has something to say about: an ordinary file buffer, or a
+# remote one -- whose buftype is acwrite and which every buftype gate used to
+# skip.
+def IsFileBuffer(bufnr: number): bool
+  # getbufvar() answers '' for a buffer that does not exist, which reads as
+  # "an ordinary file buffer"; ask first.
+  return bufexists(bufnr)
+    && (getbufvar(bufnr, '&buftype') ==# '' || BufIsRemote(bufnr))
+enddef
+
+# The path a buffer's requests name: a readable local file, or the
+# `remote:///abs/path` of a remote one.  '' for anything else, which is what
+# switches every feature off for that buffer.
 def BufFilePath(bufnr: number): string
-  if !bufexists(bufnr) || getbufvar(bufnr, '&buftype') !=# ''
+  if !bufexists(bufnr)
+    return ''
+  endif
+  var remote = BufRemotePath(bufnr)
+  if remote !=# ''
+    return REMOTE_PREFIX .. remote
+  endif
+  if getbufvar(bufnr, '&buftype') !=# ''
     return ''
   endif
   # getbufinfo names are absolute, unlike bufname(), which would resolve
   # relative to whatever the current directory happens to be by now.
   var name = get(get(getbufinfo(bufnr), 0, {}), 'name', '')
   return name !=# '' && filereadable(name) ? name : ''
+enddef
+
+# Reasons remote git was refused, so each is said once rather than on every
+# cursor rest.  Cleared when the workspace changes.
+var s_remote_warned: dict<bool> = {}
+
+# Why a remote request cannot go out right now, or '' when it can.  Decided
+# per request rather than once: the daemon's capabilities arrive with its
+# handshake, and SimpleRemote's transport comes and goes with the connection.
+def RemoteUnavailable(): string
+  if !exists('*g:SimpleRemoteExecArgv')
+    return 'remote git needs SimpleRemote (g:SimpleRemoteExecArgv)'
+  endif
+  var workspace = get(g:, 'simpleremote_workspace', {})
+  if type(workspace) != v:t_dict || empty(workspace)
+    # Deliberately first among the real obstacles, and the one reason that is
+    # never announced: between a disconnect and the next connection every
+    # remote buffer still asks, and none of that is news to whoever
+    # disconnected.
+    return 'no SimpleRemote workspace is connected'
+  endif
+  # A probe that has finished always reports a `git` key -- empty when the
+  # host has none.  While it is still in flight the dictionary holds only
+  # {status: -1}, and without a runtime it is empty; neither says anything
+  # about git, so neither refuses the request.
+  var probe = get(workspace, 'probe', {})
+  if type(probe) == v:t_dict && has_key(probe, 'git') && get(probe, 'git', '') ==# ''
+    return 'git is not installed on the remote host'
+  endif
+  # Last: the transport is what a user can act on, and an old daemon is a
+  # reason worth naming only once the rest is in place.
+  if !simplegit#core#HasCap(CAP_REMOTE_EXEC)
+    return 'remote git needs a newer daemon; rerun ./install.sh'
+  endif
+  return ''
+enddef
+
+def RemoteExecArgv(): list<string>
+  var argv = call('g:SimpleRemoteExecArgv', [])
+  return type(argv) == v:t_list ? argv : []
+enddef
+
+# Refuse a remote request the way the daemon would: the error reaches
+# OnRequestError() *after* the caller has recorded the request as in flight,
+# so the same bookkeeping that handles a daemon error -- the failure caches
+# that stop a cursor rest from re-asking, the released view reservation, the
+# reset commit buffer -- handles this one too.  Said once per reason; an
+# interactive command still hears it every time it asks.
+def RefuseRemote(ctx: dict<any>, reason: string)
+  var deliver: dict<any> = copy(ctx)
+  if !has_key(s_remote_warned, reason)
+    s_remote_warned[reason] = true
+    # A disconnect explains itself; the rest is worth one line.
+    if reason !~# 'no SimpleRemote workspace'
+      Warn(reason)
+    endif
+    deliver.interactive = false
+  endif
+  # Always from a timer, never inline: the caller marks its request as in
+  # flight only after Dispatch() returns, so an error delivered before that
+  # would leave the mark behind and the buffer would never ask again.  The
+  # supervisor arms a timer for every request it sends anyway
+  # (simplegit#core#Request), so this needs nothing a request did not.
+  timer_start(0, (_) => OnRequestError(deliver, reason))
+enddef
+
+# Requests whose `path` is a repository directory rather than a file in one.
+const DIR_REQUEST_TYPES = ['status', 'branch', 'watch', 'file_op', 'commit',
+  'commit_message']
+
+# Attach the workspace transport to a request whose path is remote: the exec
+# prefix, the directory git runs in (the daemon must not guess it from the
+# local filesystem) and the plain paths the git on the other side expects.
+# False when it cannot be sent, in which case the refusal has been delivered.
+def AttachRemote(wire: dict<any>, ctx: dict<any>): bool
+  var reason = RemoteUnavailable()
+  var argv: list<string> = reason ==# '' ? RemoteExecArgv() : []
+  if reason ==# '' && empty(argv)
+    reason = 'SimpleRemote has no argv-safe transport for this workspace'
+  endif
+  if reason !=# ''
+    RefuseRemote(ctx, reason)
+    return false
+  endif
+  var dir: string = get(ctx, 'dir', '')
+  if type(dir) != v:t_string || dir ==# ''
+    # The daemon must be told where git runs; it cannot stat a path on the
+    # other machine to find out.  A repository-wide request names that
+    # directory as its path, everything else names a file inside it -- and
+    # only the request type can tell the two apart here.
+    dir = index(DIR_REQUEST_TYPES, get(wire, 'type', '')) >= 0
+      ? wire.path : PathDir(wire.path)
+  endif
+  wire.exec = argv
+  wire.cwd = RemotePlainPath(dir)
+  wire.path = RemotePlainPath(wire.path)
+  if type(get(wire, 'file', v:null)) == v:t_string && IsRemotePath(wire.file)
+    wire.file = RemotePlainPath(wire.file)
+  endif
+  return true
 enddef
 
 def ShortSha(sha: string): string
@@ -280,10 +508,14 @@ def Dispatch(req: dict<any>, ctx: dict<any>): bool
     # "daemon unavailable" warning at the call site.
     return true
   endif
-  var id = NextId()
   # Copy into a dict<any>: call sites pass all-string literals whose inferred
   # type would reject the numeric id.
   var wire: dict<any> = extend({}, req)
+  if IsRemotePath(get(wire, 'path', '')) && !AttachRemote(wire, ctx)
+    # Refused and reported through the error path; nothing went on the wire.
+    return true
+  endif
+  var id = NextId()
   wire.id = id
   s_pending[string(id)] = ctx
   if !SendRaw(wire)
@@ -753,7 +985,15 @@ export def ScheduleLineBlame()
   if s_blame_timer != 0
     timer_stop(s_blame_timer)
   endif
-  s_blame_timer = timer_start(ConfNum('simplegit_blame_delay', 350), (_) => {
+  # A remote buffer's annotation is one SSH round trip per cursor rest, so it
+  # waits longer before asking: a cursor merely passing through a line then
+  # costs nothing.  Latency itself is not consulted -- the probe measures a
+  # shell script once at connect time -- one honest knob is easier to reason
+  # about than a threshold that moves.
+  var delay = BufIsRemote(bufnr('%'))
+    ? ConfNum('simplegit_remote_blame_delay', 750)
+    : ConfNum('simplegit_blame_delay', 350)
+  s_blame_timer = timer_start(delay, (_) => {
     s_blame_timer = 0
     ShowLineBlameNow()
   })
@@ -794,7 +1034,7 @@ def RefreshVisibleGitState(repo_filter: string = '')
     s_repo_token_cache = {}
   endif
   for win in getwininfo()
-    if getbufvar(win.bufnr, '&buftype') !=# ''
+    if !IsFileBuffer(win.bufnr)
       continue
     endif
     if repo_filter !=# '' && BufRepoToken(win.bufnr) !=# repo_filter
@@ -1177,7 +1417,7 @@ def ViewContext(kind: string, path: string, target: string): dict<any>
   endif
   s_view_latest[target] = s_view_generation
   var dir = path ==# '' ? getcwd()
-    : isdirectory(path) ? path : fnamemodify(path, ':h')
+    : isdirectory(path) ? path : PathDir(path)
   return {
     kind: kind,
     interactive: true,
@@ -1209,7 +1449,7 @@ def ViewStillWanted(ctx: dict<any>): bool
   # and possibly a different repository -- than the one this reply describes.
   var origin_path = BufFilePath(get(ctx, 'origin_bufnr', -1))
   if origin_path !=# ''
-        && RepoToken(fnamemodify(origin_path, ':h')) !=# get(ctx, 'repo_token', '')
+        && RepoToken(PathDir(origin_path)) !=# get(ctx, 'repo_token', '')
     DebugLog('discarded ' .. get(ctx, 'kind', 'view') .. ' reply after its repository changed')
     return false
   endif
@@ -2058,7 +2298,12 @@ export def ScheduleHunks()
   if s_hunk_timer != 0
     timer_stop(s_hunk_timer)
   endif
-  s_hunk_timer = timer_start(ConfNum('simplegit_hunk_delay', 300), (_) => {
+  # A remote live diff reads the index through the workspace transport (two
+  # round trips) before diffing locally; give the typing more rest first.
+  var delay = BufIsRemote(bufnr('%'))
+    ? ConfNum('simplegit_remote_hunk_delay', 750)
+    : ConfNum('simplegit_hunk_delay', 300)
+  s_hunk_timer = timer_start(delay, (_) => {
     s_hunk_timer = 0
     var bufnr = bufnr('%')
     if get(get(s_hunk_cache, string(bufnr), {}), 'failed', false)
@@ -2086,6 +2331,17 @@ enddef
 # Repository status
 # =============================================================
 def RepoToken(dir: string): string
+  if IsRemotePath(dir)
+    # A remote directory: there is no local filesystem to walk for a .git
+    # marker, and asking the daemon would make every cache lookup a round
+    # trip.  So each remote directory is its own repository as far as the
+    # caches are concerned -- the same conservative identity a marker-less
+    # local path gets below -- under the remote:// namespace, so a remote
+    # checkout at /home/me/proj can never share a branch or a watch with a
+    # local one at the same path.
+    var plain = substitute(RemotePlainPath(dir), '/\+$', '', '')
+    return REMOTE_PREFIX .. plain .. '/'
+  endif
   # Match git -C's physical-path semantics without spawning Git on every UI
   # callback.  The nearest .git directory or gitfile distinguishes ordinary
   # worktrees, linked worktrees and submodules; a marker-less path keeps the
@@ -2249,7 +2505,8 @@ def CancelStatusRefresh()
   s_status_refresh_excluded_repos = {}
 enddef
 
-def RefreshOpenStatus(repo_filter: string = '', excluded_repos: dict<bool> = {})
+def RefreshOpenStatus(repo_filter: string = '', excluded_repos: dict<bool> = {},
+    remote_only: bool = false)
   var seen: dict<bool> = {}
   for win in getwininfo()
     if bufname(win.bufnr) !=# STATUS_BUF || has_key(seen, string(win.bufnr))
@@ -2263,6 +2520,7 @@ def RefreshOpenStatus(repo_filter: string = '', excluded_repos: dict<bool> = {})
     endif
     if (repo_filter !=# '' && repo !=# repo_filter)
           || has_key(excluded_repos, repo)
+          || (remote_only && !IsRemotePath(dir))
       continue
     endif
     var source: dict<any> = {
@@ -2388,6 +2646,10 @@ def OnStatus(ctx: dict<any>, ev: dict<any>)
     PublishRepo(repo)
   endif
   var dir = get(ctx, 'dir', getcwd())
+  var root = get(ev, 'root', '')
+  if type(root) != v:t_string
+    root = ''
+  endif
   var display = ['## ' .. (branch ==# '' ? '(no branch)' : branch)
     .. UpstreamSuffix(ahead, behind)]
   var paths: list<string> = ['']
@@ -2436,6 +2698,8 @@ def OnStatus(ctx: dict<any>, ev: dict<any>)
     endif
     setbufvar(target_bufnr, 'simplegit_paths', paths)
     setbufvar(target_bufnr, 'simplegit_dir', dir)
+    setbufvar(target_bufnr, 'simplegit_root', root)
+    setbufvar(target_bufnr, 'simplegit_remote', IsRemotePath(dir))
     setbufvar(target_bufnr, 'simplegit_repo_token', RepoToken(dir))
     setbufvar(target_bufnr, '&modifiable', 0)
     var target_winid = get(ctx, 'status_winid', 0)
@@ -2490,6 +2754,12 @@ def OnStatus(ctx: dict<any>, ev: dict<any>)
   setlocal nomodifiable nowrap
   b:simplegit_paths = paths
   b:simplegit_dir = dir
+  # The repository root the entries are relative to, as git on the daemon's
+  # side reported it (empty from a daemon that predates the field).  A remote
+  # status view can only open its entries through this: there is no local
+  # git to ask.
+  b:simplegit_root = root
+  b:simplegit_remote = IsRemotePath(dir)
   b:simplegit_repo_token = RepoToken(dir)
 
   syntax match SimpleGitStatusBranch /^##.*/
@@ -2586,8 +2856,20 @@ enddef
 # it; :SimpleGitCommit bound to `c` in the status window depends on this.
 def CommitRepoDir(): string
   var owned = get(b:, 'simplegit_dir', '')
-  if type(owned) == v:t_string && owned !=# '' && isdirectory(owned)
+  if type(owned) == v:t_string && owned !=# ''
+        && (IsRemotePath(owned) || isdirectory(owned))
     return owned
+  endif
+  return CurrentBufferDir()
+enddef
+
+# The directory the current buffer's repository work is about: the remote
+# directory of a remote buffer, the file's directory for a local one, and the
+# working directory when the buffer has no file.
+def CurrentBufferDir(): string
+  var bufnr = bufnr('%')
+  if BufIsRemote(bufnr)
+    return PathDir(BufFilePath(bufnr))
   endif
   var dir = expand('%:p:h')
   if dir ==# '' || !isdirectory(dir)
@@ -2656,6 +2938,7 @@ export def Commit(amend: bool = false)
   # retyped; it is fetched asynchronously and prepended when it arrives.
   setline(1, body)
   b:simplegit_dir = dir
+  b:simplegit_remote = IsRemotePath(dir)
   b:simplegit_amend = amend
   b:simplegit_commit_generation = s_commit_generation
   b:simplegit_commit_pending = false
@@ -2802,13 +3085,33 @@ def OnFileOp(ctx: dict<any>, ev: dict<any>)
   RefreshStatusAfterMutation(ctx, dir, get(ctx, 'lnum', 1))
 enddef
 
+# The root the status entries are relative to.  The status reply carries it;
+# only a daemon that predates the field leaves it empty, and then local git
+# is asked -- which is fine for a local repository and impossible for a
+# remote one.
 def StatusRoot(dir: string): string
-  # The daemon reports paths relative to the repository root.
+  var reported = get(b:, 'simplegit_root', '')
+  if type(reported) == v:t_string && reported !=# ''
+    return reported
+  endif
+  if IsRemotePath(dir)
+    return ''
+  endif
   var root = system('git -C ' .. shellescape(dir) .. ' rev-parse --show-toplevel')
   if v:shell_error != 0
     return dir
   endif
   return trim(root)
+enddef
+
+# The local file behind a remote path when the workspace is projected (sshfs,
+# a bind mount, an explicit mapping), or '' in virtual mode.
+def LocalPathFor(remote_path: string): string
+  if !exists('*g:SimpleRemoteLocalPath')
+    return ''
+  endif
+  var local = call('g:SimpleRemoteLocalPath', [remote_path])
+  return type(local) == v:t_string ? local : ''
 enddef
 
 def StatusOpen(diff_it: bool)
@@ -2818,7 +3121,18 @@ def StatusOpen(diff_it: bool)
   if lnum > len(paths) || paths[lnum - 1] ==# ''
     return
   endif
-  var full = StatusRoot(dir) .. '/' .. paths[lnum - 1]
+  var root = StatusRoot(dir)
+  if root ==# ''
+    Warn('the daemon did not report the repository root; rerun ./install.sh')
+    return
+  endif
+  var full = JoinPath(root, paths[lnum - 1])
+  if IsRemotePath(dir)
+    # A projected workspace has a real file to edit; a virtual one opens the
+    # remote:// buffer, which SimpleRemote fills.
+    var local = LocalPathFor(full)
+    full = local !=# '' ? local : REMOTE_PREFIX .. full
+  endif
   close
   execute 'edit ' .. fnameescape(full)
   if diff_it
@@ -2832,10 +3146,7 @@ export def Status()
     StatusRefresh()
     return
   endif
-  var dir = expand('%:p:h')
-  if dir ==# '' || !isdirectory(dir)
-    dir = getcwd()
-  endif
+  var dir = CurrentBufferDir()
   if !Dispatch({type: 'status', path: dir},
       InitialStatusContext(dir))
     Warn('daemon unavailable; run ./install.sh')
@@ -2899,7 +3210,7 @@ enddef
 var s_repo_token_cache: dict<dict<string>> = {}
 
 def BufRepoToken(bufnr: number): string
-  if bufnr <= 0 || !bufexists(bufnr) || getbufvar(bufnr, '&buftype') !=# ''
+  if bufnr <= 0 || !bufexists(bufnr) || !IsFileBuffer(bufnr)
     return ''
   endif
   # A wiped buffer number is handed out again, so the name the answer was
@@ -2919,7 +3230,7 @@ def BufRepoToken(bufnr: number): string
     # remember: the answer may still change once it is written.
     return ''
   endif
-  var token = RepoToken(fnamemodify(path, ':h'))
+  var token = RepoToken(PathDir(path))
   if len(s_repo_token_cache) >= 256 && !has_key(s_repo_token_cache, key)
     remove(s_repo_token_cache, keys(s_repo_token_cache)[0])
   endif
@@ -2958,10 +3269,13 @@ def EnsureBranch(bufnr: number)
   if repo ==# '' || has_key(s_branch_cache, repo) || has_key(s_branch_inflight, repo)
     return
   endif
+  var dir = PathDir(BufFilePath(bufnr))
+  # `dir` says the path *is* a directory: a remote request needs to name the
+  # directory git runs in explicitly, the daemon cannot stat it to find out.
   var ctx: dict<any> = {kind: 'branch', interactive: false, repo_token: repo,
-    branch_generation: s_branch_generation,
+    dir: dir, branch_generation: s_branch_generation,
     requires_capability: CAP_BRANCH_SUMMARY}
-  if Dispatch({type: 'branch', path: fnamemodify(BufFilePath(bufnr), ':h')}, ctx)
+  if Dispatch({type: 'branch', path: dir}, ctx)
     # Also set when the capability gate refused to send: an older daemon has
     # no branch data to give, and retrying on every buffer entry would only
     # repeat that verdict.  A restart clears this through ClearPending().
@@ -3020,10 +3334,10 @@ def EnsureWatch(bufnr: number)
     return
   endif
   var interval = ConfNum('simplegit_watch_interval', 2000)
+  var dir = PathDir(BufFilePath(bufnr))
   var ctx: dict<any> = {kind: 'watch', interactive: false, repo_token: repo,
-    requires_capability: CAP_REPO_WATCH}
-  if Dispatch({type: 'watch', path: fnamemodify(BufFilePath(bufnr), ':h'),
-      interval_ms: interval}, ctx)
+    dir: dir, requires_capability: CAP_REPO_WATCH}
+  if Dispatch({type: 'watch', path: dir, interval_ms: interval}, ctx)
     # Set even when the capability gate refused: an older daemon cannot watch
     # anything, and asking again on every BufEnter would only repeat that.
     s_watch_requested[repo] = true
@@ -3036,6 +3350,12 @@ def OnWatch(ctx: dict<any>, ev: dict<any>)
   if type(root) != v:t_string || root ==# '' || repo ==# ''
     DebugLog('ignored malformed watch response')
     return
+  endif
+  # A remote acknowledgement (no daemon sends one today: the watch is refused
+  # for remote workspaces) is keyed under its namespace, so a repo_change
+  # naming a bare root can only ever hit the local repository of that name.
+  if IsRemotePath(repo)
+    root = REMOTE_PREFIX .. root
   endif
   if len(s_watch_roots) >= 64 && !has_key(s_watch_roots, root)
     remove(s_watch_roots, keys(s_watch_roots)[0])
@@ -3112,7 +3432,7 @@ def PublishRepo(repo: string)
     return
   endif
   for win in getwininfo()
-    if getbufvar(win.bufnr, '&buftype') ==# '' && BufRepoToken(win.bufnr) ==# repo
+    if IsFileBuffer(win.bufnr) && BufRepoToken(win.bufnr) ==# repo
       PublishStatusDict(win.bufnr)
     endif
   endfor
@@ -3175,6 +3495,133 @@ export def StatusLine(buf: number = 0): string
     endif
   endfor
   return join(parts, ' ')
+enddef
+
+# =============================================================
+# SimpleRemote events
+# =============================================================
+
+# Forget the branches of every remote repository and abandon the reads in
+# flight for them; local repositories keep theirs.
+def InvalidateRemoteBranches()
+  s_branch_generation += 1
+  filter(s_branch_cache, (key, _) => !IsRemotePath(key))
+  # Global generation, so no reply on the wire can be trusted any more; the
+  # local repositories that kept their value simply do not re-ask.
+  s_branch_inflight = {}
+enddef
+
+# Everything remembered about remote buffers and repositories.  A workspace
+# came, went or moved: what was cached describes a host that may no longer be
+# the one behind these paths, and the in-flight marks would otherwise keep a
+# buffer from asking again once the new connection is ready.
+def ForgetRemoteState()
+  s_remote_warned = {}
+  InvalidateRemoteBranches()
+  # Tokens under the namespace of the workspace that is going away.
+  filter(s_repo_token_cache, (_, entry) => !IsRemotePath(get(entry, 'token', '')))
+  filter(s_watch_requested, (key, _) => !IsRemotePath(key))
+  filter(s_watch_roots, (key, _) => !IsRemotePath(key))
+  for info in getbufinfo()
+    if !BufWorkspaceTied(info.bufnr)
+      continue
+    endif
+    var key = string(info.bufnr)
+    # A projected buffer keeps its name and its number across a disconnect
+    # while its repository token flips between the workspace namespace and
+    # the local path; the token cache is keyed by the name, so it cannot
+    # notice that by itself.
+    if has_key(s_repo_token_cache, key)
+      remove(s_repo_token_cache, key)
+    endif
+    InvalidateBlame(info.bufnr)
+    InvalidateHunks(info.bufnr)
+    for store in [s_blame_inflight, s_hunk_inflight, s_hunk_stale]
+      if has_key(store, key)
+        remove(store, key)
+      endif
+    endfor
+    filter(s_line_blame_inflight, (line_key, _) => line_key !~# '^' .. key .. ':')
+  endfor
+enddef
+
+# User SimpleRemoteConnected / SimpleRemoteWorkspaceChanged /
+# SimpleRemoteDisconnected: the workspace behind every remote:// path changed
+# (a switch is Disconnected, Connecting, Connected in that order), or a
+# projection appeared that turns local files into workspace files.  Drop what
+# was cached for it and read the visible buffers again -- after a disconnect
+# that read is refused quietly and remembered as such, after a connect it
+# succeeds against the new host.
+export def OnRemoteWorkspace()
+  ForgetRemoteState()
+  if !s_enabled
+    return
+  endif
+  RefreshVisibleGitState()
+enddef
+
+# User SimpleRemoteBufferRead: a remote:// buffer was filled -- on open, after
+# a reload, after a workspace switch.  BufReadPost does not fire for these
+# buffers (their read is a BufReadCmd), and it is only now that b:vimrc_remote
+# marks the buffer as remote, so this is the buffer's "you were (re)read".
+export def OnRemoteBufferRead()
+  if !s_enabled
+    return
+  endif
+  var event = get(g:, 'simpleremote_event', {})
+  var bufnr = type(event) == v:t_dict ? get(event, 'bufnr', -1) : -1
+  if type(bufnr) != v:t_number || bufnr <= 0 || !bufexists(bufnr)
+    return
+  endif
+  if bufnr == bufnr('%')
+    RefreshHunks(true)
+    ScheduleLineBlame()
+    return
+  endif
+  # Filled while another window was current: refresh it in place if it is
+  # showing; a hidden buffer is read when it is entered, as usual.
+  InvalidateHunks(bufnr)
+  InvalidateBlame(bufnr)
+  if bufwinid(bufnr) == -1
+    return
+  endif
+  EnsureBranch(bufnr)
+  PublishStatusDict(bufnr)
+  if SignsEnabled()
+    RequestHunks(bufnr, 'signs', false)
+  endif
+enddef
+
+# User SimpleRemoteFilesChanged: SimpleRemote created, changed or deleted
+# workspace files outside a buffer write (its tree, an upload, an API write).
+# The daemon's repository watch cannot see a remote git directory, so this is
+# the remote counterpart of ShellCmdPost: re-read what is visible of the
+# remote repositories and refresh their status views.  Which repository each
+# change belongs to is not known here (a remote token is a directory, see
+# RepoToken()), so every remote buffer is refreshed; the events are rare.
+export def OnRemoteFilesChanged()
+  if !s_enabled
+    return
+  endif
+  var event = get(g:, 'simpleremote_event', {})
+  var changes = type(event) == v:t_dict ? get(event, 'changes', []) : []
+  if type(changes) == v:t_list && empty(changes)
+    return
+  endif
+  InvalidateRemoteBranches()
+  for win in getwininfo()
+    if !BufIsRemote(win.bufnr)
+      continue
+    endif
+    InvalidateBlame(win.bufnr)
+    InvalidateHunks(win.bufnr)
+    EnsureBranch(win.bufnr)
+    RequestHunks(win.bufnr, 'signs', false)
+  endfor
+  ScheduleLineBlame()
+  if ConfBool('simplegit_status_auto_refresh', true)
+    RefreshOpenStatus('', {}, true)
+  endif
 enddef
 
 # =============================================================
@@ -3292,12 +3739,44 @@ export def Health()
           : !simplegit#core#HasCap(CAP_REPO_WATCH) ? 'unavailable (rerun ./install.sh)'
           : len(s_watch_roots) .. ' repositories, every '
             .. ConfNum('simplegit_watch_interval', 2000) .. 'ms')
+  echo '  remote git:     ' .. RemoteHealth()
   echo '  cached buffers: ' .. len(s_blame_cache) .. ' blame, ' .. len(s_hunk_cache) .. ' hunks, '
         .. len(s_branch_cache) .. ' branches'
   echo '  pending:        ' .. len(s_pending)
   echo '  crashes:        ' .. h.crashes .. ' (restarts: ' .. h.restarts .. ')'
         .. (h.breaker_open ? ' — auto-restart disabled, run :SimpleGitRestart' : '')
   echo '  last message:   ' .. (s_last_error ==# '' ? '(none)' : s_last_error)
+enddef
+
+# One line for :SimpleGitHealth: whether a remote:// buffer would get its git
+# from the workspace host right now, and if not, why.
+def RemoteHealth(): string
+  var mode = RemoteMode()
+  if mode ==# 'never'
+    return 'off (g:simplegit_remote_git = never)'
+  endif
+  if !s_daemon_ready
+    return 'unknown (handshake pending)'
+  endif
+  var reason = RemoteUnavailable()
+  if reason ==# '' && empty(RemoteExecArgv())
+    reason = 'SimpleRemote has no argv-safe transport for this workspace'
+  endif
+  if reason !=# ''
+    return 'unavailable (' .. reason .. ')'
+  endif
+  var workspace = get(g:, 'simpleremote_workspace', {})
+  var count = 0
+  for info in getbufinfo()
+    if BufIsRemote(info.bufnr)
+      count += 1
+    endif
+  endfor
+  return printf('%s:%s via %s, %d remote buffer%s%s',
+    get(workspace, 'kind', '?'), get(workspace, 'target', '?'),
+    fnamemodify(get(RemoteExecArgv(), 0, ''), ':t'),
+    count, count == 1 ? '' : 's',
+    mode ==# 'always' ? ' (projected buffers too)' : '')
 enddef
 
 export def DebugStatus()

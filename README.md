@@ -16,6 +16,7 @@ Like the other `simple*` plugins, rendering stays in Vim9script and all git work
 - **Line blame popup** (`:SimpleGitBlameLine`): commit, author, date, and summary for the line under the cursor.
 - **Hunk handling** (GitGutter style): `+`/`~`/`_` signs for changes against the index — updated live while you type, without saving — plus hunk navigation (`:SimpleGitHunkNext`/`Prev`), a diff preview popup, and per-hunk stage (`:SimpleGitHunkStage`) and undo (`:SimpleGitHunkUndo`). Stage, revert and preview also take a range, so a visual selection acts on every hunk it touches, and `ih` / `ah` select a hunk as a text object.
 - **Statusline API**: `simplegit#StatusLine()` renders `main ↑2 ↓1 +12 ~3 -1`; `simplegit#StatusDict()`, `simplegit#Head()` and `simplegit#HunkSummary()` expose the same data, and every file buffer carries `b:simplegit_status_dict`, sign column on or off. All of it reads caches the plugin already keeps — not the daemon and not the filesystem — so it is safe on the redraw path; no statusline plugin needs to run its own `git`.
+- **Remote workspaces** (SimpleRemote): a `remote:///path` buffer, which has no local file at all, gets the same blame, history, hunks, status and commits as any other — the daemon runs `<simpleremote exec prefix> git -C <remote dir> …` instead of its own local git, so nothing is reimplemented for SSH or Docker. Prefixed requests use their own concurrency pool and index queue, so a stalled connection cannot hold up local repositories. Optional (`g:simplegit_remote_git`) for projected sshfs/bind-mount workspaces too. See [Remote workspaces](#remote-workspaces).
 - Asynchronous daemon with a version/capability handshake, request correlation, concurrency limiting and timeouts; the live diff hands unsaved buffer text to git through a private scratch directory created and removed around that one diff (0700, files 0600); index-changing requests run through a FIFO lane, while UI replies are tied to their initiating tab/window/repository and never pull focus back after you move on. `:SimpleGitHealth` exposes the negotiated support.
 
 ## Requirements
@@ -133,6 +134,18 @@ Default mappings (only installed when the keys are free; disable with `let g:sim
 | `<leader>gu` | Undo hunk (visual: every hunk in the selection) |
 | `ih` / `ah` | Hunk text object, without / with the blank lines below it |
 
+## Remote workspaces
+
+With [SimpleRemote](https://github.com/beamiter/simpleremote) connected to an SSH host or a Docker container, Simplegit runs git **on that host**. Every request carries the argv prefix from `g:SimpleRemoteExecArgv()` and the directory git must run in, and the daemon executes `<prefix> git -C <remote dir> …`; the daemon itself stays local and keeps owning the timeouts, concurrency and parsing.
+
+- Virtual-mode buffers (`remote:///abs/path`, `buftype=acwrite`) get the inline annotation, the blame sidebar, history, the commit graph, diff, show, the sign column with stage/undo, the status window, commits and `b:simplegit_status_dict` — everything a local buffer gets.
+- Repository identity is namespaced as `remote://<dir>`, so a checkout at the same absolute path on both machines never shares a branch, a watch or a status view.
+- The repository watch is refused for a workspace (the daemon cannot stat a git directory that lives elsewhere); remote buffers are re-read on `User SimpleRemoteFilesChanged` instead, alongside `FocusGained`/`ShellCmdPost`.
+- Debounces are longer, because each request is a round trip: `g:simplegit_remote_blame_delay` and `g:simplegit_remote_hunk_delay` (750 ms each). The live buffer-vs-index diff reads the index through the workspace and diffs locally, so unsaved text is never shipped across.
+- `g:simplegit_remote_git`: `'auto'` (default, `remote://` buffers only), `'always'` (projected sshfs / bind-mount / mapped files as well, so `git status` stops walking the mount), `'never'`.
+
+None of this requires SimpleRemote: without it every buffer is local. When remote git cannot be used — no workspace, no git on the host, no argv-safe transport, or a daemon that predates the `remote_exec` capability — the reason is said once and shown by `:SimpleGitHealth`, and nothing is sent. See `:help simplegit-remote`.
+
 ## Configuration
 
 ```vim
@@ -152,13 +165,16 @@ let g:simplegit_status_auto_refresh = 1 " refresh open status after Focus/Shell
 let g:simplegit_status_refresh_delay = 150 " external status refresh debounce
 let g:simplegit_live_max_bytes = 1048576 " live-diff buffer size cap
 let g:simplegit_daemon_path = ''       " explicit daemon binary path
+let g:simplegit_remote_git = 'auto'    " workspace git: auto | always | never
+let g:simplegit_remote_blame_delay = 750 " annotation debounce, remote buffers
+let g:simplegit_remote_hunk_delay = 750  " live-diff debounce, remote buffers
 ```
 
 See `:help simplegit` for the full reference, highlight groups, and troubleshooting.
 
 ## Development
 
-`make check` runs the quality gate: `cargo fmt --check`, `cargo clippy -D warnings`, Rust protocol/parser/FIFO tests, the vendored simplecore bundle checksum, and headless Vim suites — smoke, real-Git integration, commit flow, old-daemon capability and status races, the statusline API, per-line blame, asynchronously opened views, hunk navigation, the supervisor regression suite and a `:defcompile` of every Vim9 function. CI runs the same gate plus an installer/handshake verification; its MSRV job derives the expected toolchain from `Cargo.toml`.
+`make check` runs the quality gate: `cargo fmt --check`, `cargo clippy -D warnings`, Rust protocol/parser/FIFO tests, the vendored simplecore bundle checksum, and headless Vim suites — smoke, real-Git integration, commit flow, old-daemon capability and status races, the statusline API, per-line blame, asynchronously opened views, hunk navigation, remote workspaces, the supervisor regression suite and a `:defcompile` of every Vim9 function. CI runs the same gate plus an installer/handshake verification; its MSRV job derives the expected toolchain from `Cargo.toml`.
 
 ## License
 

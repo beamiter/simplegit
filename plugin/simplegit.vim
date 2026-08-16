@@ -56,6 +56,15 @@ g:simplegit_live_max_bytes = get(g:, 'simplegit_live_max_bytes', 1024 * 1024)
 # (a checkout in another terminal) instead of waiting for FocusGained.
 g:simplegit_watch = ConfigFlag('simplegit_watch', 1)
 g:simplegit_watch_interval = get(g:, 'simplegit_watch_interval', 2000)
+# SimpleRemote workspaces: which buffers run git on the workspace host.
+#   'auto'   remote:// buffers (they have no local file)   -- default
+#   'always' also projected buffers (b:simpleremote_path) instead of local git
+#            over the sshfs / bind mount
+#   'never'  none (remote:// buffers then have no git at all)
+g:simplegit_remote_git = get(g:, 'simplegit_remote_git', 'auto')
+# Debounces for remote buffers: each request is a round trip to the host.
+g:simplegit_remote_blame_delay = get(g:, 'simplegit_remote_blame_delay', 750)
+g:simplegit_remote_hunk_delay = get(g:, 'simplegit_remote_hunk_delay', 750)
 g:simplegit_enable_default_mappings = ConfigFlag('simplegit_enable_default_mappings', 1)
 
 # =============================================================
@@ -211,6 +220,16 @@ augroup SimpleGit
   autocmd FocusGained,ShellCmdPost * simplegit#OnExternalChange()
   autocmd BufDelete * simplegit#OnBufClose(expand('<abuf>')->str2nr())
   autocmd VimLeavePre * try | simplegit#Stop() | catch | endtry
+  # SimpleRemote workspaces.  Harmless without SimpleRemote: nothing fires
+  # them.  A remote:// buffer is filled by a BufReadCmd, so BufReadPost never
+  # fires for it and SimpleRemoteBufferRead is its "read" instead; the
+  # connection events invalidate what was cached for the previous host; the
+  # files-changed event stands in for the repository watch, which cannot see a
+  # remote git directory.
+  autocmd User SimpleRemoteBufferRead simplegit#OnRemoteBufferRead()
+  autocmd User SimpleRemoteConnected,SimpleRemoteWorkspaceChanged,SimpleRemoteDisconnected
+        \ simplegit#OnRemoteWorkspace()
+  autocmd User SimpleRemoteFilesChanged simplegit#OnRemoteFilesChanged()
 augroup END
 
 if g:simplegit_auto_enable && v:vim_did_enter

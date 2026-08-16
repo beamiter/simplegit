@@ -1,6 +1,46 @@
 # Changelog
 
-## Unreleased - 2026-08-08
+## Unreleased - 2026-08-16
+
+### 新增:SimpleRemote 工作区里的 git 跑在远端主机上
+
+- 虚拟模式的 `remote:///abs/path` buffer(buftype=acwrite,本机根本没有对应文件)
+  以前所有功能都是静默关闭的:`BufFilePath()` 要求 `&buftype == ''` 且
+  `filereadable()`,两条都不成立。投影模式(sshfs / docker-bind / local-map)虽然
+  能用,但 `git status --porcelain=v2` 和每次按键的 live diff 都要走挂载点。
+- daemon 的 git argv 只在 `git_command()` 一处拼装,所以整条链路只需要一个接缝:
+  每个带 path 的请求新增两个可选字段——`exec`(argv 前缀,空表示本机 git)与
+  `cwd`(git 的工作目录;远端路径不能靠本机 `is_dir()` 去猜)。有前缀时执行
+  `<exec…> git -C <cwd> <颜色开关> <子命令>`,不设 `current_dir`,也不动
+  `GIT_OPTIONAL_LOCKS` / `GIT_DIR` 那套环境变量——它们只会落到本机的 ssh/docker
+  客户端上,永远到不了它启动的 git。`run_git` / `run_git_coded` /
+  `run_git_with_input`(`commit -F -` 与 `apply` 走 stdin)和全部 handler 一起改走
+  `GitTarget`;live diff 只有读 index 的那两步走前缀,`diff --no-index` 的两个临时
+  文件在本机,仍由本机 git 比。
+- Vim 侧只在 `Dispatch()` 一处附加:`BufFilePath()` 现在为 remote buffer 返回
+  `remote:///abs/path`,请求路径本身就是标记,`AttachRemote()` 填上
+  `g:SimpleRemoteExecArgv()` 与远端目录,并把 URI 还原成对端认得的裸路径。于是
+  blame、hunks、history、log、diff、show、stage/undo、status、commit、
+  `b:simplegit_status_dict` 与 `User SimpleGitUpdate` 全部自动可用,不必逐个调用点
+  改写。
+- 仓库身份加了 `remote://` 命名空间:两台机器上同一个绝对路径的 checkout 不会共用
+  分支缓存、watch 或 status 视图。status 回包新增 `root` 字段,远端 status 视图靠
+  它打开条目——那里没有本机 git 可问,原来的 `system('git -C … rev-parse')` 对远端
+  仓库根本不成立。
+- watch 对带前缀的请求明确返回错误(daemon 没法 stat 另一台机器上的 git 目录,
+  fingerprint 会恒定不变、watch 永不触发),Vim 把它当最终答复不再重问;这个角色改
+  由 `User SimpleRemoteFilesChanged` 承担,连同 `FocusGained` / `ShellCmdPost`。
+- 带前缀的请求走独立且更小的并发池与独立的 index 串行队列:一条卡住的 SSH 不会占着
+  本机仓库要用的许可,排队上限之外直接拒绝,而不是在后面堆十五秒一个的超时。
+- 新增 `g:simplegit_remote_git`(`auto` / `always` / `never`)、
+  `g:simplegit_remote_blame_delay`、`g:simplegit_remote_hunk_delay`(远端一次请求就
+  是一个往返,debounce 默认放宽到 750ms);新增能力 `remote_exec`,老 daemon 上一个
+  请求都不发——否则就是拿本机 git 去跑一个只存在于对端的路径,报出莫名其妙的
+  "not a git repository"。拒绝的理由每种只说一次(交互命令每次都说),
+  `:SimpleGitHealth` 有专门一行显示当前状态。
+- 新增 `make vim-remote`:runtimepath 上没有 SimpleRemote,用桩函数和手动触发的事件
+  驱动整条链路,断言远端 buffer 的每个请求都带 exec/cwd、本地 buffer 一个都不带,
+  以及断连、无 git、无 argv 传输、老 daemon 与 `never` 各自的拒绝路径。
 
 ### 修复:`color.ui = always` 会把 ANSI 转义码渲染进 scratch buffer
 

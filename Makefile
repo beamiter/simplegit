@@ -1,6 +1,6 @@
-.PHONY: check fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame vim-views vim-hunks vim-watch vim-core defcompile core-verify
+.PHONY: check fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame vim-views vim-hunks vim-watch vim-remote vim-core defcompile core-verify
 
-check: core-verify fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame vim-views vim-hunks vim-watch defcompile vim-core
+check: core-verify fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame vim-views vim-hunks vim-watch vim-remote defcompile vim-core
 
 fmt:
 	cargo fmt --all -- --check
@@ -50,6 +50,13 @@ vim-hunks:
 # event, and that a change in one repository leaves the others alone.
 vim-watch:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_watch.vim
+
+# SimpleRemote workspaces: a remote:// buffer routed to the git of the
+# workspace host (exec prefix plus cwd on every request), the refusals when
+# that is not possible, and the projected 'always' mode.  SimpleRemote itself
+# is not on the runtimepath; its API is stubbed and its events fired by hand.
+vim-remote:
+	vim -Nu NONE -n -i NONE -es -S tests/vim_remote.vim
 
 # ---------------------------------------------------------------------------
 # simplecore: the vendored daemon supervisor shared by the simple* suite.

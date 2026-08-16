@@ -60,6 +60,7 @@ def push_watcher(path):
 def main():
     log_path = os.environ.get("SIMPLEGIT_FAKE_LOG", "")
     file_op_delay = int(os.environ.get("SIMPLEGIT_FAKE_FILE_OP_DELAY_MS", "0"))
+    hunk_op_delay = int(os.environ.get("SIMPLEGIT_FAKE_HUNK_OP_DELAY_MS", "0"))
     commit_delay = int(os.environ.get("SIMPLEGIT_FAKE_COMMIT_DELAY_MS", "0"))
     status_delays = delays_from_env("SIMPLEGIT_FAKE_STATUS_DELAYS")
     status_entries = []
@@ -113,6 +114,10 @@ def main():
 
         kind = request.get("type", "")
         request_id = request.get("id", 0)
+        # The remote-workspace fields, echoed into every reply that has room
+        # for them: a test can then read where a request was routed from the
+        # reply it got, not only from the request log.
+        echo = {key: request[key] for key in ("exec", "cwd") if key in request}
         if kind == "version":
             reply = {
                 "type": "version",
@@ -138,15 +143,17 @@ def main():
             entries = [{"xy": "??", "path": "sample.txt"}]
             if status_entries:
                 entries = status_entries[min(status_count - 1, len(status_entries) - 1)]
-            schedule(
-                {
-                    "type": "status",
-                    "id": request_id,
-                    "branch": f"fake-{status_count}",
-                    "entries": entries,
-                },
-                delay,
-            )
+            reply = {
+                "type": "status",
+                "id": request_id,
+                "branch": f"fake-{status_count}",
+                "entries": entries,
+                **echo,
+            }
+            root = os.environ.get("SIMPLEGIT_FAKE_STATUS_ROOT", "")
+            if root:
+                reply["root"] = root
+            schedule(reply, delay)
         elif kind == "show":
             show_count += 1
             delay = (
@@ -159,6 +166,7 @@ def main():
                     "type": "show",
                     "id": request_id,
                     "lines": [f"commit fake-{show_count}", "", "    subject"],
+                    **echo,
                 },
                 delay,
             )
@@ -168,6 +176,7 @@ def main():
                     "type": "cat",
                     "id": request_id,
                     "lines": ["cat line one", "cat line two"],
+                    **echo,
                 },
                 view_delay,
             )
@@ -185,6 +194,7 @@ def main():
                             "subject": "initial import",
                         }
                     ],
+                    **echo,
                 },
                 view_delay,
             )
@@ -205,6 +215,7 @@ def main():
                             "subject": "initial import",
                         }
                     ],
+                    **echo,
                 },
                 view_delay,
             )
@@ -226,6 +237,7 @@ def main():
                         "id": request_id,
                         "path": request.get("path", ""),
                         "lnum": lnum,
+                        **echo,
                     },
                     **body,
                 ),
@@ -244,6 +256,7 @@ def main():
                             for key in ("author", "email", "time", "summary")
                         }
                     },
+                    **echo,
                 }
             )
         elif kind == "branch":
@@ -267,20 +280,33 @@ def main():
                     "head": head,
                     "ahead": int(os.environ.get("SIMPLEGIT_FAKE_AHEAD", "0")),
                     "behind": int(os.environ.get("SIMPLEGIT_FAKE_BEHIND", "0")),
+                    **echo,
                 },
                 delay,
             )
         elif kind == "watch":
             # The fixture echoes the request path as the repository root, so a
             # test knows exactly what a repo_change has to name.
-            emit(
-                {
-                    "type": "watch",
-                    "id": request_id,
-                    "path": request.get("path", ""),
-                    "interval_ms": request.get("interval_ms", 2000),
-                }
-            )
+            if request.get("exec"):
+                # What the real daemon answers: it cannot poll a git directory
+                # it has no filesystem for.
+                emit(
+                    {
+                        "type": "error",
+                        "id": request_id,
+                        "message": "repository watch is unavailable for remote workspaces",
+                        **echo,
+                    }
+                )
+            else:
+                emit(
+                    {
+                        "type": "watch",
+                        "id": request_id,
+                        "path": request.get("path", ""),
+                        "interval_ms": request.get("interval_ms", 2000),
+                    }
+                )
         elif kind == "hunks":
             schedule(
                 {
@@ -288,8 +314,21 @@ def main():
                     "id": request_id,
                     "path": request.get("path", ""),
                     "hunks": hunks,
+                    **echo,
                 },
                 hunks_delay,
+            )
+        elif kind in ("stage", "undo"):
+            # The real daemon answers both with `hunk_op`, naming what it did.
+            schedule(
+                {
+                    "type": "hunk_op",
+                    "id": request_id,
+                    "path": request.get("path", ""),
+                    "action": "stage" if kind == "stage" else "undo",
+                    **echo,
+                },
+                hunk_op_delay,
             )
         elif kind == "file_op":
             schedule(
@@ -298,6 +337,7 @@ def main():
                     "id": request_id,
                     "path": request.get("path", ""),
                     "op": request.get("op", ""),
+                    **echo,
                 },
                 file_op_delay,
             )
@@ -310,6 +350,7 @@ def main():
                     "sha": "fake123",
                     "subject": request.get("message", "").split("\n", 1)[0],
                     "summary": "fake commit",
+                    **echo,
                 },
                 commit_delay,
             )
