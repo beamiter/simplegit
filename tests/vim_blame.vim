@@ -151,6 +151,28 @@ sleep 100m
 assert_equal('Uncommitted changes', simplegit#BlameAnnotation(),
   'the zero sha renders as uncommitted')
 
+# An explicit popup request invalidated by a write is promoted onto a fresh
+# generation instead of being swallowed with the old reply.
+simplegit#Disable()
+WaitFor(() => !simplegit#core#IsRunning(), 'daemon stops before delayed blame')
+$SIMPLEGIT_FAKE_BLAME_LINE_DELAY_MS = '300'
+delete(request_log)
+simplegit#Enable()
+WaitFor(() => simplegit#core#Ready() && simplegit#core#HasCap('blame_line'),
+  'delayed blame daemon handshake')
+cursor(5, 1)
+simplegit#BlameLine()
+WaitFor(() => len(Requests('blame_line')) == 1, 'popup blame is in flight')
+sleep 100m
+simplegit#OnBufWrite()
+WaitFor(() => len(Requests('blame_line')) == 2,
+  'invalidated popup blame is reissued for the current generation')
+WaitFor(() => !empty(PopupLines()), 'reissued popup blame still opens')
+assert_equal(2, len(Requests('blame_line')),
+  'the stale reply neither answers nor starts a third request')
+popup_clear()
+$SIMPLEGIT_FAKE_BLAME_LINE_DELAY_MS = '0'
+
 # --- The whole-file cache still wins when the sidebar already paid for it ----
 delete(request_log)
 simplegit#Disable()

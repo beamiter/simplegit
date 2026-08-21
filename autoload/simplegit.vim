@@ -32,25 +32,45 @@ var s_view_latest: dict<number> = {}
 # ----------- Blame state -----------
 # bufnr (string) -> {lines: list<string>, commits: dict<any>, failed: bool}
 var s_blame_cache: dict<dict<any>> = {}
-var s_blame_inflight: dict<bool> = {}
+var s_blame_inflight: dict<number> = {}
+var s_blame_request_token: number = 0
+var s_blame_generation: number = 0
+var s_blame_latest: dict<number> = {}
+# Explicit sidebar/popup actions survive an ordinary write/reload invalidation
+# and are promoted onto the next current-generation request.  Remote workspace
+# switches and buffer close clear them instead of replaying on another target.
+var s_blame_pending_action: dict<dict<any>> = {}
 # Single-line blame, the annotation's fast path: bufnr (string) ->
 # {tick: number, lines: dict<string>} where lines maps a line number to its
 # rendered annotation.  An entry with an empty string means "asked, nothing to
 # show", which is what stops the cursor from re-asking on every rest.
 var s_line_blame_cache: dict<dict<any>> = {}
-var s_line_blame_inflight: dict<bool> = {}
+var s_line_blame_inflight: dict<number> = {}
 var s_blame_timer: number = 0
 var s_line_blame_on: bool = true
 
 # ----------- Hunk state -----------
 # bufnr (string) -> {failed: bool, hunks: list<dict<any>>}
 var s_hunk_cache: dict<dict<any>> = {}
-var s_hunk_inflight: dict<bool> = {}
+# bufnr (string) -> request token.  A generation says whether a reply still
+# describes the buffer; the token separately says whether it owns the live
+# in-flight slot.  Both are needed when a remote switch abandons a request and
+# immediately starts another one for the same buffer.
+var s_hunk_inflight: dict<number> = {}
+var s_hunk_request_token: number = 0
+# Every invalidation advances the affected buffer's generation.  A daemon
+# reply can otherwise repopulate the cache (and briefly repaint stale signs)
+# after a reload, write, or external Git change happened while it was in
+# flight.
+var s_hunk_generation: number = 0
+var s_hunk_latest: dict<number> = {}
 # Buffers that changed again while a hunks request was in flight.
 var s_hunk_stale: dict<bool> = {}
 # A jump or preview asked for while a refresh was in flight, to run when the
 # answer lands: bufnr (string) -> purpose.
 var s_hunk_pending_action: dict<string> = {}
+# The range a preview was asked for, kept across an asynchronous hunks reply.
+var s_hunk_preview_range: dict<list<number>> = {}
 var s_hunk_timer: number = 0
 var s_status_refresh_timer: number = 0
 var s_status_refresh_forced: bool = false
@@ -450,8 +470,11 @@ def ClearPending()
   s_view_latest = {}
   s_blame_inflight = {}
   s_line_blame_inflight = {}
+  s_blame_pending_action = {}
   s_hunk_inflight = {}
+  s_hunk_stale = {}
   s_hunk_pending_action = {}
+  s_hunk_preview_range = {}
   s_branch_inflight = {}
   # A restarted daemon watches nothing, so every repository has to register
   # again; without this the plugin would believe it was still being told about
@@ -488,9 +511,20 @@ def Dispatch(req: dict<any>, ctx: dict<any>): bool
     return false
   endif
   if !s_daemon_ready
-    if len(s_wait_queue) < 32
-      s_wait_queue->add({req: req, ctx: ctx})
+    if len(s_wait_queue) >= 32
+      # Returning true means "this request has an owner": hunk/blame/branch
+      # callers then install an in-flight interlock that only its callback can
+      # release.  A silently dropped 33rd request therefore wedges that feature
+      # for the buffer for the rest of the daemon session.
+      var message = 'startup request queue is full; retry after the daemon handshake'
+      if get(ctx, 'interactive', false)
+        Warn(message)
+      else
+        DebugLog(message)
+      endif
+      return false
     endif
+    s_wait_queue->add({req: req, ctx: ctx})
     return true
   endif
   # Capabilities are known only after the handshake.  Keeping this gate here
@@ -638,8 +672,19 @@ def OnVersion(ev: dict<any>)
   endif
 enddef
 
+def AbandonHunkState(key: string): bool
+  var had_action = has_key(s_hunk_pending_action, key)
+  for store in [s_hunk_pending_action, s_hunk_stale, s_hunk_preview_range]
+    if has_key(store, key)
+      remove(store, key)
+    endif
+  endfor
+  return had_action
+enddef
+
 def OnRequestError(ctx: dict<any>, message: any)
   var text = type(message) == v:t_string ? message : string(message)
+  var effective_interactive = get(ctx, 'interactive', false)
   # A failed request must release its view reservation, or the next request
   # for the same view would look superseded and be discarded in turn.
   var view_target = get(ctx, 'view_target', '')
@@ -647,26 +692,99 @@ def OnRequestError(ctx: dict<any>, message: any)
         && get(s_view_latest, view_target, -2) == get(ctx, 'view_generation', -1)
     remove(s_view_latest, view_target)
   endif
-  if get(ctx, 'kind', '') ==# 'blame' || get(ctx, 'kind', '') ==# 'blame_line'
+  if get(ctx, 'kind', '') ==# 'blame'
     var key = string(get(ctx, 'bufnr', -1))
-    if has_key(s_blame_inflight, key)
+    var owns_inflight = get(s_blame_inflight, key, -1)
+      == get(ctx, 'blame_request_token', -2)
+    if owns_inflight
       remove(s_blame_inflight, key)
     endif
-    if has_key(s_line_blame_inflight, key .. ':' .. get(ctx, 'lnum', 0))
-      remove(s_line_blame_inflight, key .. ':' .. get(ctx, 'lnum', 0))
+    if !owns_inflight
+        || get(ctx, 'blame_generation', 0) != get(s_blame_latest, key, 0)
+        || !bufexists(get(ctx, 'bufnr', -1))
+      DebugLog('ignored stale blame error')
+      return
+    endif
+    if has_key(s_blame_pending_action, key)
+        && get(s_blame_pending_action[key], 'kind', '') ==# 'full'
+      effective_interactive = effective_interactive
+        || get(s_blame_pending_action[key], 'interactive', false)
+      remove(s_blame_pending_action, key)
     endif
     # Remember the failure so cursor movement does not hammer the daemon
     # with requests for files outside any repository.
     s_blame_cache[key] = {failed: true, lines: [], commits: {}}
+  elseif get(ctx, 'kind', '') ==# 'blame_line'
+    var bufnr = get(ctx, 'bufnr', -1)
+    var key = string(bufnr)
+    var line_key = key .. ':' .. get(ctx, 'lnum', 0)
+    var owns_inflight = get(s_line_blame_inflight, line_key, -1)
+      == get(ctx, 'blame_request_token', -2)
+    if owns_inflight
+      remove(s_line_blame_inflight, line_key)
+    endif
+    if !owns_inflight
+        || get(ctx, 'blame_generation', 0) != get(s_blame_latest, key, 0)
+        || !bufexists(bufnr)
+      DebugLog('ignored stale blame_line error')
+      return
+    endif
+    if getbufvar(bufnr, 'changedtick', 0) != get(ctx, 'changedtick', -1)
+      var pending = get(s_blame_pending_action, key, {})
+      if get(pending, 'kind', '') ==# 'line'
+          && get(pending, 'lnum', -1) == get(ctx, 'lnum', 0)
+        var interactive = get(pending, 'interactive', false)
+        remove(s_blame_pending_action, key)
+        if interactive
+          Warn('buffer changed before blame completed; retry the command')
+        endif
+      endif
+      DebugLog('ignored blame_line error for changed buffer')
+      return
+    endif
+    if has_key(s_blame_pending_action, key)
+        && get(s_blame_pending_action[key], 'kind', '') ==# 'line'
+        && get(s_blame_pending_action[key], 'lnum', -1) == get(ctx, 'lnum', 0)
+      effective_interactive = effective_interactive
+        || get(s_blame_pending_action[key], 'interactive', false)
+      remove(s_blame_pending_action, key)
+    endif
+    # A line-scoped failure must not poison the whole buffer while another
+    # line request is succeeding concurrently.  Cache an empty answer only for
+    # this line so cursor rest does not hammer the daemon.
+    RecordLineBlame(bufnr, get(ctx, 'lnum', 0), {sha: ''})
   elseif get(ctx, 'kind', '') ==# 'hunks'
     var key = string(get(ctx, 'bufnr', -1))
-    if has_key(s_hunk_inflight, key)
+    var owns_inflight = get(s_hunk_inflight, key, -1)
+      == get(ctx, 'hunk_request_token', -2)
+    if owns_inflight
       remove(s_hunk_inflight, key)
     endif
-    if has_key(s_hunk_pending_action, key)
-      # The jump this buffer was waiting for cannot happen; say so rather than
-      # leaving the keypress unexplained.
-      remove(s_hunk_pending_action, key)
+    if get(ctx, 'hunk_generation', 0) != get(s_hunk_latest, key, 0)
+      DebugLog('ignored stale hunks error')
+      if owns_inflight
+          && (has_key(s_hunk_stale, key) || has_key(s_hunk_pending_action, key))
+        if has_key(s_hunk_stale, key)
+          remove(s_hunk_stale, key)
+        endif
+        if !RequestHunks(get(ctx, 'bufnr', -1), 'signs', false)
+          if AbandonHunkState(key)
+            Warn('no hunk information for this buffer')
+          endif
+        endif
+      elseif !bufexists(get(ctx, 'bufnr', -1)) && has_key(s_hunk_latest, key)
+        remove(s_hunk_latest, key)
+      endif
+      return
+    endif
+    if !owns_inflight
+      DebugLog('ignored superseded hunks error')
+      return
+    endif
+    var had_action = AbandonHunkState(key)
+    if had_action && !get(ctx, 'interactive', false)
+      # The background request acquired an interactive waiter later; its own
+      # context cannot make the final error below visible, so answer it here.
       Warn('no hunk information for this buffer')
     endif
     s_hunk_cache[key] = {failed: true, hunks: []}
@@ -693,7 +811,7 @@ def OnRequestError(ctx: dict<any>, message: any)
       setbufvar(commit_bufnr, '&modified', 1)
     endif
   endif
-  if get(ctx, 'interactive', false)
+  if effective_interactive
     Warn(text)
   else
     DebugLog('daemon error: ' .. strtrans(text))
@@ -714,13 +832,36 @@ def RequestBlame(bufnr: number, purpose: string, interactive: bool): bool
     return false
   endif
   var key = string(bufnr)
+  if purpose !=# 'virtual'
+    s_blame_pending_action[key] = {kind: 'full', purpose: purpose,
+      interactive: interactive}
+  endif
   if has_key(s_blame_inflight, key)
     return true
   endif
+  var request_purpose = purpose
+  var request_interactive = interactive
+  var pending = get(s_blame_pending_action, key, {})
+  var uses_pending = get(pending, 'kind', '') ==# 'full'
+  if uses_pending
+    request_purpose = get(pending, 'purpose', request_purpose)
+    request_interactive = get(pending, 'interactive', request_interactive)
+  endif
+  s_blame_request_token += 1
+  if s_blame_request_token <= 0
+    s_blame_request_token = 1
+  endif
+  var request_token = s_blame_request_token
   var ok = Dispatch({type: 'blame', path: path},
-    {kind: 'blame', bufnr: bufnr, purpose: purpose, interactive: interactive})
+    {kind: 'blame', bufnr: bufnr, purpose: request_purpose,
+      interactive: request_interactive,
+      blame_generation: get(s_blame_latest, key, 0),
+      blame_request_token: request_token})
   if ok
-    s_blame_inflight[key] = true
+    s_blame_inflight[key] = request_token
+  elseif uses_pending && has_key(s_blame_pending_action, key)
+      && get(s_blame_pending_action[key], 'kind', '') ==# 'full'
+    remove(s_blame_pending_action, key)
   endif
   return ok
 enddef
@@ -728,11 +869,27 @@ enddef
 def OnBlame(ctx: dict<any>, ev: dict<any>)
   var bufnr = get(ctx, 'bufnr', -1)
   var key = string(bufnr)
-  if has_key(s_blame_inflight, key)
+  var owns_inflight = get(s_blame_inflight, key, -1)
+    == get(ctx, 'blame_request_token', -2)
+  if owns_inflight
     remove(s_blame_inflight, key)
+  endif
+  if !owns_inflight
+      || get(ctx, 'blame_generation', 0) != get(s_blame_latest, key, 0)
+    DebugLog('ignored stale blame response')
+    return
   endif
   if !ValidBlame(ev)
     DebugLog('ignored malformed blame response')
+    var interactive = get(ctx, 'interactive', false)
+    var pending = get(s_blame_pending_action, key, {})
+    if get(pending, 'kind', '') ==# 'full'
+      interactive = interactive || get(pending, 'interactive', false)
+      remove(s_blame_pending_action, key)
+    endif
+    if interactive
+      Warn('daemon returned malformed blame information')
+    endif
     return
   endif
   if !bufexists(bufnr)
@@ -743,6 +900,10 @@ def OnBlame(ctx: dict<any>, ev: dict<any>)
   endif
   s_blame_cache[key] = {failed: false, lines: ev.lines, commits: ev.commits}
   var purpose = get(ctx, 'purpose', 'virtual')
+  var pending = get(s_blame_pending_action, key, {})
+  if get(pending, 'kind', '') ==# 'full'
+    purpose = get(remove(s_blame_pending_action, key), 'purpose', purpose)
+  endif
   if purpose ==# 'virtual'
     ShowLineBlameNow()
   elseif purpose ==# 'window'
@@ -758,6 +919,15 @@ enddef
 
 def InvalidateBlame(bufnr: number)
   var key = string(bufnr)
+  s_blame_generation += 1
+  s_blame_latest[key] = s_blame_generation
+  # The generation/token guards make old callbacks harmless.  Release their
+  # ownership now so the scheduled refresh is not mistaken for a duplicate
+  # and silently lost while an obsolete request is still on the wire.
+  if has_key(s_blame_inflight, key)
+    remove(s_blame_inflight, key)
+  endif
+  filter(s_line_blame_inflight, (line_key, _) => line_key !~# '^' .. key .. ':')
   if has_key(s_blame_cache, key)
     remove(s_blame_cache, key)
   endif
@@ -861,15 +1031,44 @@ def RequestLineBlame(bufnr: number, lnum: number, purpose: string, interactive: 
   if path ==# ''
     return false
   endif
-  var key = string(bufnr) .. ':' .. lnum
+  var bufkey = string(bufnr)
+  if purpose !=# 'virtual'
+    s_blame_pending_action[bufkey] = {kind: 'line', purpose: purpose,
+      interactive: interactive, lnum: lnum}
+  elseif has_key(s_blame_pending_action, bufkey)
+      && get(s_blame_pending_action[bufkey], 'kind', '') ==# 'line'
+      && get(s_blame_pending_action[bufkey], 'lnum', -1) != lnum
+    remove(s_blame_pending_action, bufkey)
+  endif
+  var key = bufkey .. ':' .. lnum
   if has_key(s_line_blame_inflight, key)
     return true
   endif
+  var request_purpose = purpose
+  var request_interactive = interactive
+  var pending = get(s_blame_pending_action, bufkey, {})
+  var uses_pending = get(pending, 'kind', '') ==# 'line'
+    && get(pending, 'lnum', -1) == lnum
+  if uses_pending
+    request_purpose = get(pending, 'purpose', request_purpose)
+    request_interactive = get(pending, 'interactive', request_interactive)
+  endif
+  s_blame_request_token += 1
+  if s_blame_request_token <= 0
+    s_blame_request_token = 1
+  endif
+  var request_token = s_blame_request_token
   var ok = Dispatch({type: 'blame_line', path: path, lnum: lnum},
-    {kind: 'blame_line', bufnr: bufnr, lnum: lnum, purpose: purpose,
-     interactive: interactive, changedtick: getbufvar(bufnr, 'changedtick', 0)})
+    {kind: 'blame_line', bufnr: bufnr, lnum: lnum, purpose: request_purpose,
+     interactive: request_interactive, changedtick: getbufvar(bufnr, 'changedtick', 0),
+     blame_generation: get(s_blame_latest, bufkey, 0),
+     blame_request_token: request_token})
   if ok
-    s_line_blame_inflight[key] = true
+    s_line_blame_inflight[key] = request_token
+  elseif uses_pending && has_key(s_blame_pending_action, bufkey)
+      && get(s_blame_pending_action[bufkey], 'kind', '') ==# 'line'
+      && get(s_blame_pending_action[bufkey], 'lnum', -1) == lnum
+    remove(s_blame_pending_action, bufkey)
   endif
   return ok
 enddef
@@ -877,13 +1076,30 @@ enddef
 def OnBlameLine(ctx: dict<any>, ev: dict<any>)
   var bufnr = get(ctx, 'bufnr', -1)
   var lnum = get(ctx, 'lnum', 0)
-  var key = string(bufnr) .. ':' .. lnum
-  if has_key(s_line_blame_inflight, key)
+  var bufkey = string(bufnr)
+  var key = bufkey .. ':' .. lnum
+  var owns_inflight = get(s_line_blame_inflight, key, -1)
+    == get(ctx, 'blame_request_token', -2)
+  if owns_inflight
     remove(s_line_blame_inflight, key)
+  endif
+  if !owns_inflight
+      || get(ctx, 'blame_generation', 0) != get(s_blame_latest, bufkey, 0)
+    DebugLog('ignored stale blame_line response')
+    return
   endif
   var sha = get(ev, 'sha', '')
   if type(sha) != v:t_string
     DebugLog('ignored malformed blame_line response')
+    var interactive = get(ctx, 'interactive', false)
+    var pending = get(s_blame_pending_action, bufkey, {})
+    if get(pending, 'kind', '') ==# 'line' && get(pending, 'lnum', -1) == lnum
+      interactive = interactive || get(pending, 'interactive', false)
+      remove(s_blame_pending_action, bufkey)
+    endif
+    if interactive
+      Warn('daemon returned malformed line blame information')
+    endif
     return
   endif
   if !bufexists(bufnr)
@@ -891,6 +1107,14 @@ def OnBlameLine(ctx: dict<any>, ev: dict<any>)
   endif
   # An edit while the reply was in flight moved the line the answer describes.
   if getbufvar(bufnr, 'changedtick', 0) != get(ctx, 'changedtick', -1)
+    var pending = get(s_blame_pending_action, bufkey, {})
+    if get(pending, 'kind', '') ==# 'line' && get(pending, 'lnum', -1) == lnum
+      var interactive = get(pending, 'interactive', false)
+      remove(s_blame_pending_action, bufkey)
+      if interactive
+        Warn('buffer changed before blame completed; retry the command')
+      endif
+    endif
     return
   endif
   # Keep only the fields the annotation renders, not the whole event.
@@ -902,7 +1126,12 @@ def OnBlameLine(ctx: dict<any>, ev: dict<any>)
     summary: get(ev, 'summary', ''),
   }
   RecordLineBlame(bufnr, lnum, info)
-  if get(ctx, 'purpose', 'virtual') ==# 'popup'
+  var purpose = get(ctx, 'purpose', 'virtual')
+  var pending = get(s_blame_pending_action, bufkey, {})
+  if get(pending, 'kind', '') ==# 'line' && get(pending, 'lnum', -1) == lnum
+    purpose = get(remove(s_blame_pending_action, bufkey), 'purpose', purpose)
+  endif
+  if purpose ==# 'popup'
     ShowLineBlamePopup(bufnr, lnum, sha, info)
   elseif bufnr == bufnr('%') && lnum == line('.')
     ShowLineBlameNow()
@@ -978,7 +1207,40 @@ def ShowLineBlameNow()
   })
 enddef
 
+def RetryPendingBlame(bufnr: number)
+  var key = string(bufnr)
+  var pending = get(s_blame_pending_action, key, {})
+  if empty(pending)
+    return
+  endif
+  if BufFilePath(bufnr) ==# ''
+    var interactive = get(pending, 'interactive', false)
+    remove(s_blame_pending_action, key)
+    if interactive
+      Warn('current buffer no longer has a readable file')
+    endif
+    return
+  endif
+  var purpose = get(pending, 'purpose', 'virtual')
+  var interactive = get(pending, 'interactive', false)
+  if get(pending, 'kind', '') ==# 'line'
+    var lnum = get(pending, 'lnum', 0)
+    if LineBlameSupported() && !getbufvar(bufnr, '&modified') && lnum > 0
+      RequestLineBlame(bufnr, lnum, purpose, interactive)
+    else
+      # A protocol without blame_line can still honour the popup through the
+      # whole-file request; RequestBlame promotes the pending kind to `full`.
+      RequestBlame(bufnr, purpose, interactive)
+    endif
+  elseif get(pending, 'kind', '') ==# 'full'
+    RequestBlame(bufnr, purpose, interactive)
+  endif
+enddef
+
 export def ScheduleLineBlame()
+  if s_enabled
+    RetryPendingBlame(bufnr('%'))
+  endif
   if !s_enabled || !s_line_blame_on || !VirtualTextSupported()
     return
   endif
@@ -1013,8 +1275,25 @@ export def OnBufWrite()
 enddef
 
 export def OnBufClose(bufnr: number)
+  var key = string(bufnr)
   InvalidateBlame(bufnr)
   InvalidateHunks(bufnr)
+  for store in [s_blame_inflight, s_hunk_inflight, s_hunk_stale,
+      s_hunk_pending_action, s_blame_pending_action]
+    if has_key(store, key)
+      remove(store, key)
+    endif
+  endfor
+  if has_key(s_hunk_latest, key)
+    remove(s_hunk_latest, key)
+  endif
+  if has_key(s_blame_latest, key)
+    remove(s_blame_latest, key)
+  endif
+  if has_key(s_hunk_preview_range, key)
+    remove(s_hunk_preview_range, key)
+  endif
+  filter(s_line_blame_inflight, (line_key, _) => line_key !~# '^' .. key .. ':')
 enddef
 
 # Refresh every visible file buffer after Git changes, not only the current
@@ -1825,12 +2104,18 @@ enddef
 
 def InvalidateHunks(bufnr: number)
   var key = string(bufnr)
+  s_hunk_generation += 1
+  s_hunk_latest[key] = s_hunk_generation
   if has_key(s_hunk_cache, key)
     remove(s_hunk_cache, key)
   endif
   if has_key(s_hunk_stale, key)
     remove(s_hunk_stale, key)
   endif
+  # A stale sign is actionable UI: it can invite a stage/undo on lines whose
+  # hunk no longer exists.  Clear it synchronously; the current reply will
+  # restore the column in place.
+  PlaceSigns(bufnr)
 enddef
 
 # The buffer line a hunk anchors on: its first changed line, or for pure
@@ -1947,6 +2232,9 @@ def RequestHunks(bufnr: number, purpose: string, interactive: bool): bool
       # a refresh in flight, so without this the first ]g after opening a
       # buffer did nothing at all -- no jump, no message, keypress gone.
       s_hunk_pending_action[key] = purpose
+      if purpose !=# 'preview' && has_key(s_hunk_preview_range, key)
+        remove(s_hunk_preview_range, key)
+      endif
     endif
     return true
   endif
@@ -1958,10 +2246,26 @@ def RequestHunks(bufnr: number, purpose: string, interactive: bool): bool
     endif
     req.content = text
   endif
+  if purpose !=# 'signs'
+    s_hunk_pending_action[key] = purpose
+    if purpose !=# 'preview' && has_key(s_hunk_preview_range, key)
+      remove(s_hunk_preview_range, key)
+    endif
+  endif
+  s_hunk_request_token += 1
+  if s_hunk_request_token <= 0
+    s_hunk_request_token = 1
+  endif
+  var request_token = s_hunk_request_token
   var ok = Dispatch(req,
-    {kind: 'hunks', bufnr: bufnr, purpose: purpose, interactive: interactive})
+    {kind: 'hunks', bufnr: bufnr, purpose: purpose, interactive: interactive,
+      hunk_generation: get(s_hunk_latest, key, 0),
+      hunk_request_token: request_token})
   if ok
-    s_hunk_inflight[key] = true
+    s_hunk_inflight[key] = request_token
+  elseif purpose !=# 'signs'
+      && get(s_hunk_pending_action, key, '') ==# purpose
+    remove(s_hunk_pending_action, key)
   endif
   return ok
 enddef
@@ -1969,12 +2273,38 @@ enddef
 def OnHunks(ctx: dict<any>, ev: dict<any>)
   var bufnr = get(ctx, 'bufnr', -1)
   var key = string(bufnr)
-  if has_key(s_hunk_inflight, key)
+  var owns_inflight = get(s_hunk_inflight, key, -1)
+    == get(ctx, 'hunk_request_token', -2)
+  if owns_inflight
     remove(s_hunk_inflight, key)
+  endif
+  if get(ctx, 'hunk_generation', 0) != get(s_hunk_latest, key, 0)
+    DebugLog('ignored stale hunks response')
+    if owns_inflight
+        && (has_key(s_hunk_stale, key) || has_key(s_hunk_pending_action, key))
+      if has_key(s_hunk_stale, key)
+        remove(s_hunk_stale, key)
+      endif
+      if !RequestHunks(bufnr, 'signs', false)
+        if AbandonHunkState(key)
+          Warn('no hunk information for this buffer')
+        endif
+      endif
+    elseif !bufexists(bufnr) && has_key(s_hunk_latest, key)
+      remove(s_hunk_latest, key)
+    endif
+    return
+  endif
+  if !owns_inflight
+    DebugLog('ignored superseded hunks response')
+    return
   endif
   var hunks = get(ev, 'hunks', v:null)
   if type(hunks) != v:t_list
     DebugLog('ignored malformed hunks response')
+    if AbandonHunkState(key)
+      Warn('no hunk information for this buffer')
+    endif
     return
   endif
   if !bufexists(bufnr)
@@ -1997,6 +2327,9 @@ def OnHunks(ctx: dict<any>, ev: dict<any>)
     # Something was pressed while this request was in flight; the later press
     # wins, exactly as it would have without the race.
     purpose = remove(s_hunk_pending_action, key)
+  endif
+  if purpose !=# 'preview' && has_key(s_hunk_preview_range, key)
+    remove(s_hunk_preview_range, key)
   endif
   if purpose ==# 'preview'
     ShowHunkPreview(bufnr)
@@ -2076,8 +2409,6 @@ enddef
 # The range a preview was asked for, kept across the wait for a hunks reply:
 # bufnr (string) -> [first, last].  Without it a preview requested over a
 # selection would come back as a preview of whatever line the cursor sits on.
-var s_hunk_preview_range: dict<list<number>> = {}
-
 def ShowHunkPreview(bufnr: number)
   if bufnr != bufnr('%')
     return
@@ -3541,11 +3872,15 @@ def ForgetRemoteState()
     endif
     InvalidateBlame(info.bufnr)
     InvalidateHunks(info.bufnr)
-    for store in [s_blame_inflight, s_hunk_inflight, s_hunk_stale]
+    for store in [s_blame_inflight, s_hunk_inflight, s_hunk_stale,
+        s_hunk_pending_action, s_blame_pending_action]
       if has_key(store, key)
         remove(store, key)
       endif
     endfor
+    if has_key(s_hunk_preview_range, key)
+      remove(s_hunk_preview_range, key)
+    endif
     filter(s_line_blame_inflight, (line_key, _) => line_key !~# '^' .. key .. ':')
   endfor
 enddef
@@ -3676,6 +4011,8 @@ export def Stop()
   s_blame_cache = {}
   s_line_blame_cache = {}
   s_hunk_cache = {}
+  s_blame_latest = {}
+  s_hunk_latest = {}
   InvalidateBranches()
 enddef
 

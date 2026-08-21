@@ -1,6 +1,16 @@
-.PHONY: check fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame vim-views vim-hunks vim-watch vim-remote vim-core defcompile core-verify
+.PHONY: check fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame vim-views vim-hunks vim-queue vim-watch vim-remote vim-core defcompile core-verify doc-tags
 
-check: core-verify fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame vim-views vim-hunks vim-watch vim-remote defcompile vim-core
+check: core-verify doc-tags fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame vim-views vim-hunks vim-queue vim-watch vim-remote defcompile vim-core
+
+doc-tags:
+	@tmp=$$(mktemp -d) && cp doc/*.txt $$tmp/ && \
+	vim -Nu NONE -n -i NONE -es -c "helptags $$tmp" -c 'qa!' </dev/null && \
+	status=0; \
+	foreign=$$(awk -F'\t' '$$1 !~ /^(simplegit|g:simplegit|b:simplegit|:SimpleGit|SimpleGitUpdate|<Plug>\(simplegit)/ { print $$1 }' $$tmp/tags); \
+	if [ -n "$$foreign" ]; then \
+	  echo "doc: *word* in prose defined a global help tag: $$foreign" >&2; status=1; fi; \
+	rm -rf $$tmp; \
+	[ $$status -eq 0 ] && echo "doc: help tags are valid and plugin-scoped"
 
 fmt:
 	cargo fmt --all -- --check
@@ -16,7 +26,15 @@ vim-test:
 
 # Drives the real daemon; skips cleanly when lib/simplegit-daemon is absent.
 vim-integration:
-	vim -Nu NONE -n -i NONE -es -S tests/vim_integration.vim
+	# This suite verifies a linewise Visual text object.  Ex mode cannot enter
+	# Visual mode, even through :normal, so run normal Vim while keeping its
+	# screen rendering out of successful build logs.  On failure the captured
+	# terminal/error stream is replayed, and the final cquit is a sentinel for a
+	# script that aborted before reaching its own qall!/cquit!.
+	@log=$$(mktemp); status=0; \
+	vim -Nu NONE -n -i NONE -S tests/vim_integration.vim -c 'cquit!' >$$log 2>&1 || status=$$?; \
+	if [ $$status -ne 0 ]; then cat $$log >&2; fi; \
+	rm -f $$log; exit $$status
 
 # Drives real `git commit` inside throwaway repositories.
 vim-commit:
@@ -45,6 +63,9 @@ vim-views:
 # Hunk navigation and preview requested while a refresh is already in flight.
 vim-hunks:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_hunks.vim
+
+vim-queue:
+	vim -Nu NONE -n -i NONE -es -S tests/vim_queue.vim
 
 # Repository watch: per-repository registration, the unsolicited repo_change
 # event, and that a change in one repository leaves the others alone.

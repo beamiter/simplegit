@@ -74,6 +74,8 @@ def main():
     show_delays = delays_from_env("SIMPLEGIT_FAKE_SHOW_DELAYS")
     view_delay = int(os.environ.get("SIMPLEGIT_FAKE_VIEW_DELAY_MS", "0"))
     hunks_delay = int(os.environ.get("SIMPLEGIT_FAKE_HUNKS_DELAY_MS", "0"))
+    hunks_delays = delays_from_env("SIMPLEGIT_FAKE_HUNKS_DELAYS")
+    hunks_count = 0
     blame_line_delay = int(os.environ.get("SIMPLEGIT_FAKE_BLAME_LINE_DELAY_MS", "0"))
     blame_file_lines = int(os.environ.get("SIMPLEGIT_FAKE_BLAME_LINES", "10"))
     uncommitted_lnum = int(os.environ.get("SIMPLEGIT_FAKE_UNCOMMITTED_LNUM", "0"))
@@ -132,7 +134,10 @@ def main():
                 reply["capabilities"] = {
                     cap: True for cap in caps.split(",") if cap
                 }
-            emit(reply)
+            schedule(
+                reply,
+                int(os.environ.get("SIMPLEGIT_FAKE_VERSION_DELAY_MS", "0")),
+            )
         elif kind == "status":
             status_count += 1
             delay = (
@@ -308,6 +313,12 @@ def main():
                     }
                 )
         elif kind == "hunks":
+            hunks_count += 1
+            delay = (
+                hunks_delays[hunks_count - 1]
+                if hunks_count <= len(hunks_delays)
+                else hunks_delay
+            )
             schedule(
                 {
                     "type": "hunks",
@@ -316,7 +327,7 @@ def main():
                     "hunks": hunks,
                     **echo,
                 },
-                hunks_delay,
+                delay,
             )
         elif kind in ("stage", "undo"):
             # The real daemon answers both with `hunk_op`, naming what it did.

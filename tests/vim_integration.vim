@@ -1,9 +1,11 @@
 vim9script
-# Headless integration test: drives the real daemon and verifies that every
-# window-opening command actually opens its window. Requires a built daemon
-# (./install.sh) and a git checkout with history; skips cleanly otherwise.
+# Integration test: drives the real daemon, verifies that every window-opening
+# command actually opens its window, and exercises the Visual hunk text object.
+# Requires a built daemon (./install.sh) and a git checkout with history; skips
+# cleanly otherwise.  It deliberately runs in Normal mode because Vim's Ex
+# mode cannot enter Visual mode.
 # Run with:
-#   vim -Nu NONE -n -i NONE -es -S tests/vim_integration.vim
+#   vim -Nu NONE -n -i NONE -S tests/vim_integration.vim
 
 set nocompatible
 var root = fnamemodify(expand('<sfile>:p:h'), ':h')
