@@ -71,6 +71,46 @@ catch
   errors->add('FAIL: simplegit#Health threw: ' .. v:exception)
 endtry
 
+# The help promises Vim 9.1 with +job and +channel.  The guard is what keeps
+# that promise, and it has to run before anything is registered: a plugin that
+# defines its commands first fails later inside job_start with an E117 that
+# names neither the build nor SimpleGit.
+var plugin_lines = readfile(root .. '/plugin/simplegit.vim')
+var guard = indexof(plugin_lines,
+  (_, l) => l =~# "^if v:version < 901 .*!has('job').*!has('channel')")
+var first_command = indexof(plugin_lines, (_, l) => l =~# '^command!')
+Check(guard >= 0, 'plugin/simplegit.vim refuses Vim 9.0 and builds without +job/+channel')
+Check(guard >= 0 && first_command > guard, 'the guard runs before any command is defined')
+var guard_block = guard >= 0 ? join(plugin_lines[guard : guard + 5], "\n") : ''
+Check(guard_block =~# "echomsg '\\[SimpleGit\\] Vim 9.1", 'the guard names the requirement')
+Check(guard_block =~# '\n  finish\nendif', 'the guard finishes rather than falling through')
+
+# A documented millisecond option set to 0 means "no debounce", not "unset":
+# timer_start(0, ...) is valid Vim and fires on the next pass of the event
+# loop.  The rejecting numeric reader substituted the documented default, and
+# :SimpleGitHealth -- reading the same helper -- then confirmed that default,
+# so a 0 read as never seen rather than as discarded.
+var saved_hunk_delay = get(g:, 'simplegit_hunk_delay', 300)
+var saved_status_delay = get(g:, 'simplegit_status_refresh_delay', 150)
+g:simplegit_hunk_delay = 0
+g:simplegit_status_refresh_delay = 0
+var health = execute('SimpleGitHealth')
+Check(health =~# 'live diff:\s\+up to \d\+ bytes, 0ms debounce',
+  ':SimpleGitHealth honours g:simplegit_hunk_delay = 0')
+Check(health =~# 'status refresh: 0ms debounce',
+  ':SimpleGitHealth honours g:simplegit_status_refresh_delay = 0')
+# A negative delay is still not a delay -- timer_start() would throw -- and a
+# value of the wrong type still falls back to the documented default.
+g:simplegit_hunk_delay = -5
+g:simplegit_status_refresh_delay = 'soon'
+health = execute('SimpleGitHealth')
+Check(health =~# 'live diff:\s\+up to \d\+ bytes, 0ms debounce',
+  'a negative g:simplegit_hunk_delay clamps to 0')
+Check(health =~# 'status refresh: 150ms debounce',
+  'a non-numeric delay falls back to its default')
+g:simplegit_hunk_delay = saved_hunk_delay
+g:simplegit_status_refresh_delay = saved_status_delay
+
 # Vim9 compiles def bodies lazily; force-compile every function by sourcing a
 # copy of the autoload script with a trailing :defcompile.
 var tmp = tempname() .. '.vim'

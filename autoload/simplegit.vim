@@ -111,9 +111,26 @@ def ConfBool(name: string, default_val: bool): bool
   return default_val
 enddef
 
-def ConfNum(name: string, default_val: number): number
+# `value > 0` is the right test for a width, a count or a byte ceiling: zero
+# there is not a smaller size, it is a broken one, and the documented default
+# is the kinder answer.  It is the wrong test for a millisecond delay -- see
+# ConfDelay() -- so the two readers stay separate and the call site picks, the
+# way simpleplug splits ConfigPositive() from ConfigInt().
+def ConfPositive(name: string, default_val: number): number
   var value = get(g:, name, default_val)
   return type(value) == v:t_number && value > 0 ? value : default_val
+enddef
+
+# A millisecond delay, where 0 is a setting rather than a mistake:
+# `timer_start(0, ...)` is valid Vim and means "next pass of the event loop",
+# which is how a user spells "no debounce".  Read through ConfPositive() these
+# options silently became their default, and :SimpleGitHealth -- reading the
+# same helper -- then confirmed that default, so the setting looked unread
+# rather than discarded.  simplefinder reads its own debounce this way:
+# max([0, ConfigNumber('debounce_ms', 50)]).
+def ConfDelay(name: string, default_val: number): number
+  var value = get(g:, name, default_val)
+  return type(value) == v:t_number ? max([0, value]) : default_val
 enddef
 
 def DebugLog(message: string)
@@ -1258,8 +1275,8 @@ export def ScheduleLineBlame()
   # shell script once at connect time -- one honest knob is easier to reason
   # about than a threshold that moves.
   var delay = BufIsRemote(bufnr('%'))
-    ? ConfNum('simplegit_remote_blame_delay', 750)
-    : ConfNum('simplegit_blame_delay', 350)
+    ? ConfDelay('simplegit_remote_blame_delay', 750)
+    : ConfDelay('simplegit_blame_delay', 350)
   s_blame_timer = timer_start(delay, (_) => {
     s_blame_timer = 0
     ShowLineBlameNow()
@@ -1511,7 +1528,7 @@ def OpenBlameWindow(bufnr: number)
   setwinvar(src_win, '&scrollbind', 1)
   setwinvar(src_win, '&cursorbind', 1)
 
-  var width = ConfNum('simplegit_blame_width', 34)
+  var width = ConfPositive('simplegit_blame_width', 34)
   silent keepalt vertical topleft new
   execute 'vertical resize ' .. width
   silent execute 'file ' .. fnameescape('simplegit://blame/' .. fnamemodify(bufname(bufnr), ':t'))
@@ -1807,7 +1824,7 @@ def OnLog(ctx: dict<any>, ev: dict<any>)
       ShortSha(entry.sha), CommitDate(entry.time),
       strcharpart(entry.author, 0, 16), entry.subject))
   endfor
-  var height = min([max([len(display), 5]), ConfNum('simplegit_history_height', 15)])
+  var height = min([max([len(display), 5]), ConfPositive('simplegit_history_height', 15)])
   OpenScratch('simplegit://history/' .. fnamemodify(path, ':t'), height)
   setline(1, display)
   setlocal nomodifiable nowrap
@@ -1848,7 +1865,7 @@ export def History()
     Warn('current buffer has no readable file')
     return
   endif
-  var limit = ConfNum('simplegit_history_limit', 200)
+  var limit = ConfPositive('simplegit_history_limit', 200)
   var ctx = ViewContext('log', path,
     'simplegit://history/' .. fnamemodify(path, ':t'))
   ctx.path = path
@@ -1928,7 +1945,7 @@ def OnGraphLog(ctx: dict<any>, ev: dict<any>)
     return
   endif
 
-  var height = min([max([len(display), 5]), ConfNum('simplegit_log_height', 20)])
+  var height = min([max([len(display), 5]), ConfPositive('simplegit_log_height', 20)])
   OpenScratch('simplegit://log', height)
   setline(1, display)
   setlocal nomodifiable nowrap
@@ -1973,7 +1990,7 @@ def GraphLogMore()
   if path ==# ''
     return
   endif
-  var limit = ConfNum('simplegit_log_limit', 200)
+  var limit = ConfPositive('simplegit_log_limit', 200)
   var skip = get(b:, 'simplegit_graph_skip', 0)
   if !Dispatch({type: 'graph_log', path: path, limit: limit, skip: skip},
       {kind: 'graph_log', interactive: true, path: path,
@@ -1987,7 +2004,7 @@ export def Log()
   if path ==# ''
     path = getcwd()
   endif
-  var limit = ConfNum('simplegit_log_limit', 200)
+  var limit = ConfPositive('simplegit_log_limit', 200)
   var ctx = ViewContext('graph_log', path, 'simplegit://log')
   ctx.path = path
   if !Dispatch({type: 'graph_log', path: path, limit: limit, skip: 0}, ctx)
@@ -2150,7 +2167,7 @@ def DesiredSigns(bufnr: number): dict<string>
   if empty(hunks)
     return want
   endif
-  var max_signs = ConfNum('simplegit_max_signs', 500)
+  var max_signs = ConfPositive('simplegit_max_signs', 500)
   var last = get(get(getbufinfo(bufnr), 0, {}), 'linecount', 0)
   var total = 0
   for hunk in hunks
@@ -2182,7 +2199,7 @@ def PlaceSigns(bufnr: number)
     return
   endif
   var want = DesiredSigns(bufnr)
-  var priority = ConfNum('simplegit_sign_priority', 10)
+  var priority = ConfPositive('simplegit_sign_priority', 10)
   var keep: dict<bool> = {}
   var to_remove: list<dict<any>> = []
   for sign in get(get(sign_getplaced(bufnr, {group: SIGN_GROUP}), 0, {}), 'signs', [])
@@ -2241,7 +2258,7 @@ def RequestHunks(bufnr: number, purpose: string, interactive: bool): bool
   var req: dict<any> = {type: 'hunks', path: path}
   if getbufvar(bufnr, '&modified')
     var text = BufferText(bufnr)
-    if len(text) > ConfNum('simplegit_live_max_bytes', 1024 * 1024)
+    if len(text) > ConfPositive('simplegit_live_max_bytes', 1024 * 1024)
       return false
     endif
     req.content = text
@@ -2637,8 +2654,8 @@ export def ScheduleHunks()
   # A remote live diff reads the index through the workspace transport (two
   # round trips) before diffing locally; give the typing more rest first.
   var delay = BufIsRemote(bufnr('%'))
-    ? ConfNum('simplegit_remote_hunk_delay', 750)
-    : ConfNum('simplegit_hunk_delay', 300)
+    ? ConfDelay('simplegit_remote_hunk_delay', 750)
+    : ConfDelay('simplegit_hunk_delay', 300)
   s_hunk_timer = timer_start(delay, (_) => {
     s_hunk_timer = 0
     var bufnr = bufnr('%')
@@ -2924,7 +2941,7 @@ def ScheduleStatusRefresh(force: bool = false, repo_filter: string = '')
   s_status_refresh_repo_filter = repo_filter
   s_status_refresh_excluded_repos = {}
   s_status_refresh_timer = timer_start(
-    ConfNum('simplegit_status_refresh_delay', 150),
+    ConfDelay('simplegit_status_refresh_delay', 150),
     (timer) => RunScheduledStatusRefresh(force, repo_filter, timer))
 enddef
 
@@ -3669,7 +3686,7 @@ def EnsureWatch(bufnr: number)
   if repo ==# '' || has_key(s_watch_requested, repo)
     return
   endif
-  var interval = ConfNum('simplegit_watch_interval', 2000)
+  var interval = ConfPositive('simplegit_watch_interval', 2000)
   var dir = PathDir(BufFilePath(bufnr))
   var ctx: dict<any> = {kind: 'watch', interactive: false, repo_token: repo,
     dir: dir, requires_capability: CAP_REPO_WATCH}
@@ -4057,9 +4074,9 @@ export def Health()
   echo '  popups:         ' .. (has('popupwin') ? 'supported' : 'unsupported')
   echo '  line blame:     ' .. (s_line_blame_on ? 'on' : 'off')
   echo '  hunk signs:     ' .. (SignsEnabled() ? 'on' : 'off')
-  echo '  live diff:      up to ' .. ConfNum('simplegit_live_max_bytes', 1024 * 1024) .. ' bytes, '
-        .. ConfNum('simplegit_hunk_delay', 300) .. 'ms debounce'
-  echo '  status refresh: ' .. ConfNum('simplegit_status_refresh_delay', 150)
+  echo '  live diff:      up to ' .. ConfPositive('simplegit_live_max_bytes', 1024 * 1024) .. ' bytes, '
+        .. ConfDelay('simplegit_hunk_delay', 300) .. 'ms debounce'
+  echo '  status refresh: ' .. ConfDelay('simplegit_status_refresh_delay', 150)
         .. 'ms debounce, '
         .. (ConfBool('simplegit_status_auto_refresh', true) ? 'on' : 'off')
         .. (s_status_refresh_timer != 0 ? ' (pending)' : '')
@@ -4080,7 +4097,7 @@ export def Health()
           : !s_daemon_ready ? 'unknown (handshake pending)'
           : !simplegit#core#HasCap(CAP_REPO_WATCH) ? 'unavailable (rerun ./install.sh)'
           : len(s_watch_roots) .. ' repositories, every '
-            .. ConfNum('simplegit_watch_interval', 2000) .. 'ms')
+            .. ConfPositive('simplegit_watch_interval', 2000) .. 'ms')
   echo '  remote git:     ' .. RemoteHealth()
   echo '  cached buffers: ' .. len(s_blame_cache) .. ' blame, ' .. len(s_hunk_cache) .. ' hunks, '
         .. len(s_branch_cache) .. ' branches'

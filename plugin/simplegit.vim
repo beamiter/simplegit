@@ -4,6 +4,18 @@ if exists('g:loaded_simplegit')
   finish
 endif
 g:loaded_simplegit = 1
+
+# The help has always promised Vim 9.1 with +job and +channel; nothing enforced
+# it, so an older or feature-poor build registered every command and then failed
+# inside the supervisor with E117 for job_start, which names neither the build
+# nor this plugin.  Twelve siblings refuse to load with a message instead.
+if v:version < 901 || !has('job') || !has('channel')
+  echohl WarningMsg
+  echomsg '[SimpleGit] Vim 9.1 with +job and +channel is required.'
+  echohl None
+  finish
+endif
+
 # Keep in step with `version` in Cargo.toml; tests/vim_smoke.vim fails the
 # build when the two disagree, because this is the number a user quotes.
 g:simplegit_version = '0.5.0'

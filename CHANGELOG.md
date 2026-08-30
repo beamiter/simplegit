@@ -42,6 +42,50 @@
   驱动整条链路,断言远端 buffer 的每个请求都带 exec/cwd、本地 buffer 一个都不带,
   以及断连、无 git、无 argv 传输、老 daemon 与 `never` 各自的拒绝路径。
 
+### 修复:CRLF 结尾的请求在正好等于上限时被拒
+
+- 家族里六份 bounded line reader 只有 simplegit 这一份把 CRLF 的 CR 当成载荷:
+  累积时按 `MAX_REQUEST_LINE_BYTES` 比较(其余五份是 `saturating_add(1)`),
+  `finish_request_line` 又在弹掉 CR 之前就判定 too_long。两处叠加,CRLF 客户端的
+  实际上限比自己错误信息里印的那个数小一个字节。改成 simpleline 的形状:先剥掉
+  作为分帧的 CR,再对上限做判定;新增 `crlf_at_the_exact_line_limit_is_accepted`
+  与 `one_payload_byte_over_the_line_limit_is_refused` 钉住边界——这份 reader 此前
+  在测试里一次都没有出现过。
+- `MAX_REQUEST_LINE_BYTES` 的推导补上了 remote exec 带来的两个字段。公式当年只数了
+  `path` 与 `content`,而 `hunks` 一条请求同时携带 `path`、`content`、
+  `exec`(16 × 4096)与 `cwd`(4096):每个字段校验器都放行的请求,会被跑在它们
+  前面的 reader 以 id 0 拒掉,两套上限对"什么是合法请求"的说法并不一致。
+  新增 `accepts_the_widest_request_after_json_escaping`,按 simpleline 的
+  `accepts_maximum_path_after_json_escaping` 的形状钉住。
+
+### 修复:stdout 写不动时 daemon 会一直等下去
+
+- 事件发送没有截止时间。客户端一旦不再读,发送方就被无限期挂住;1024 条的队列填满
+  之后连读请求的循环也跟着停下,于是 stdin 的 EOF 永远观察不到,daemon 活得比启动
+  它的那个 Vim 还久。现在 `EventTx` 带一个所有克隆共享的 fail-closed 位:一次发送
+  最多等 `EVENT_SEND_TIMEOUT`(2s),超时即判定整个协议会话 stalled;读循环用
+  `wait_stalled()` 与下一行请求一起 select,阻塞在读上也能立刻收工。形状取自
+  simplecc 的 `EventTx`。
+
+### 修复:`g:simplegit_hunk_delay = 0` 被当成没设
+
+- `ConfNum()` 用 `type(value) == v:t_number && value > 0` 判定,0 和类型错误走同一条
+  分支,直接被换成文档里的默认值。但 `timer_start(0, ...)` 在 Vim 里是合法的,意思是
+  "下一轮事件循环",正是用户写"不要 debounce"的拼法;`:SimpleGitHealth` 又读同一个
+  helper,于是回头确认了那个默认值,让这次设置看起来像没被读到而不是被丢掉。
+  现在分成两个 reader,由调用点挑(simpleplug 的 ConfigPositive / ConfigInt 就是这么
+  分的):宽度、条数、字节上限继续走 `ConfPositive()`,毫秒级延迟走 `ConfDelay()`,
+  负数夹到 0、类型不对仍然回落到默认值。涉及 `g:simplegit_hunk_delay`、
+  `g:simplegit_blame_delay`、`g:simplegit_status_refresh_delay` 与两个
+  `g:simplegit_remote_*_delay`。
+
+### 修复:文档要求 Vim 9.1 + `+job` + `+channel`,却从来没有拦过
+
+- `plugin/simplegit.vim` 从 `g:loaded_` 守卫径直进入命令定义,没有任何版本或特性
+  检查。旧版本上一切照常注册,直到第一条 `:SimpleGitStatus` 在 supervisor 里因
+  `job_start` 抛出 E117——既不提 build 也不提插件。现在按家族里另外十二个插件的形状
+  拒绝加载并给出一行说明。
+
 ### 修复:断连之后第一条显式命令什么都不说
 
 - `RefuseRemote()` 只在一个理由第一次出现时打印一行,并顺手把这一次的

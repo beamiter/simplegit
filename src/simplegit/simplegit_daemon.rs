@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::io::{self, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -10,13 +13,25 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinError, JoinSet};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long one event waits for a full stdout queue before the session is
+/// declared stalled and torn down.  See [`EventTx`].
+const EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CONCURRENT_GIT_REQUESTS: usize = 4;
 const MAX_REQUEST_PATH_BYTES: usize = 4096;
 // Live hunk requests carry whole buffer contents.
 const MAX_CONTENT_BYTES: usize = 2 * 1024 * 1024;
 // A valid request may expand sixfold when JSON escapes ASCII control bytes.
-// Keep enough headroom for the envelope and a maximum-width u64 request ID.
-const MAX_REQUEST_LINE_BYTES: usize = (MAX_REQUEST_PATH_BYTES + MAX_CONTENT_BYTES) * 6 + 1024;
+// Every bounded field one request may carry at once has to appear here, or the
+// reader refuses a record each field validator would accept: `hunks` carries a
+// path, buffer content, an exec argv prefix and an explicit cwd together (see
+// [`validate_request_target`]).  Keep enough headroom for the envelope and a
+// maximum-width u64 request ID.
+const MAX_REQUEST_LINE_BYTES: usize = (MAX_REQUEST_PATH_BYTES
+    + MAX_CONTENT_BYTES
+    + MAX_EXEC_PREFIX_ELEMENTS * MAX_REQUEST_PATH_BYTES
+    + MAX_REQUEST_PATH_BYTES)
+    * 6
+    + 1024;
 const MAX_OUTPUT_LINES: usize = 200_000;
 const MAX_PENDING_INDEX_MUTATIONS: usize = 1024;
 const PROTOCOL_VERSION: u32 = 5;
@@ -465,7 +480,62 @@ enum Event {
     Error { id: u64, message: String },
 }
 
-type EventTx = tokio::sync::mpsc::Sender<String>;
+/// The stdout queue, plus one fail-closed bit every clone shares.
+///
+/// Sends used to be awaited with no deadline.  A client that stopped reading
+/// therefore parked whichever task was sending -- and, once the 1024-line queue
+/// filled, the read loop behind it -- for as long as it liked, so stdin EOF was
+/// never observed and the daemon outlived the Vim that started it.  Now one
+/// deadline fails the protocol session as a whole; `wait_stalled` is how the
+/// read loop learns of it while blocked on the next request line.
+#[derive(Clone)]
+struct EventTx {
+    sender: tokio::sync::mpsc::Sender<String>,
+    stalled: Arc<AtomicBool>,
+    stalled_notify: Arc<tokio::sync::Notify>,
+}
+
+impl EventTx {
+    fn new(sender: tokio::sync::mpsc::Sender<String>) -> Self {
+        Self {
+            sender,
+            stalled: Arc::new(AtomicBool::new(false)),
+            stalled_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn is_stalled(&self) -> bool {
+        self.stalled.load(Ordering::Acquire)
+    }
+
+    /// Nothing will read another event: the client hung up, or it stopped
+    /// reading for longer than [`EVENT_SEND_TIMEOUT`].
+    fn is_closed(&self) -> bool {
+        self.is_stalled() || self.sender.is_closed()
+    }
+
+    fn mark_stalled(&self) {
+        if !self.stalled.swap(true, Ordering::AcqRel) {
+            // notify_one stores a permit when the read loop has created but not
+            // yet polled its Notified future; notify_waiters would lose that
+            // transition in precisely that window.
+            self.stalled_notify.notify_one();
+        }
+    }
+
+    /// Resolves once the session is stalled, and never otherwise.
+    async fn wait_stalled(&self) {
+        loop {
+            // Register before checking the bit, so a transition between the
+            // check and the await cannot be lost.
+            let notified = self.stalled_notify.notified();
+            if self.is_stalled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
 
 /// Operations that mutate the index, plus hunk undo whose patch must be based
 /// on a stable index.  A single FIFO worker owns this queue, so mutations are
@@ -545,8 +615,14 @@ where
 }
 
 async fn send_event(out: &EventTx, evt: &Event) {
+    if out.is_stalled() {
+        return;
+    }
     if let Ok(line) = serde_json::to_string(evt) {
-        let _ = out.send(line).await;
+        match tokio::time::timeout(EVENT_SEND_TIMEOUT, out.sender.send(line)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => out.mark_stalled(),
+        }
     }
 }
 
@@ -2132,13 +2208,13 @@ async fn run_index_mutations(
 }
 
 fn finish_request_line(mut bytes: Vec<u8>, too_long: bool) -> Result<String, String> {
-    if too_long {
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    if too_long || bytes.len() > MAX_REQUEST_LINE_BYTES {
         return Err(format!(
             "request line exceeds {MAX_REQUEST_LINE_BYTES} bytes"
         ));
-    }
-    if bytes.last() == Some(&b'\r') {
-        bytes.pop();
     }
     String::from_utf8(bytes).map_err(|_| "request line is not valid UTF-8".to_string())
 }
@@ -2167,7 +2243,9 @@ where
         let consumed = newline.map_or(available.len(), |position| position + 1);
 
         if !too_long {
-            if bytes.len().saturating_add(content_len) > MAX_REQUEST_LINE_BYTES {
+            // Keep one framing byte until the record ends.  A terminal CR in
+            // CRLF is not part of the JSONL payload's documented size limit.
+            if bytes.len().saturating_add(content_len) > MAX_REQUEST_LINE_BYTES.saturating_add(1) {
                 too_long = true;
                 bytes.clear();
             } else {
@@ -2411,7 +2489,8 @@ where
 {
     let mut input = BufReader::new(input);
 
-    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<String>(1024);
+    let (out_sender, out_rx) = tokio::sync::mpsc::channel::<String>(1024);
+    let out_tx = EventTx::new(out_sender);
     let writer = tokio::spawn(stdout_writer(output, out_rx));
     let pools = GitPools::new();
     // Two index lanes, one per machine class: mutations of a local index and
@@ -2441,7 +2520,17 @@ where
         Arc::new(std::sync::Mutex::new(HashSet::new()));
 
     loop {
-        let line = match read_request_line(&mut input).await {
+        // A stalled session has no one left to answer.  Waiting on the stall
+        // alongside the next request line is what stops the loop from blocking
+        // on a client that has stopped both reading and writing.
+        if out_tx.is_stalled() {
+            break;
+        }
+        let next = tokio::select! {
+            _ = out_tx.wait_stalled() => break,
+            line = read_request_line(&mut input) => line,
+        };
+        let line = match next {
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(error) => {
@@ -2997,6 +3086,167 @@ mod tests {
         // A prefix without a working directory is refused: the guess the
         // local filesystem would make is meaningless for a remote path.
         assert!(validate_request_target(&["ssh".to_string()], None).is_err());
+    }
+
+    /// The CR of a CRLF terminator is framing, not payload, so it must not
+    /// count against a limit documented in payload bytes.  This copy of the
+    /// reader used to admit only `MAX_REQUEST_LINE_BYTES` into the buffer and
+    /// to check the length before popping the CR, which made the effective
+    /// limit one byte smaller for every CRLF client than for every LF one --
+    /// and one byte smaller than the number its own error message prints.
+    #[tokio::test]
+    async fn crlf_at_the_exact_line_limit_is_accepted() {
+        let mut input = vec![b'x'; MAX_REQUEST_LINE_BYTES];
+        input.extend_from_slice(b"\r\n");
+        let mut reader = BufReader::new(input.as_slice());
+        let line = read_request_line(&mut reader)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(line.len(), MAX_REQUEST_LINE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn one_payload_byte_over_the_line_limit_is_refused() {
+        for terminator in [&b"\n"[..], &b"\r\n"[..]] {
+            let mut input = vec![b'x'; MAX_REQUEST_LINE_BYTES + 1];
+            input.extend_from_slice(terminator);
+            let mut reader = BufReader::new(input.as_slice());
+            let error = read_request_line(&mut reader)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(
+                error,
+                format!("request line exceeds {MAX_REQUEST_LINE_BYTES} bytes")
+            );
+        }
+    }
+
+    /// The line limit and the per-field limits have to agree about what a legal
+    /// request is.  `hunks` is the widest one: it carries a path, buffer
+    /// content, an exec prefix and a cwd at once, and every one of them may be
+    /// control bytes that JSON escapes sixfold.  Before the exec and cwd fields
+    /// entered the derivation, a request every field validator accepts was
+    /// refused by the reader that runs before them, with an id of 0.
+    #[tokio::test]
+    async fn accepts_the_widest_request_after_json_escaping() {
+        let escaped = "\u{1}";
+        let path = escaped.repeat(MAX_REQUEST_PATH_BYTES);
+        let content = escaped.repeat(MAX_CONTENT_BYTES);
+        let exec: Vec<String> = (0..MAX_EXEC_PREFIX_ELEMENTS)
+            .map(|_| escaped.repeat(MAX_REQUEST_PATH_BYTES))
+            .collect();
+        let request = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "hunks",
+                "id": 42,
+                "path": path,
+                "content": content,
+                "exec": exec,
+                "cwd": path,
+            })
+        );
+        assert!(request.len() <= MAX_REQUEST_LINE_BYTES + 1);
+
+        let mut reader = BufReader::new(request.as_bytes());
+        let line = read_request_line(&mut reader)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match serde_json::from_str::<Request>(&line).unwrap() {
+            Request::Hunks {
+                id,
+                path,
+                content,
+                exec,
+                cwd,
+            } => {
+                assert_eq!(id, 42);
+                assert_eq!(path.len(), MAX_REQUEST_PATH_BYTES);
+                assert_eq!(content.unwrap().len(), MAX_CONTENT_BYTES);
+                assert_eq!(exec.len(), MAX_EXEC_PREFIX_ELEMENTS);
+                assert!(validate_request_path(&path).is_ok());
+                assert!(validate_request_target(&exec, cwd.as_deref()).is_ok());
+            }
+            other => panic!("expected a hunks request, got {other:?}"),
+        }
+    }
+
+    /// A client that stops reading must not park the daemon.  The send used to
+    /// be awaited with no deadline, so a full stdout queue held the sending
+    /// task -- and eventually the read loop -- until the client came back,
+    /// which is how a daemon outlives the Vim that started it.
+    #[tokio::test]
+    async fn stdout_backpressure_fails_the_session_closed() {
+        let (sender, mut rx) = tokio::sync::mpsc::channel(1);
+        let out = EventTx::new(sender);
+        // The read loop parks here while a request task does the sending.
+        let waiter = tokio::spawn({
+            let out = out.clone();
+            async move { out.wait_stalled().await }
+        });
+
+        send_event(
+            &out,
+            &Event::Error {
+                id: 1,
+                message: "queued".to_string(),
+            },
+        )
+        .await;
+        assert!(!out.is_stalled());
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            EVENT_SEND_TIMEOUT * 2,
+            send_event(
+                &out,
+                &Event::Error {
+                    id: 2,
+                    message: "blocked".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("the send observes its own deadline");
+        assert!(started.elapsed() >= EVENT_SEND_TIMEOUT);
+        assert!(out.is_stalled());
+        assert!(out.is_closed());
+
+        tokio::time::timeout(EVENT_SEND_TIMEOUT, waiter)
+            .await
+            .expect("a parked wait_stalled is woken")
+            .unwrap();
+
+        // Fail closed: nothing is queued behind the stall, and the events that
+        // did fit are still the ones the client would read.
+        send_event(
+            &out,
+            &Event::Error {
+                id: 3,
+                message: "after the stall".to_string(),
+            },
+        )
+        .await;
+        drop(out);
+        let queued: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(queued.len(), 1);
+        assert!(queued[0].contains("\"id\":1"));
+    }
+
+    #[tokio::test]
+    async fn wait_stalled_returns_at_once_when_the_session_already_stalled() {
+        let (sender, _rx) = tokio::sync::mpsc::channel(1);
+        let out = EventTx::new(sender);
+        out.mark_stalled();
+        tokio::time::timeout(EVENT_SEND_TIMEOUT, out.wait_stalled())
+            .await
+            .expect("an already-stalled session does not wait for a notification");
     }
 
     /// The whole request path with a prefix, against real git: `env` is a
@@ -3696,7 +3946,8 @@ u UU N... 100644 100644 100644 100644 aaaa bbbb cccc conflict.rs\n\
     #[tokio::test]
     async fn index_mutations_execute_in_fifo_order() {
         let (queue_tx, queue_rx) = tokio::sync::mpsc::channel(4);
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(4);
+        let (event_sender, _event_rx) = tokio::sync::mpsc::channel(4);
+        let event_tx = EventTx::new(event_sender);
         let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         queue_tx

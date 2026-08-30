@@ -23,7 +23,8 @@ sign-column change markers with navigation, preview, stage and undo.
 
 Rendering stays in Vim9script; every git invocation runs inside a small
 asynchronous Rust daemon over a JSON line protocol, so editing never waits on
-git. The core UI requires Vim 9.1 with +vim9script, +job and +channel. The
+git. The core UI requires Vim 9.1 with +vim9script, +job and +channel, and
+SimpleGit refuses to load with a message on a build without them. The
 inline annotation additionally needs the +textprop feature (virtual text,
 patch 9.0.0067 or later); popups need +popupwin; debouncing needs +timers.
 Neovim is not supported.
@@ -214,7 +215,8 @@ g:simplegit_line_blame (default 1)                     *g:simplegit_line_blame*
   Show the inline current-line blame annotation.
 
 g:simplegit_blame_delay (default 350)                 *g:simplegit_blame_delay*
-  Milliseconds after the cursor stops before the annotation appears.
+  Milliseconds after the cursor stops before the annotation appears. 0 asks
+  for the next pass of the event loop, i.e. no debounce.
 
 g:simplegit_blame_format (default '%a, %w • %s')     *g:simplegit_blame_format*
   Layout of the inline annotation and of |simplegit#BlameAnnotation()|: >
@@ -257,12 +259,13 @@ g:simplegit_max_signs (default 500)                     *g:simplegit_max_signs*
   Above this many signs in one buffer none are placed.
 
 g:simplegit_hunk_delay (default 300)                   *g:simplegit_hunk_delay*
-  Milliseconds of typing rest before the live buffer-vs-index diff runs.
+  Milliseconds of typing rest before the live buffer-vs-index diff runs. 0
+  asks for the next pass of the event loop, i.e. no debounce.
 
 g:simplegit_status_refresh_delay (default 150)
                                     *g:simplegit_status_refresh_delay*
   Milliseconds to coalesce FocusGained and ShellCmdPost before refreshing an
-  already-open status view. `R` and repository mutations issued from that
+  already-open status view; 0 means no debounce. `R` and repository mutations issued from that
   status view refresh their exact target immediately and exclude only that
   repository from a pending global debounce; other repositories retain their
   scheduled refresh. Same-repository mutations without a target coalesce once.
@@ -305,7 +308,8 @@ g:simplegit_remote_git (default 'auto')                *g:simplegit_remote_git*
 g:simplegit_remote_blame_delay (default 750)   *g:simplegit_remote_blame_delay*
 g:simplegit_remote_hunk_delay (default 750)     *g:simplegit_remote_hunk_delay*
   Which buffers of a SimpleRemote workspace run git on the workspace host,
-  and how long their debounces are. See |simplegit-remote|.
+  and how long their debounces are; 0 means no debounce. See
+  |simplegit-remote|.
 
 g:simplegit_daemon_path (default '')                  *g:simplegit_daemon_path*
   Absolute path of the daemon binary; overrides runtimepath discovery.
