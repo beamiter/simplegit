@@ -738,11 +738,11 @@ fn git_command(target: &GitTarget, args: &[&str]) -> tokio::process::Command {
     command
 }
 
-async fn run_git_coded(
+async fn run_git_coded_bytes(
     target: &GitTarget,
     args: &[&str],
     ok_codes: &[i32],
-) -> Result<String, String> {
+) -> Result<Vec<u8>, String> {
     let output = tokio::time::timeout(GIT_TIMEOUT, git_command(target, args).output())
         .await
         .map_err(|_| {
@@ -764,11 +764,25 @@ async fn run_git_coded(
         let first = stderr.lines().next().unwrap_or("git command failed");
         return Err(first.to_string());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(output.stdout)
+}
+
+async fn run_git_coded(
+    target: &GitTarget,
+    args: &[&str],
+    ok_codes: &[i32],
+) -> Result<String, String> {
+    run_git_coded_bytes(target, args, ok_codes)
+        .await
+        .map(|stdout| String::from_utf8_lossy(&stdout).into_owned())
 }
 
 async fn run_git(target: &GitTarget, args: &[&str]) -> Result<String, String> {
     run_git_coded(target, args, &[]).await
+}
+
+async fn run_git_bytes(target: &GitTarget, args: &[&str]) -> Result<Vec<u8>, String> {
+    run_git_coded_bytes(target, args, &[]).await
 }
 
 async fn run_git_with_input(
@@ -1222,58 +1236,68 @@ struct StatusResult {
     entries: Vec<StatusEntry>,
 }
 
-/// Parse `git status --porcelain=v2 --branch` output into a branch name, its
-/// upstream distance and a changed-file list. Rename records keep the original
-/// path in `orig`.
-fn parse_status(stdout: &str) -> StatusResult {
+/// Parse `git status --porcelain=v2 --branch -z` output into a branch name, its
+/// upstream distance and a changed-file list. With `-z`, every record and path
+/// is NUL-terminated and Git never C-quotes a path. Type-2 records therefore
+/// occupy two fields: the record ending in the new path, then the old path.
+fn parse_status(stdout: &[u8]) -> StatusResult {
     let mut result = StatusResult::default();
-    for line in stdout.lines() {
-        if let Some(value) = line.strip_prefix("# branch.head ") {
-            result.branch = value.trim().to_string();
-        } else if let Some(value) = line.strip_prefix("# branch.ab ") {
+    let mut records = stdout.split(|byte| *byte == 0);
+    while let Some(record) = records.next() {
+        if record.is_empty() {
+            continue;
+        }
+        if let Some(value) = record.strip_prefix(b"# branch.head ") {
+            result.branch = String::from_utf8_lossy(value).trim().to_string();
+        } else if let Some(value) = record.strip_prefix(b"# branch.ab ") {
             // "+3 -1"; the header is emitted only when an upstream is set.
-            for field in value.split_ascii_whitespace() {
+            for field in String::from_utf8_lossy(value).split_ascii_whitespace() {
                 match field.split_at_checked(1) {
                     Some(("+", count)) => result.ahead = count.parse().unwrap_or(0),
                     Some(("-", count)) => result.behind = count.parse().unwrap_or(0),
                     _ => {}
                 }
             }
-        } else if let Some(record) = line.strip_prefix("1 ") {
+        } else if let Some(record) = record.strip_prefix(b"1 ") {
             // 1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>
-            let mut fields = record.splitn(8, ' ');
-            let xy = fields.next().unwrap_or("").to_string();
+            let mut fields = record.splitn(8, |byte| *byte == b' ');
+            let xy = String::from_utf8_lossy(fields.next().unwrap_or(b"")).into_owned();
             if let Some(path) = fields.nth(6) {
                 result.entries.push(StatusEntry {
                     xy,
-                    path: path.to_string(),
+                    path: String::from_utf8_lossy(path).into_owned(),
                     orig: None,
                 });
             }
-        } else if let Some(record) = line.strip_prefix("2 ") {
-            // 2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path>\t<origPath>
-            let mut fields = record.splitn(9, ' ');
-            let xy = fields.next().unwrap_or("").to_string();
-            if let Some(paths) = fields.nth(7) {
-                let mut paths = paths.split('\t');
-                let path = paths.next().unwrap_or("").to_string();
-                let orig = paths.next().map(|orig| orig.to_string());
-                result.entries.push(StatusEntry { xy, path, orig });
+        } else if let Some(record) = record.strip_prefix(b"2 ") {
+            // 2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path>\0<origPath>\0
+            let mut fields = record.splitn(9, |byte| *byte == b' ');
+            let xy = String::from_utf8_lossy(fields.next().unwrap_or(b"")).into_owned();
+            let path = fields.nth(7);
+            // Consume the original-path field even for a malformed type-2
+            // record, or it could be mistaken for the next status record.
+            let orig = records.next().filter(|path| !path.is_empty());
+            if let Some(path) = path {
+                result.entries.push(StatusEntry {
+                    xy,
+                    path: String::from_utf8_lossy(path).into_owned(),
+                    orig: orig.map(|path| String::from_utf8_lossy(path).into_owned()),
+                });
             }
-        } else if let Some(record) = line.strip_prefix("u ") {
-            let mut fields = record.splitn(10, ' ');
-            let xy = fields.next().unwrap_or("").to_string();
+        } else if let Some(record) = record.strip_prefix(b"u ") {
+            let mut fields = record.splitn(10, |byte| *byte == b' ');
+            let xy = String::from_utf8_lossy(fields.next().unwrap_or(b"")).into_owned();
             if let Some(path) = fields.nth(8) {
                 result.entries.push(StatusEntry {
                     xy: format!("u{xy}"),
-                    path: path.to_string(),
+                    path: String::from_utf8_lossy(path).into_owned(),
                     orig: None,
                 });
             }
-        } else if let Some(path) = line.strip_prefix("? ") {
+        } else if let Some(path) = record.strip_prefix(b"? ") {
             result.entries.push(StatusEntry {
                 xy: "??".to_string(),
-                path: path.to_string(),
+                path: String::from_utf8_lossy(path).into_owned(),
                 orig: None,
             });
         }
@@ -1288,13 +1312,14 @@ async fn handle_status(
     tx: EventTx,
     _permit: OwnedSemaphorePermit,
 ) {
-    let result = run_git(
+    let result = run_git_bytes(
         &target,
         &[
             "status",
             "--porcelain=v2",
             "--branch",
             "--untracked-files=normal",
+            "-z",
         ],
     )
     .await;
@@ -3791,45 +3816,136 @@ live
 
     #[test]
     fn status_v2_records_are_parsed() {
-        let stdout = "\
-# branch.oid deadbeef\n\
-# branch.head main\n\
-1 .M N... 100644 100644 100644 aaaa bbbb src/lib.rs\n\
-2 R. N... 100644 100644 100644 aaaa bbbb R100 new name.txt\told name.txt\n\
-u UU N... 100644 100644 100644 100644 aaaa bbbb cccc conflict.rs\n\
-? untracked file.txt\n";
+        let stdout = b"# branch.oid deadbeef\0\
+# branch.head main\0\
+1 .M N... 100644 100644 100644 aaaa bbbb src/line\nbreak.rs\0\
+2 R. N... 100644 100644 100644 aaaa bbbb R100 new\t\xe5\x90\x8d\xe5\xad\x97.txt\0\
+old:123:\"name.txt\0\
+u UU N... 100644 100644 100644 100644 aaaa bbbb cccc conflict.rs\0\
+? untracked\n\xe5\x90\x8d\xe5\xad\x97.txt\0";
         let result = parse_status(stdout);
         assert_eq!(result.branch, "main");
         assert_eq!(result.entries.len(), 4);
         // No `# branch.ab` header: no upstream, not "unknown".
         assert_eq!((result.ahead, result.behind), (0, 0));
         assert_eq!(result.entries[0].xy, ".M");
-        assert_eq!(result.entries[0].path, "src/lib.rs");
-        assert_eq!(result.entries[1].path, "new name.txt");
-        assert_eq!(result.entries[1].orig.as_deref(), Some("old name.txt"));
+        assert_eq!(result.entries[0].path, "src/line\nbreak.rs");
+        assert_eq!(result.entries[1].path, "new\t\u{540d}\u{5b57}.txt");
+        assert_eq!(
+            result.entries[1].orig.as_deref(),
+            Some("old:123:\"name.txt")
+        );
         assert_eq!(result.entries[2].xy, "uUU");
         assert_eq!(result.entries[2].path, "conflict.rs");
         assert_eq!(result.entries[3].xy, "??");
-        assert_eq!(result.entries[3].path, "untracked file.txt");
+        assert_eq!(result.entries[3].path, "untracked\n\u{540d}\u{5b57}.txt");
     }
 
     #[test]
     fn status_reports_upstream_distance() {
-        let stdout = "\
-# branch.oid deadbeef\n\
-# branch.head feature\n\
-# branch.upstream origin/feature\n\
-# branch.ab +12 -3\n\
-1 .M N... 100644 100644 100644 aaaa bbbb src/lib.rs\n";
+        let stdout = b"# branch.oid deadbeef\0\
+# branch.head feature\0\
+# branch.upstream origin/feature\0\
+# branch.ab +12 -3\0\
+1 .M N... 100644 100644 100644 aaaa bbbb src/lib.rs\0";
         let result = parse_status(stdout);
         assert_eq!(result.branch, "feature");
         assert_eq!((result.ahead, result.behind), (12, 3));
         assert_eq!(result.entries.len(), 1);
 
         // A malformed count must not poison the rest of the header.
-        let broken = "# branch.head main\n# branch.ab +x -2\n";
+        let broken = b"# branch.head main\0# branch.ab +x -2\0";
         let result = parse_status(broken);
         assert_eq!((result.ahead, result.behind), (0, 2));
+    }
+
+    #[tokio::test]
+    async fn status_round_trips_rename_and_special_paths_through_json() {
+        use std::process::Command;
+        use tokio::io::AsyncReadExt;
+
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let repo = temp_fixture_dir("status-special-paths");
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "commit.gpgsign", "false"]);
+
+        let old = "old:123:\t\u{540d}\u{5b57}.txt";
+        let renamed = "new\n\"\u{540d}\u{5b57}\".txt";
+        let untracked = "untracked\tline\n\u{540d}\u{5b57}.txt";
+        std::fs::write(repo.join(old), "old\n").unwrap();
+        git(&["add", "--", old]);
+        git(&["commit", "-q", "-m", "initial"]);
+        git(&["mv", "--", old, renamed]);
+        std::fs::write(repo.join(untracked), "new\n").unwrap();
+
+        let request = format!(
+            "{}\n",
+            serde_json::json!({"type": "status", "id": 71, "path": repo})
+        );
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        run(request.as_bytes(), server).await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        let reply: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
+        assert_eq!(reply["type"], "status", "{reply}");
+        let entries = reply["entries"].as_array().unwrap();
+        let rename = entries
+            .iter()
+            .find(|entry| entry["orig"] == old)
+            .expect("rename entry retains its original special path");
+        assert_eq!(rename["path"], renamed);
+        assert!(
+            entries.iter().any(|entry| entry["path"] == untracked),
+            "untracked special path survives status JSON: {reply}"
+        );
+
+        // The path returned by status is the exact path accepted by the index
+        // mutation path; no dequoting or display-only representation is needed.
+        let request = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "file_op", "id": 72, "path": repo,
+                "op": "add", "file": untracked
+            })
+        );
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        run(request.as_bytes(), server).await.unwrap();
+        response.clear();
+        client.read_to_string(&mut response).await.unwrap();
+        let reply: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
+        assert_eq!(reply["type"], "file_op", "{reply}");
+        let staged = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["diff", "--cached", "--name-only", "-z"])
+            .output()
+            .unwrap();
+        assert!(
+            staged
+                .stdout
+                .split(|byte| *byte == 0)
+                .any(|path| path == untracked.as_bytes()),
+            "the exact status path was staged"
+        );
+
+        std::fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]
