@@ -1,6 +1,6 @@
-.PHONY: check fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame vim-views vim-hunks vim-queue vim-watch vim-remote vim-core defcompile core-verify doc-tags
+.PHONY: check fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame vim-views vim-hunks vim-queue vim-watch vim-remote vim-reload vim-core defcompile core-verify doc-tags
 
-check: core-verify doc-tags fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame vim-views vim-hunks vim-queue vim-watch vim-remote defcompile vim-core
+check: core-verify doc-tags fmt clippy test vim-test vim-integration vim-commit vim-file-ops vim-statusline vim-blame vim-views vim-hunks vim-queue vim-watch vim-remote vim-reload defcompile vim-core
 
 doc-tags:
 	@tmp=$$(mktemp -d) && cp doc/*.txt $$tmp/ && \
@@ -78,6 +78,9 @@ vim-watch:
 # is not on the runtimepath; its API is stubbed and its events fired by hand.
 vim-remote:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_remote.vim
+
+vim-reload:
+	vim -Nu NONE -n -i NONE -es -S tests/vim_reload.vim
 
 # ---------------------------------------------------------------------------
 # simplecore: the vendored daemon supervisor shared by the simple* suite.

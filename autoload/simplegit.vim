@@ -108,6 +108,15 @@ def ConfBool(name: string, default_val: bool): bool
   if type(value) == v:t_number
     return value != 0
   endif
+  if type(value) == v:t_string
+    var folded = tolower(trim(value))
+    if index(['1', 'true', 'on', 'yes'], folded) >= 0
+      return true
+    endif
+    if index(['0', 'false', 'off', 'no', ''], folded) >= 0
+      return false
+    endif
+  endif
   return default_val
 enddef
 
@@ -131,6 +140,23 @@ enddef
 def ConfDelay(name: string, default_val: number): number
   var value = get(g:, name, default_val)
   return type(value) == v:t_number ? max([0, value]) : default_val
+enddef
+
+# 0 disables the live buffer-vs-index diff (fall back to the on-disk file)
+# rather than meaning "the default ceiling".  ConfPositive() cannot spell that.
+def LiveMaxBytes(): number
+  var value = get(g:, 'simplegit_live_max_bytes', 1024 * 1024)
+  if type(value) != v:t_number
+    return 1024 * 1024
+  endif
+  return max([0, value])
+enddef
+
+# The daemon lifts anything below 200ms; 0 used to be read as "unset" and
+# become 2000, so the documented floor was unreachable from Vim.
+def WatchIntervalMs(): number
+  var interval = ConfDelay('simplegit_watch_interval', 2000)
+  return interval < 200 ? 200 : interval
 enddef
 
 def DebugLog(message: string)
@@ -475,7 +501,7 @@ def NextId(): number
 enddef
 
 def ClearPending()
-  var commit_bufnr = bufnr(COMMIT_BUF)
+  var commit_bufnr = ScratchBufnr(COMMIT_BUF)
   if commit_bufnr > 0 && bufexists(commit_bufnr)
         && getbufvar(commit_bufnr, 'simplegit_commit_pending', false)
     setbufvar(commit_bufnr, 'simplegit_commit_pending', false)
@@ -1274,11 +1300,20 @@ export def ScheduleLineBlame()
   # costs nothing.  Latency itself is not consulted -- the probe measures a
   # shell script once at connect time -- one honest knob is easier to reason
   # about than a threshold that moves.
-  var delay = BufIsRemote(bufnr('%'))
+  var bufnr = bufnr('%')
+  var lnum = line('.')
+  var delay = BufIsRemote(bufnr)
     ? ConfDelay('simplegit_remote_blame_delay', 750)
     : ConfDelay('simplegit_blame_delay', 350)
   s_blame_timer = timer_start(delay, (_) => {
     s_blame_timer = 0
+    # The rest was on this buffer and line.  Applying the annotation to
+    # whatever is current paints the previous file's delay onto a file the
+    # cursor only just entered (and whose own ScheduleLineBlame has not yet
+    # asked).
+    if bufnr('%') != bufnr || line('.') != lnum
+      return
+    endif
     ShowLineBlameNow()
   })
 enddef
@@ -2258,10 +2293,14 @@ def RequestHunks(bufnr: number, purpose: string, interactive: bool): bool
   var req: dict<any> = {type: 'hunks', path: path}
   if getbufvar(bufnr, '&modified')
     var text = BufferText(bufnr)
-    if len(text) > ConfPositive('simplegit_live_max_bytes', 1024 * 1024)
-      return false
+    var limit = LiveMaxBytes()
+    # 0 disables the live diff, and a buffer over the ceiling must not be
+    # dropped: both are supposed to fall back to the on-disk file, which is
+    # a hunks request *without* `content`.  Returning false here left the
+    # signs frozen on the last live snapshot.
+    if limit > 0 && len(text) <= limit
+      req.content = text
     endif
-    req.content = text
   endif
   if purpose !=# 'signs'
     s_hunk_pending_action[key] = purpose
@@ -2651,14 +2690,19 @@ export def ScheduleHunks()
   if s_hunk_timer != 0
     timer_stop(s_hunk_timer)
   endif
-  # A remote live diff reads the index through the workspace transport (two
-  # round trips) before diffing locally; give the typing more rest first.
-  var delay = BufIsRemote(bufnr('%'))
+  # Capture the buffer that changed.  The timer used to read bufnr('%') when
+  # it fired, so typing in a.rs and jumping to b.rs inside the debounce window
+  # refreshed b.rs (or nothing, if b.rs is not a file) and left a.rs's signs
+  # on the text that was just replaced — BufEnter then repainted that cache.
+  var bufnr = bufnr('%')
+  var delay = BufIsRemote(bufnr)
     ? ConfDelay('simplegit_remote_hunk_delay', 750)
     : ConfDelay('simplegit_hunk_delay', 300)
   s_hunk_timer = timer_start(delay, (_) => {
     s_hunk_timer = 0
-    var bufnr = bufnr('%')
+    if !bufexists(bufnr)
+      return
+    endif
     if get(get(s_hunk_cache, string(bufnr), {}), 'failed', false)
       # Outside a repository or untracked; do not hammer the daemon per edit.
       return
@@ -2775,7 +2819,7 @@ def InitialStatusContext(dir: string): dict<any>
   # clock. Reserve the explicit request before it goes on the wire, so any
   # already-in-flight refresh becomes stale; a later refresh will in turn
   # advance the same clock and supersede this initial response.
-  var existing = bufnr(STATUS_BUF)
+  var existing = ScratchBufnr(STATUS_BUF)
   if existing > 0 && bufexists(existing)
     ctx.status_generation_bufnr = existing
     ctx.status_generation = NextStatusGeneration(existing)
@@ -3082,7 +3126,7 @@ def OnStatus(ctx: dict<any>, ev: dict<any>)
 
   # Initial and refresh-only requests compete on one buffer generation.  Do
   # this before OpenScratch(), which may clear or retire the old buffer.
-  var existing_status = bufnr(STATUS_BUF)
+  var existing_status = ScratchBufnr(STATUS_BUF)
   if existing_status > 0 && bufexists(existing_status)
     var reserved_bufnr = get(ctx, 'status_generation_bufnr', 0)
     var response_generation = get(ctx, 'status_generation', 0)
@@ -3257,7 +3301,7 @@ def CommitBufWhere(bufnr: number): string
 enddef
 
 export def Commit(amend: bool = false)
-  var existing = bufnr(COMMIT_BUF)
+  var existing = ScratchBufnr(COMMIT_BUF)
   if existing > 0 && bufexists(existing)
     if getbufvar(existing, 'simplegit_commit_pending', false)
       Warn('a commit is already in progress')
@@ -3686,7 +3730,7 @@ def EnsureWatch(bufnr: number)
   if repo ==# '' || has_key(s_watch_requested, repo)
     return
   endif
-  var interval = ConfPositive('simplegit_watch_interval', 2000)
+  var interval = WatchIntervalMs()
   var dir = PathDir(BufFilePath(bufnr))
   var ctx: dict<any> = {kind: 'watch', interactive: false, repo_token: repo,
     dir: dir, requires_capability: CAP_REPO_WATCH}
@@ -4074,7 +4118,9 @@ export def Health()
   echo '  popups:         ' .. (has('popupwin') ? 'supported' : 'unsupported')
   echo '  line blame:     ' .. (s_line_blame_on ? 'on' : 'off')
   echo '  hunk signs:     ' .. (SignsEnabled() ? 'on' : 'off')
-  echo '  live diff:      up to ' .. ConfPositive('simplegit_live_max_bytes', 1024 * 1024) .. ' bytes, '
+  echo '  live diff:      ' .. (LiveMaxBytes() == 0
+        ? 'off (g:simplegit_live_max_bytes = 0)'
+        : 'up to ' .. LiveMaxBytes() .. ' bytes') .. ', '
         .. ConfDelay('simplegit_hunk_delay', 300) .. 'ms debounce'
   echo '  status refresh: ' .. ConfDelay('simplegit_status_refresh_delay', 150)
         .. 'ms debounce, '
@@ -4097,7 +4143,7 @@ export def Health()
           : !s_daemon_ready ? 'unknown (handshake pending)'
           : !simplegit#core#HasCap(CAP_REPO_WATCH) ? 'unavailable (rerun ./install.sh)'
           : len(s_watch_roots) .. ' repositories, every '
-            .. ConfPositive('simplegit_watch_interval', 2000) .. 'ms')
+            .. WatchIntervalMs() .. 'ms')
   echo '  remote git:     ' .. RemoteHealth()
   echo '  cached buffers: ' .. len(s_blame_cache) .. ' blame, ' .. len(s_hunk_cache) .. ' hunks, '
         .. len(s_branch_cache) .. ' branches'

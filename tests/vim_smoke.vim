@@ -111,6 +111,27 @@ Check(health =~# 'status refresh: 150ms debounce',
 g:simplegit_hunk_delay = saved_hunk_delay
 g:simplegit_status_refresh_delay = saved_status_delay
 
+# 0 is a real live-diff ceiling (disable), not "use the default megabyte".
+var saved_live = get(g:, 'simplegit_live_max_bytes', 1024 * 1024)
+g:simplegit_live_max_bytes = 0
+health = execute('SimpleGitHealth')
+Check(health =~# 'live diff:\s\+off (g:simplegit_live_max_bytes = 0)',
+  ':SimpleGitHealth honours g:simplegit_live_max_bytes = 0')
+g:simplegit_live_max_bytes = saved_live
+
+# The daemon's 200ms floor used to be unreachable: ConfPositive(0) became 2000.
+var saved_watch = get(g:, 'simplegit_watch_interval', 2000)
+g:simplegit_watch_interval = 0
+var sid = getscriptinfo({name: 'autoload/simplegit.vim'})[0].sid
+var interval = call(function(printf('<SNR>%d_WatchIntervalMs', sid)), [])
+Check(interval == 200, 'g:simplegit_watch_interval = 0 reaches the daemon floor (200ms)')
+g:simplegit_watch_interval = saved_watch
+
+g:simplegit_watch = 'off'
+var watch_on = call(function(printf('<SNR>%d_WatchEnabled', sid)), [])
+Check(!watch_on, 'g:simplegit_watch = ''off'' disables the repository watch')
+unlet g:simplegit_watch
+
 # Vim9 compiles def bodies lazily; force-compile every function by sourcing a
 # copy of the autoload script with a trailing :defcompile.
 var tmp = tempname() .. '.vim'

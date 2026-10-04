@@ -149,6 +149,24 @@ WaitFor(() => line('.') == 3, 'the last press decides what happens')
 sleep 150m
 assert_true(empty(popup_list()), 'the superseded preview does not also open')
 
+# --- typing in a.rs then jumping away still refreshes a.rs -----------------
+# ScheduleHunks used to read bufnr('%') when the timer fired, so the live
+# diff of the file you edited was dropped if you left it inside the debounce.
+g:simplegit_hunk_delay = 80
+delete(request_log)
+var edited = bufnr('%')
+var edited_path = expand('%:p')
+setline(1, 'typed in this file')
+simplegit#ScheduleHunks()
+enew
+sleep 200m
+var after_jump = Requests('hunks')->filter((_, r) => get(r, 'path', '') ==# edited_path)
+assert_true(!empty(after_jump),
+  'a hunks refresh must still name the buffer that changed after a jump: '
+  .. string(Requests('hunks')))
+execute 'buffer ' .. edited
+g:simplegit_hunk_delay = 300
+
 # --- A reply abandoned by a workspace switch cannot clear its successor ----
 # Restart the fixture with per-request delays: A belongs to the old workspace,
 # B to the new one.  A lands first.  If it clears B's in-flight slot, ]g sends

@@ -1,4 +1,8 @@
-vim9script
+vim9script noclear
+# noclear: a plugin manager sources plugin/ again when the vimrc is reloaded.
+# Without it Vim deletes every script-local function and variable below before
+# the guard gets to `finish`, while the commands, autocommands and g: functions
+# that use them stay defined -- and fail with E933/E117 from then on.
 
 if exists('g:loaded_simplegit')
   finish
@@ -27,6 +31,15 @@ def ConfigFlag(name: string, default_value: number): number
   endif
   if type(value) == v:t_number
     return value != 0 ? 1 : 0
+  endif
+  if type(value) == v:t_string
+    var folded = tolower(trim(value))
+    if index(['1', 'true', 'on', 'yes'], folded) >= 0
+      return 1
+    endif
+    if index(['0', 'false', 'off', 'no', ''], folded) >= 0
+      return 0
+    endif
   endif
   return default_value
 enddef

@@ -1,5 +1,67 @@
 # Changelog
 
+## Unreleased - 2026-10-04
+
+### 打字后立刻跳走,hunk signs 仍刷新你刚改的那个 buffer
+
+- `ScheduleHunks()` 的定时器回调里读 `bufnr('%')`。在 debounce 窗口里从 a.rs
+  跳到 b.rs,刷新的是 b.rs(或什么都不刷),a.rs 的 signs 停在被替换掉的旧文本上,
+  之后每次 BufEnter 只是把那份缓存再画一遍。现在记下发生变化的 buffer。
+- `tests/vim_hunks.vim` 改一行再 `enew`,断言随后的 hunks 请求仍带着原文件路径。
+
+### 行内 blame 定时器不再把注解画到刚走进的另一个文件上
+
+- 同样的定时器在回调里无条件 `ShowLineBlameNow()`,画的是**当时**当前 buffer。
+  光标在 a.rs 停了一下再进 b.rs,a.rs 的 delay 到期会给 b.rs 的当前行贴上
+  一次还没为它请求过的注解。buffer 或行对不上就丢掉。
+
+### 剩下的 `bufnr(STATUS_BUF)` / `bufnr(COMMIT_BUF)` 走字面名字
+
+- `ScratchBufnr()` 就是为"bufnr() 把参数当正则"写的,status / commit 的
+  打开路径已经在用;ClearPending、status 世代时钟和另一处 commit 查找还在
+  用裸 `bufnr()`,名字里的 `[SimpleGit` 是字符类。四处都改走 `ScratchBufnr()`。
+
+### 重新 source 一次 vimrc 之后 script-local 不再被清掉
+
+- `plugin/simplegit.vim` 仍是普通 `vim9script`。守卫会 `finish`,但走之前已经
+  把 `ConfigFlag()` 等删掉。首行改为 `vim9script noclear`。
+- 新增 `tests/vim_reload.vim`。
+
+### `g:simplegit_watch_interval = 0` 不再变成 2000ms
+
+- `ConfPositive()` 把 0 当没设。daemon 的下限是 200ms,Vim 侧却把 0 抬成默认
+  2000,文档里的地板从这边摸不到。`WatchIntervalMs()` 把低于 200 的值抬到
+  200,Health 读同一个数字。
+
+### `g:simplegit_live_max_bytes = 0` 现在真的关掉 live diff
+
+- 同一套 `ConfPositive()`:0 被换成 1MiB,用户无法关掉"把未保存缓冲区送去
+  diff"。0 现在跳过 `content`,signs 退回磁盘上的文件;Health 写 `off`。
+
+### Health 的 watch 间隔与真正发给 daemon 的一致
+
+- `:SimpleGitHealth` 继续用 `ConfPositive()` 读间隔,EnsureWatch 已经改走
+  地板逻辑时,Health 仍在回显那个被丢掉的 2000。
+
+### 超大未保存 buffer 不再从此没有 hunk signs
+
+- `g:simplegit_live_max_bytes` 超限时 `RequestHunks()` 直接 `return false`,
+  连"只带 path、diff 磁盘文件"的请求都不发。文档写的是退回 on-disk diff,
+  实际是 signs 冻在最后一次 live 快照上。现在超限和 0 一样:省略 `content`,
+  请求照发。
+
+### `g:simplegit_watch = 'off'` 不再被当成没设
+
+- `ConfBool()` 只认 number/bool,字符串一律回落到默认值 `true`。vimrc 里写
+  `'off'` / `'0'` 时 watch、signs、line blame 全还开着,Health 也这么报。
+  常见的开/关拼法现在按布尔读。
+
+### `plugin/` 的 `ConfigFlag()` 不再在加载时把 `'off'` 写成 1
+
+- `plugin/simplegit.vim` 的 `ConfigFlag()` 只认数字,autoload 根本看不到用户
+  写的字符串。加载时就把选项规范化成 0/1,字符串 `'off'` 走默认 on。
+  现在与 `ConfBool()` 认同一套拼法。
+
 ## Unreleased - 2026-08-16
 
 ### 新增:SimpleRemote 工作区里的 git 跑在远端主机上
