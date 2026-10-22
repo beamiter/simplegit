@@ -91,6 +91,8 @@ WaitFor(() => !empty(PopupLines()), 'whole-file blame answers the popup')
 assert_equal(0, len(Requests('blame_line')), 'no blame_line without the capability')
 assert_equal(1, len(Requests('blame')), 'the old path blames the whole file')
 assert_match('^Commit  deadbee', PopupLine(1), 'popup names the commit')
+assert_equal(1, getwinvar(popup_list()[0], 'jterm_native_popup', 0),
+  'a real blame response opts into native text paint')
 popup_clear()
 simplegit#Disable()
 WaitFor(() => !simplegit#core#IsRunning(), 'old daemon stops')

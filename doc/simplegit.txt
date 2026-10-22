@@ -138,6 +138,14 @@ COMMANDS                                                   *simplegit-commands*
   visual selection, `:10,20SimpleGitHunkPreview`), every hunk the range
   touches is shown, in file order.
 
+  In Anvil/Forge/Ember/Frost with jterm render protocol 6, short fully visible
+  hunk and blame text popups can retain native GUI buffer rendering. The
+  plugin marks its mask-free passive text windows with w:jterm_native_popup=1
+  and requests User JTermVim9PopupChanged after setting the popup filetype.
+  Vim still owns content, input and lifetime; unsupported wrapping, scrolling
+  or decoration uses compatibility rendering. Ordinary Vim and older hosts
+  ignore the rendering hint. Remove it before adding masks/nonrectangular UI.
+
 :[range]SimpleGitHunkStage                                *:SimpleGitHunkStage*
   Stage the hunk under the cursor into the index (like git add -p for one
   hunk). The buffer must be saved first; hunks reflect the file on disk.

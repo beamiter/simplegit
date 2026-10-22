@@ -136,6 +136,9 @@ WaitFor(() => len(Requests('hunks')) == 1, 'the preview refresh is in flight')
 cursor(3, 1)
 simplegit#HunkPreview()
 WaitFor(() => !empty(popup_list()), 'a queued preview opens its popup')
+assert_equal(1, getwinvar(popup_list()[0], 'jterm_native_popup', 0),
+  'a real queued hunk preview opts into native text paint')
+assert_equal('diff', getbufvar(winbufnr(popup_list()[0]), '&filetype'))
 popup_clear()
 
 # The later press wins, exactly as it would without the race.

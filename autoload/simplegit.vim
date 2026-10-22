@@ -1429,14 +1429,27 @@ def BlamePopupText(sha: string, info: dict<any>): list<string>
   ]
 enddef
 
+# Only mask-free passive text popups opt in to jterm protocol-6 GUI paint.
+# Ordinary Vim and older hosts ignore the marker. Keep Vim's input/lifetime.
+def NativeTextPopup(winid: number)
+  if winid <= 0
+    return
+  endif
+  setwinvar(winid, 'jterm_native_popup', 1)
+  if exists('#User#JTermVim9PopupChanged')
+    doautocmd <nomodeline> User JTermVim9PopupChanged
+  endif
+enddef
+
 def ShowPopup(text: list<string>)
   if has('popupwin')
-    popup_atcursor(text, {
+    var winid = popup_atcursor(text, {
       padding: [0, 1, 0, 1],
       border: [1, 1, 1, 1],
       borderchars: ['─', '│', '─', '│', '┌', '┐', '┘', '└'],
       moved: 'any',
     })
+    NativeTextPopup(winid)
   else
     echo join(text, ' | ')
   endif
@@ -1642,7 +1655,8 @@ def BlameWindowPopup()
     get(info, 'summary', ''),
   ]
   if has('popupwin')
-    popup_atcursor(text, {padding: [0, 1, 0, 1], moved: 'any'})
+    var winid = popup_atcursor(text, {padding: [0, 1, 0, 1], moved: 'any'})
+    NativeTextPopup(winid)
   else
     echo join(text, ' | ')
   endif
@@ -2492,6 +2506,7 @@ def ShowHunkPreview(bufnr: number)
       maxheight: 20,
     })
     win_execute(winid, 'setlocal filetype=diff')
+    NativeTextPopup(winid)
   else
     echo join(lines, "\n")
   endif
