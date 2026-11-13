@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Treat single-file Git paths literally
+
+- Stage/reset, file history, filtered commit views, disk hunks, and hunk
+  stage/undo now disable Git pathspec interpretation for their exact file
+  arguments. `--` alone did not protect filenames containing `*`, brackets,
+  or `:(...)` magic from selecting other files.
+- The literal setting is an argument to Git itself, so remote exec prefixes
+  preserve it. Repository-wide stage/reset retain their intentional `:/`
+  pathspec, including when invoked from a subdirectory.
+- Added real local and prefixed daemon regressions for wildcard/magic names,
+  leading dashes, whitespace/newlines and Unicode, deleted files, unchanged
+  neighboring files, and the read/diff/hunk mutation paths. Object/index
+  lookups remain unchanged; their `revision:path` syntax is not a pathspec.
+
 ## Unreleased - 2026-10-04
 
 ### 打字后立刻跳走,hunk signs 仍刷新你刚改的那个 buffer

@@ -1021,6 +1021,7 @@ async fn handle_log(
             run_git(
                 &target,
                 &[
+                    "--literal-pathspecs",
                     "log",
                     "--follow",
                     &count,
@@ -1152,6 +1153,7 @@ async fn handle_show(
     let result = match validate_rev(&rev) {
         Ok(()) => {
             let mut args = vec![
+                "--literal-pathspecs",
                 "show",
                 "--stat",
                 "--patch",
@@ -1575,7 +1577,16 @@ async fn handle_branch(
 // Hunks (working tree vs index) and hunk staging / reverting
 // ---------------------------------------------------------------------------
 
-const DIFF_ARGS: [&str; 4] = ["diff", "--no-color", "--no-ext-diff", "--unified=0"];
+// These diffs name exact files (including hunk mutations), never user patterns.
+// Use Git's global argv flag, not an environment variable: remote exec prefixes
+// must carry the same semantics to the Git process on the other machine.
+const DIFF_ARGS: [&str; 5] = [
+    "--literal-pathspecs",
+    "diff",
+    "--no-color",
+    "--no-ext-diff",
+    "--unified=0",
+];
 
 /// Parse one `@@ -old_start[,old_count] +new_start[,new_count] @@` header.
 fn parse_hunk_header(line: &str) -> Option<(u32, u32, u32, u32)> {
@@ -1929,9 +1940,11 @@ async fn handle_file_op(
 }
 
 fn file_op_args<'a>(op: &str, file: &'a str) -> Result<Vec<&'a str>, String> {
+    // `--` ends option parsing, but does not disable wildcard/pathspec magic.
+    // Single-file operations must treat the exact status path literally.
     match op {
-        "add" => Ok(vec!["add", "--", file]),
-        "reset" => Ok(vec!["reset", "-q", "--", file]),
+        "add" => Ok(vec!["--literal-pathspecs", "add", "--", file]),
+        "reset" => Ok(vec!["--literal-pathspecs", "reset", "-q", "--", file]),
         // The top pathspec makes the meaning independent of the directory the
         // current buffer happens to live in. `--all` includes removals too.
         "add_all" => Ok(vec!["add", "--all", "--", ":/"]),
@@ -3948,15 +3961,225 @@ u UU N... 100644 100644 100644 100644 aaaa bbbb cccc conflict.rs\0\
         std::fs::remove_dir_all(repo).unwrap();
     }
 
+    fn pathspec_git(repo: &Path, args: &[&str]) -> Vec<u8> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn pathspec_repo() -> PathBuf {
+        let repo = temp_fixture_dir("literal-pathspec");
+        pathspec_git(&repo, &["init", "-q"]);
+        pathspec_git(&repo, &["config", "user.email", "test@example.com"]);
+        pathspec_git(&repo, &["config", "user.name", "Test"]);
+        pathspec_git(&repo, &["config", "commit.gpgsign", "false"]);
+        repo
+    }
+
+    async fn pathspec_request(
+        mut request: serde_json::Value,
+        cwd: &Path,
+        remote: bool,
+    ) -> serde_json::Value {
+        use tokio::io::AsyncReadExt;
+        request["id"] = serde_json::json!(1);
+        request["cwd"] = serde_json::json!(cwd);
+        if remote {
+            // Exercise the remote argv without an SSH server or network.
+            request["exec"] = serde_json::json!(["env"]);
+        }
+        let input = format!("{request}\n");
+        let (mut client, server) = tokio::io::duplex(256 * 1024);
+        run(input.as_bytes(), server).await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        let reply: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
+        assert_ne!(reply["type"], "error", "{request}: {reply}");
+        reply
+    }
+
+    #[tokio::test]
+    async fn literal_file_operations_only_change_selected_path_local_and_prefixed() {
+        let names = [
+            "*",
+            "[ab]",
+            ":(exclude)other",
+            ":(glob)*",
+            "-leading",
+            "space name",
+            "line\nbreak",
+            "中文",
+        ];
+        for remote in [false, true] {
+            let repo = pathspec_repo();
+            let sub = repo.join("sub");
+            std::fs::create_dir(&sub).unwrap();
+            std::fs::write(repo.join("outside"), "before\n").unwrap();
+            for name in names.into_iter().chain(["other", "a"]) {
+                std::fs::write(sub.join(name), "before\n").unwrap();
+            }
+            pathspec_git(&repo, &["add", "--all"]);
+            pathspec_git(&repo, &["commit", "-qm", "initial"]);
+            std::fs::write(repo.join("outside"), "after\n").unwrap();
+            for name in names.into_iter().chain(["other", "a"]) {
+                std::fs::write(sub.join(name), "after\n").unwrap();
+            }
+            for name in names {
+                let request =
+                    serde_json::json!({"type":"file_op", "path":sub, "op":"add", "file":name});
+                pathspec_request(request, &sub, remote).await;
+                assert_eq!(
+                    pathspec_git(&repo, &["diff", "--cached", "--name-only", "-z"]),
+                    format!("sub/{name}\0").as_bytes()
+                );
+                pathspec_git(&repo, &["add", "--all"]);
+                pathspec_request(
+                    serde_json::json!({"type":"file_op", "path":sub, "op":"reset", "file":name}),
+                    &sub,
+                    remote,
+                )
+                .await;
+                assert_eq!(
+                    pathspec_git(&repo, &["diff", "--name-only", "-z"]),
+                    format!("sub/{name}\0").as_bytes()
+                );
+                pathspec_git(&repo, &["reset", "-q"]);
+            }
+            // Repository-wide operations deliberately keep their top pathspec,
+            // even when invoked from a nested directory.
+            pathspec_request(
+                serde_json::json!({"type":"file_op", "path":sub, "op":"add_all", "file":"."}),
+                &sub,
+                remote,
+            )
+            .await;
+            assert!(pathspec_git(&repo, &["diff", "--name-only", "-z"]).is_empty());
+            pathspec_request(
+                serde_json::json!({"type":"file_op", "path":sub, "op":"reset_all", "file":"."}),
+                &sub,
+                remote,
+            )
+            .await;
+            assert!(pathspec_git(&repo, &["diff", "--cached", "--name-only", "-z"]).is_empty());
+            // A removed literal filename must stage its removal only.
+            std::fs::remove_file(sub.join("*")).unwrap();
+            pathspec_request(
+                serde_json::json!({"type":"file_op", "path":sub, "op":"add", "file":"*"}),
+                &sub,
+                remote,
+            )
+            .await;
+            assert_eq!(
+                pathspec_git(&repo, &["diff", "--cached", "--name-only", "-z"]),
+                b"sub/*\0"
+            );
+            std::fs::remove_dir_all(repo).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn literal_file_reads_and_hunk_mutations_do_not_include_other_paths() {
+        for remote in [false, true] {
+            for name in ["*", "[ab]", ":(exclude)other", ":(glob)*"] {
+                let repo = pathspec_repo();
+                let sub = repo.join("sub");
+                std::fs::create_dir(&sub).unwrap();
+                let file = sub.join(name);
+                std::fs::write(&file, "selected-before\nkeep\n").unwrap();
+                std::fs::write(sub.join("other"), "decoy-before\nkeep\n").unwrap();
+                std::fs::write(sub.join("a"), "second-decoy\nkeep\n").unwrap();
+                pathspec_git(&repo, &["add", "--all"]);
+                pathspec_git(&repo, &["commit", "-qm", "initial"]);
+                std::fs::write(sub.join("other"), "decoy-committed\nkeep\n").unwrap();
+                pathspec_git(&repo, &["add", "--all"]);
+                pathspec_git(&repo, &["commit", "-qm", "decoy-only"]);
+                let log =
+                    pathspec_request(serde_json::json!({"type":"log", "path":file}), &sub, remote)
+                        .await;
+                assert_eq!(log["entries"].as_array().unwrap().len(), 1, "{log}");
+                let show = pathspec_request(
+                    serde_json::json!({"type":"show", "path":file, "file":file, "rev":"HEAD~1"}),
+                    &sub,
+                    remote,
+                )
+                .await;
+                let lines = show["lines"].as_array().unwrap();
+                assert!(lines.iter().any(|line| line == "+selected-before"));
+                assert!(
+                    !lines
+                        .iter()
+                        .any(|line| line.as_str().unwrap().contains("decoy")),
+                    "{show}"
+                );
+                std::fs::write(&file, "selected-after\nkeep\n").unwrap();
+                std::fs::write(sub.join("other"), "decoy-after\nkeep\n").unwrap();
+                std::fs::write(sub.join("a"), "second-decoy-after\nkeep\n").unwrap();
+                let hunks = pathspec_request(
+                    serde_json::json!({"type":"hunks", "path":file}),
+                    &sub,
+                    remote,
+                )
+                .await;
+                assert_eq!(hunks["hunks"].as_array().unwrap().len(), 1, "{hunks}");
+                assert_eq!(hunks["hunks"][0]["lines"][2], "+selected-after");
+                // Object/index syntax isn't a pathspec and must not be escaped.
+                let cat = pathspec_request(
+                    serde_json::json!({"type":"cat", "path":file, "rev":"HEAD"}),
+                    &sub,
+                    remote,
+                )
+                .await;
+                assert_eq!(cat["lines"][0], "selected-before");
+                let live = pathspec_request(serde_json::json!({"type":"hunks", "path":file, "content":"selected-live\nkeep\n"}), &sub, remote).await;
+                assert_eq!(live["hunks"][0]["lines"][2], "+selected-live");
+                pathspec_request(
+                    serde_json::json!({"type":"stage", "path":file, "lnum":1}),
+                    &sub,
+                    remote,
+                )
+                .await;
+                assert_eq!(
+                    pathspec_git(&repo, &["diff", "--cached", "--name-only", "-z"]),
+                    format!("sub/{name}\0").as_bytes()
+                );
+                pathspec_git(&repo, &["reset", "-q"]);
+                pathspec_request(
+                    serde_json::json!({"type":"undo", "path":file, "lnum":1}),
+                    &sub,
+                    remote,
+                )
+                .await;
+                assert_eq!(
+                    std::fs::read_to_string(&file).unwrap(),
+                    "selected-before\nkeep\n"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(sub.join("other")).unwrap(),
+                    "decoy-after\nkeep\n"
+                );
+                std::fs::remove_dir_all(repo).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn file_operations_distinguish_one_file_from_the_repository() {
         assert_eq!(
             file_op_args("add", "dir/file.txt").unwrap(),
-            vec!["add", "--", "dir/file.txt"]
+            vec!["--literal-pathspecs", "add", "--", "dir/file.txt"]
         );
         assert_eq!(
             file_op_args("reset", "dir/file.txt").unwrap(),
-            vec!["reset", "-q", "--", "dir/file.txt"]
+            vec!["--literal-pathspecs", "reset", "-q", "--", "dir/file.txt"]
         );
         assert_eq!(
             file_op_args("add_all", ".").unwrap(),
