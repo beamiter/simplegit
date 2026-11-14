@@ -1702,7 +1702,11 @@ fn extract_hunk_patches(stdout: &str, first: u32, last: u32, revert: bool) -> Op
     let mut in_header = true;
     let mut keep = false;
     let mut delta: i64 = 0;
-    for line in stdout.lines() {
+    // Diff records are LF-delimited, but a trailing CR on a +/- body record
+    // belongs to the file content. str::lines() removes CRLF and silently
+    // changes the patch bytes, making CRLF staging/reverting fail (or match
+    // the wrong bytes). Preserve CR and no-final-newline markers verbatim.
+    for line in stdout.split_terminator('\n') {
         if line.starts_with("@@ ") {
             in_header = false;
             if keep {
@@ -4083,6 +4087,65 @@ u UU N... 100644 100644 100644 100644 aaaa bbbb cccc conflict.rs\0\
                 b"sub/*\0"
             );
             std::fs::remove_dir_all(repo).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn crlf_hunks_stage_and_undo_without_changing_other_line_endings() {
+        for remote in [false, true] {
+            // Also cover mixed endings and a final bare CR without a newline.
+            for mixed in [false, true] {
+                let repo = pathspec_repo();
+                pathspec_git(&repo, &["config", "core.autocrlf", "false"]);
+                pathspec_git(&repo, &["config", "core.safecrlf", "false"]);
+                let middle = if mixed {
+                    "three\nfour\r\n"
+                } else {
+                    "three\r\nfour\r\n"
+                };
+                let tail = if mixed { "six\r" } else { "six\r\n" };
+                let changed_tail = if mixed {
+                    "six changed\r"
+                } else {
+                    "six changed\r\n"
+                };
+                let before = format!("one\r\ntwo\r\n{middle}five\r\n{tail}");
+                let changed =
+                    format!("one\r\ntwo changed\r\n{middle}five changed\r\n{changed_tail}");
+                let staged = format!("one\r\ntwo changed\r\n{middle}five\r\n{tail}");
+                let sub = repo.join("sub");
+                std::fs::create_dir(&sub).unwrap();
+                let file = sub.join("sample.txt");
+                std::fs::write(&file, &before).unwrap();
+                pathspec_git(&repo, &["add", "--all"]);
+                std::fs::write(&file, &changed).unwrap();
+
+                pathspec_request(
+                    serde_json::json!({"type":"stage", "path":file, "lnum":2}),
+                    &sub,
+                    remote,
+                )
+                .await;
+                assert_eq!(
+                    pathspec_git(&repo, &["show", ":sub/sample.txt"]),
+                    staged.as_bytes()
+                );
+                assert_eq!(std::fs::read(&file).unwrap(), changed.as_bytes());
+
+                pathspec_request(
+                    serde_json::json!({"type":"undo", "path":file, "lnum":5, "last_lnum":6}),
+                    &sub,
+                    remote,
+                )
+                .await;
+                assert_eq!(std::fs::read(&file).unwrap(), staged.as_bytes());
+                assert_eq!(
+                    pathspec_git(&repo, &["show", ":sub/sample.txt"]),
+                    staged.as_bytes()
+                );
+                pathspec_git(&repo, &["diff", "--quiet"]);
+                std::fs::remove_dir_all(repo).unwrap();
+            }
         }
     }
 

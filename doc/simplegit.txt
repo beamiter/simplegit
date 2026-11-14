@@ -151,7 +151,8 @@ COMMANDS                                                   *simplegit-commands*
   hunk). The buffer must be saved first; hunks reflect the file on disk.
   With a range, every hunk the range touches is staged, as one patch: if any
   part of it will not apply, nothing is staged. A pure deletion is touched
-  only through the line its sign sits on.
+  only through the line its sign sits on. Patch construction preserves CRLF
+  and mixed line endings; Git attributes/conversion rules still apply.
   A range needs a daemon that advertises the `hunk_range` capability; against
   an older one the command refuses rather than quietly staging only the first
   hunk. |:SimpleGitHealth| reports it as "hunk ranges".

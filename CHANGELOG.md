@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Preserve CRLF bytes when staging or undoing hunks
+
+- Keep carriage returns in diff body records when reconstructing a selected
+  patch. CRLF files previously failed with `patch does not apply` because
+  splitting lines silently changed their content.
+- Regression coverage uses real Git stage/undo requests, including mixed line
+  endings, missing final newlines, subdirectories, and prefixed Git execution.
+  Git's own attributes and line-ending conversion rules remain unchanged.
+
 ### Treat single-file Git paths literally
 
 - Stage/reset, file history, filtered commit views, disk hunks, and hunk
