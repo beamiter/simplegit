@@ -26,7 +26,7 @@ vim-test:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_smoke.vim
 
 # Drives the real daemon; skips cleanly when lib/simplegit-daemon is absent.
-vim-integration:
+vim-integration: vim-selected-lines-preview
 	# This suite verifies a linewise Visual text object.  Ex mode cannot enter
 	# Visual mode, even through :normal, so run normal Vim while keeping its
 	# screen rendering out of successful build logs.  On failure the captured
@@ -36,6 +36,15 @@ vim-integration:
 	vim -Nu NONE -n -i NONE -S tests/vim_integration.vim -c 'cquit!' >$$log 2>&1 || status=$$?; \
 	if [ $$status -ne 0 ]; then cat $$log >&2; fi; \
 	rm -f $$log; exit $$status
+
+# The real backend is intentionally Linux x86-64-only. A missing installed
+# helper has the same local skip policy as vim-integration.
+.PHONY: vim-selected-lines-preview
+vim-selected-lines-preview:
+	@if [ "$$(uname -s):$$(uname -m)" = Linux:x86_64 ] && [ -x lib/simplegit-daemon ]; then \
+	  vim -Nu NONE -n -i NONE -es -S tests/vim_selected_lines_preview.vim -c 'cquit!' \
+	    && echo "selected-line Vim integration passed"; \
+	else echo "selected-line Vim integration skipped (Linux x86-64 installed daemon required)"; fi
 
 # Drives real `git commit` inside throwaway repositories.
 vim-commit:

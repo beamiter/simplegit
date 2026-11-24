@@ -146,6 +146,24 @@ COMMANDS                                                   *simplegit-commands*
   or decoration uses compatibility rendering. Ordinary Vim and older hosts
   ignore the rendering hint. Remove it before adding masks/nonrectangular UI.
 
+:[range]SimpleGitSelectedLinesPreview           *:SimpleGitSelectedLinesPreview*
+  Preview only the selected saved lines in a read-only diff split. With no
+  range, preview the cursor line; for a Visual selection use the command or
+  map <Plug>(simplegit-selected-lines-preview). Press q to close the split.
+
+  Requires the current Linux x86-64 daemon and an unmodified ordinary local
+  UTF-8 tracked file (LF/CRLF, at most 256 KiB and 16,384 lines). If the saved
+  bytes no longer match the Vim buffer, reload first. Inserts can be selected
+  individually; select the entire postimage of a replacement or the preview
+  refuses to guess. Pure deletions do not select themselves. The split shows
+  captured Git blob IDs and a patch, not a reservation of the index.
+  No staging operation is performed, and hunk commands are unchanged.
+
+  Leaving the requesting window/buffer or editing it discards a late result.
+  There is only one preview helper at a time. The helper finishes its work
+  and removes its temporary files even if Vim discards the result or quits.
+  If a preview gets stuck, restart Vim and check the installed helper.
+
 :[range]SimpleGitHunkStage                                *:SimpleGitHunkStage*
   Stage the hunk under the cursor into the index (like git add -p for one
   hunk). The buffer must be saved first; hunks reflect the file on disk.
@@ -188,6 +206,8 @@ MAPPINGS                                                   *simplegit-mappings*
   <Plug>(simplegit-hunk-next)          :SimpleGitHunkNext
   <Plug>(simplegit-hunk-prev)          :SimpleGitHunkPrev
   <Plug>(simplegit-hunk-preview)       :SimpleGitHunkPreview
+  <Plug>(simplegit-selected-lines-preview)   :SimpleGitSelectedLinesPreview
+                                            (Visual; no default key)
   <Plug>(simplegit-hunk-stage)         :SimpleGitHunkStage
   <Plug>(simplegit-hunk-undo)          :SimpleGitHunkUndo
 <

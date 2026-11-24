@@ -222,3 +222,38 @@ fn preview_never_runs_repository_fsmonitor() {
         "read-only preview invoked repository executable"
     );
 }
+
+#[test]
+fn confirmed_buffer_requires_exact_saved_bytes_and_a_bounded_complete_frame() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let r = Repo::new(b"old\r\ntail", b"old\r\nnew\r\ntail");
+    let run = |declared: usize, input: &[u8]| {
+        let mut child = Command::new(BIN)
+            .arg("--preview-selected-buffer-lines")
+            .arg(declared.to_string())
+            .args(["2", "2", "--"])
+            .arg(r.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let saved = b"old\r\nnew\r\ntail";
+    let success = run(saved.len(), saved);
+    assert!(success.status.success(), "{success:?}");
+    assert!(success.stdout.ends_with(b"+new\r\n"));
+    let wrong = b"old\r\nBAD\r\ntail";
+    let mismatch = run(wrong.len(), wrong);
+    assert!(mismatch.stdout.is_empty() && !mismatch.status.success());
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("saved bytes no longer match"));
+    let short = run(saved.len(), &saved[..saved.len() - 1]);
+    assert!(short.stdout.is_empty() && !short.status.success());
+    let large = run(256 * 1024 + 1, b"");
+    assert!(large.stdout.is_empty() && !large.status.success());
+    assert!(String::from_utf8_lossy(&large.stderr).contains("byte budget"));
+}

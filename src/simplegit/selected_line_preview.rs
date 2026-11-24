@@ -413,11 +413,21 @@ fn plain_attributes(root: &Path, file: &str) -> PreviewResult<()> {
     Ok(())
 }
 
-fn preview(path: &Path, first: usize, last: usize) -> PreviewResult<Vec<u8>> {
+fn preview(
+    path: &Path,
+    first: usize,
+    last: usize,
+    expected: Option<&[u8]>,
+) -> PreviewResult<Vec<u8>> {
     // Restrict V1 to files whose names are represented literally in unified
     // diff headers, not display-path quoting or virtual/foreign workspaces.
     let path = std::path::absolute(path).map_err(|e| e.to_string())?;
     let (identity, saved) = saved_file(&path)?;
+    if expected.is_some_and(|bytes| bytes != saved) {
+        return Err(fail(
+            "saved bytes no longer match the Vim buffer; reload before previewing",
+        ));
+    }
     rows(&saved)?;
     let parent = path.parent().ok_or_else(|| fail("missing file parent"))?;
     let root = git(parent, &["rev-parse", "--show-toplevel"], None, 4096, &[0])?;
@@ -504,7 +514,25 @@ fn preview(path: &Path, first: usize, last: usize) -> PreviewResult<Vec<u8>> {
     Ok(out)
 }
 
-pub fn run_cli(args: &[String], mut output: impl Write) -> PreviewResult<()> {
+pub fn run_cli(
+    args: &[String],
+    from_buffer: bool,
+    mut input: impl Read,
+    mut output: impl Write,
+) -> PreviewResult<()> {
+    let (args, expected_len) = if from_buffer {
+        let Some((len, args)) = args.split_first() else {
+            return Err(fail("missing selected buffer byte count"));
+        };
+        let len = len
+            .parse::<usize>()
+            .ok()
+            .filter(|&len| len <= FILE_LIMIT)
+            .ok_or_else(|| fail("selected buffer exceeds its byte budget"))?;
+        (args, Some(len))
+    } else {
+        (args, None)
+    };
     let [first, last, separator, path] = args else {
         return Err(fail("usage: --preview-selected-lines FIRST LAST -- FILE"));
     };
@@ -517,7 +545,16 @@ pub fn run_cli(args: &[String], mut output: impl Write) -> PreviewResult<()> {
     let last = last
         .parse()
         .map_err(|_| fail("invalid last selected line"))?;
+    // Bounded exact frame, not an EOF protocol. Vim can queue a nonblocking
+    // channel write and leave stdin open until the job exits.
+    let expected = if let Some(len) = expected_len {
+        let mut bytes = vec![0; len];
+        input.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+        Some(bytes)
+    } else {
+        None
+    };
     output
-        .write_all(&preview(Path::new(path), first, last)?)
+        .write_all(&preview(Path::new(path), first, last, expected.as_deref())?)
         .map_err(|e| e.to_string())
 }

@@ -57,6 +57,7 @@ The installer performs a locked release build, atomically installs `lib/simplegi
 | `:SimpleGitStageAll` / `:SimpleGitUnstageAll` | Stage / unstage the whole repository |
 | `:SimpleGitToggleLineBlame` | Toggle the inline annotation |
 | `:SimpleGitHunkNext` / `:SimpleGitHunkPrev` | Jump to the next/previous hunk |
+| `:[range]SimpleGitSelectedLinesPreview` | Read-only diff of selected saved lines (Linux x86-64) |
 | `:[range]SimpleGitHunkPreview` | Popup diff of the hunk under the cursor, or of every hunk in the range |
 | `:[range]SimpleGitHunkStage` | Stage the hunk under the cursor, or every hunk the range touches |
 | `:[range]SimpleGitHunkUndo` | Revert the hunk under the cursor, or every hunk the range touches |
@@ -65,10 +66,14 @@ The installer performs a locked release build, atomically installs `lib/simplegi
 
 ### Selected lines: read-only preview (Linux x86-64)
 
-```sh
-./lib/simplegit-daemon --preview-selected-lines 12 14 -- /path/to/tracked-file
-```
+In an unmodified local file, select a range in Vim and run
+`:'<,'>SimpleGitSelectedLinesPreview` (or use `:12,14SimpleGitSelectedLinesPreview`).
+Without a range it uses the cursor line. The split is read-only; press `q`
+to close it. Reload if another process changed the saved bytes since Vim
+last read them. Reinstall the preview daemon after updating the plugin.
 
+The standalone equivalent is
+`./lib/simplegit-daemon --preview-selected-lines 12 14 -- /path/to/tracked-file`.
 The inclusive range is in the saved file, not unsaved Vim text. The preview
 reports the worktree/path, mode, original indexed blob ID, saved blob ID and
 proposed blob ID, then the Git-rendered patch. It does **not** stage anything,

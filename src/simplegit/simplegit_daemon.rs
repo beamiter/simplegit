@@ -2951,8 +2951,13 @@ async fn main() -> std::process::ExitCode {
             std::process::ExitCode::SUCCESS
         }
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        Some("--preview-selected-lines") => {
-            match selected_line_preview::run_cli(&args[1..], std::io::stdout().lock()) {
+        Some(flag @ ("--preview-selected-lines" | "--preview-selected-buffer-lines")) => {
+            match selected_line_preview::run_cli(
+                &args[1..],
+                flag == "--preview-selected-buffer-lines",
+                std::io::stdin().lock(),
+                std::io::stdout().lock(),
+            ) {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(message) => {
                     eprintln!("simplegit-daemon: {message}");

@@ -128,6 +128,7 @@ command! SimpleGitHunkPrev simplegit#HunkPrev()
 # -range: with no range Vim passes the cursor line as both ends, so the
 # rangeless forms keep meaning exactly what they always did.
 command! -range SimpleGitHunkPreview simplegit#HunkPreview(<line1>, <line2>)
+command! -range SimpleGitSelectedLinesPreview simplegit#line_preview#Start(<line1>, <line2>)
 command! -range SimpleGitHunkStage simplegit#HunkStage(<line1>, <line2>)
 command! -range SimpleGitHunkUndo simplegit#HunkUndo(<line1>, <line2>)
 command! SimpleGitToggleSigns simplegit#ToggleSigns()
@@ -158,6 +159,7 @@ nnoremap <silent> <Plug>(simplegit-hunk-undo) <Cmd>SimpleGitHunkUndo<CR>
 xnoremap <silent> <Plug>(simplegit-hunk-stage) :SimpleGitHunkStage<CR>
 xnoremap <silent> <Plug>(simplegit-hunk-undo) :SimpleGitHunkUndo<CR>
 xnoremap <silent> <Plug>(simplegit-hunk-preview) :SimpleGitHunkPreview<CR>
+xnoremap <silent> <Plug>(simplegit-selected-lines-preview) :SimpleGitSelectedLinesPreview<CR>
 
 # Hunk text objects.  ':<C-u>' rather than '<Cmd>': the function reselects
 # linewise, which a <Cmd> mapping is not allowed to do.
