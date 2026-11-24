@@ -2887,6 +2887,8 @@ Options:
       --self-test  run one request through the daemon in-process and exit
       --preview-selected-lines FIRST LAST -- FILE
                    print a read-only saved-file preview (Linux x86-64)
+      --stage-selected-lines-confirmed INDEX SAVED PROPOSED FIRST LAST -- FILE
+                   stage only the explicitly confirmed preview (Linux x86-64)
 ";
 
 /// Drives a real request through [`run`] over in-memory pipes.
@@ -2958,6 +2960,16 @@ async fn main() -> std::process::ExitCode {
                 std::io::stdin().lock(),
                 std::io::stdout().lock(),
             ) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(message) => {
+                    eprintln!("simplegit-daemon: {message}");
+                    std::process::ExitCode::FAILURE
+                }
+            }
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        Some("--stage-selected-lines-confirmed") => {
+            match selected_line_preview::run_confirmed_stage(&args[1..], std::io::stdout().lock()) {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(message) => {
                     eprintln!("simplegit-daemon: {message}");

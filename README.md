@@ -92,7 +92,21 @@ ASCII repository-relative names. It rejects symlinks, mode changes, special
 index entries and any Git attributes or autocrlf setting that could change
 the line coordinate system. It checks the captured target index entry and
 saved file again before reporting but does not reserve the index afterward.
-There is no apply subcommand.
+#### Explicit staging from the CLI
+
+Only after reviewing that preview, pass its `index-snapshot`, `saved` and
+`proposed` values, along with the same saved-file range and path:
+
+```sh
+./lib/simplegit-daemon --stage-selected-lines-confirmed INDEX_SNAPSHOT SAVED PROPOSED 12 14 -- /path/to/tracked-file
+```
+
+If another writer changed the index, the saved bytes changed, or Git cannot
+acquire and prove ownership of its normal index lock, the confirmation is
+refused. Re-open the preview rather than retrying the old confirmation. Only
+ordinary single-index Linux x86-64 worktrees with accessible `/proc` support this
+operation. The command stages the reviewed blob only; it does not save, commit,
+push, or overwrite the worktree. Vim's preview command is still read-only.
 
 ### Statusline
 

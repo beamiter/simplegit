@@ -4,8 +4,9 @@ use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 const FILE_LIMIT: usize = 256 * 1024;
 const INDEX_LIMIT: usize = 8 * 1024 * 1024;
@@ -35,13 +36,7 @@ fn read_limited(reader: impl Read, max: usize) -> PreviewResult<Vec<u8>> {
     Ok(bytes)
 }
 
-fn git(
-    cwd: &Path,
-    args: &[&str],
-    input: Option<&Path>,
-    limit: usize,
-    ok: &[i32],
-) -> PreviewResult<Vec<u8>> {
+fn git_command(cwd: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(cwd)
         .args(args)
@@ -56,6 +51,7 @@ fn git(
     // Set known safeguards after deleting inherited Git environment.
     cmd.env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_ALLOW_PROTOCOL", "")
         // A repository can configure an executable fsmonitor for otherwise
         // read-only commands. The preview must not invoke it or other hooks.
@@ -64,6 +60,17 @@ fn git(
         .env("GIT_CONFIG_VALUE_0", "false")
         .env("GIT_CONFIG_KEY_1", "core.hooksPath")
         .env("GIT_CONFIG_VALUE_1", "/dev/null");
+    cmd
+}
+
+fn git(
+    cwd: &Path,
+    args: &[&str],
+    input: Option<&Path>,
+    limit: usize,
+    ok: &[i32],
+) -> PreviewResult<Vec<u8>> {
+    let mut cmd = git_command(cwd, args);
     cmd.stdin(match input {
         Some(path) => Stdio::from(File::open(path).map_err(|e| e.to_string())?),
         None => Stdio::null(),
@@ -451,12 +458,26 @@ fn plain_attributes(root: &Path, file: &str) -> PreviewResult<()> {
     Ok(())
 }
 
+struct Preview {
+    root: PathBuf,
+    path: PathBuf,
+    file: String,
+    entry: (String, String),
+    saved: (FileIdentity, Vec<u8>),
+    index: Option<(FileIdentity, Vec<u8>)>,
+    index_id: String,
+    saved_id: String,
+    proposed_id: String,
+    scratch: Scratch,
+    output: Vec<u8>,
+}
+
 fn preview(
     path: &Path,
     first: usize,
     last: usize,
     expected: Option<&[u8]>,
-) -> PreviewResult<Vec<u8>> {
+) -> PreviewResult<Preview> {
     // Restrict V1 to files whose names are represented literally in unified
     // diff headers, not display-path quoting or virtual/foreign workspaces.
     let path = std::path::absolute(path).map_err(|e| e.to_string())?;
@@ -546,7 +567,8 @@ fn preview(
     // Last checks are not an apply lock. They disallow a known stale preview;
     // this CLI offers no commit operation and does not write index or objects.
     plain_attributes(root, file)?;
-    if index_entry(root, file)? != entry || saved_file(&path)? != (identity, saved) {
+    let saved_snapshot = (identity, saved);
+    if index_entry(root, file)? != entry || saved_file(&path)? != saved_snapshot {
         return Err(fail(
             "index entry or saved file changed while building preview",
         ));
@@ -559,7 +581,158 @@ fn preview(
         entry.0, entry.1
     ).into_bytes();
     out.extend(body);
-    Ok(out)
+    Ok(Preview {
+        root: root.to_path_buf(),
+        file: file.to_owned(),
+        path,
+        entry,
+        saved: saved_snapshot,
+        index: whole_index,
+        index_id,
+        saved_id,
+        proposed_id,
+        scratch,
+        output: out,
+    })
+}
+
+// Git itself owns and cleans up the original index.lock. Before a proposed
+// record has been sent, closing stdin asks it to exit without any mutation.
+struct NativeIndexWriter(Child);
+
+impl Drop for NativeIndexWriter {
+    fn drop(&mut self) {
+        drop(self.0.stdin.take());
+        let _ = self.0.wait();
+    }
+}
+
+impl NativeIndexWriter {
+    fn start(root: &Path) -> PreviewResult<Self> {
+        git_command(root, &["update-index", "--index-info"])
+            .stdout(Stdio::null())
+            .stdin(Stdio::piped())
+            .spawn()
+            .map(Self)
+            .map_err(|e| e.to_string())
+    }
+
+    fn owns_lock(&mut self, root: &Path) -> PreviewResult<()> {
+        let lock = root.join(".git/index.lock");
+        let fds = PathBuf::from(format!("/proc/{}/fd", self.0.id()));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if self.0.try_wait().map_err(|e| e.to_string())?.is_some() {
+                return Err(fail("Git could not acquire the index lock"));
+            }
+            if let Ok(stat) = lock.symlink_metadata()
+                && stat.is_file()
+                && fs::read_dir(&fds).is_ok_and(|entries| {
+                    entries.flatten().any(|fd| {
+                        fs::metadata(fd.path())
+                            .is_ok_and(|m| m.dev() == stat.dev() && m.ino() == stat.ino())
+                    })
+                })
+            {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Err(fail("could not verify that Git owns the index lock"))
+    }
+
+    fn commit(&mut self, mode: &str, oid: &str, file: &str) -> PreviewResult<()> {
+        let mut input = self
+            .0
+            .stdin
+            .take()
+            .ok_or_else(|| fail("Git stdin closed"))?;
+        // Only a tracked, plain ASCII file path and Git-validated mode/OID
+        // reach this record. A partial record without its newline is invalid.
+        writeln!(input, "{mode} {oid}\t{file}").map_err(|e| e.to_string())?;
+        drop(input);
+        if !self.0.wait().map_err(|e| e.to_string())?.success() {
+            return Err(fail(
+                "Git did not confirm the staged update; check the index before retrying",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn ordinary_index_config(root: &Path) -> PreviewResult<()> {
+    for key in ["core.splitIndex", "index.sparse"] {
+        let value = git(root, &["config", "--bool", "--get", key], None, 64, &[0, 1])?;
+        if !matches!(value.as_slice(), b"" | b"false\n") {
+            return Err(fail(
+                "confirmed staging requires an ordinary single Git index",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn run_confirmed_stage(args: &[String], mut output: impl Write) -> PreviewResult<()> {
+    let [index, saved, proposed, first, last, separator, path] = args else {
+        return Err(fail(
+            "usage: --stage-selected-lines-confirmed INDEX SAVED PROPOSED FIRST LAST -- FILE",
+        ));
+    };
+    if separator != "--" {
+        return Err(fail("expected -- before the saved path"));
+    }
+    for oid in [index, saved, proposed] {
+        blob_id(oid.as_bytes())?;
+    }
+    let first = first
+        .parse()
+        .map_err(|_| fail("invalid first selected line"))?;
+    let last = last
+        .parse()
+        .map_err(|_| fail("invalid last selected line"))?;
+    let plan = preview(Path::new(path), first, last, None)?;
+    if plan.index.is_none()
+        || &plan.index_id != index
+        || &plan.saved_id != saved
+        || &plan.proposed_id != proposed
+    {
+        return Err(fail(
+            "reviewed index or content changed; preview again before staging",
+        ));
+    }
+    ordinary_index_config(&plan.root)?;
+    let mut writer = NativeIndexWriter::start(&plan.root)?;
+    writer.owns_lock(&plan.root)?;
+    ordinary_index_config(&plan.root)?;
+    if index_snapshot(&plan.root) != plan.index
+        || saved_file(&plan.path)? != plan.saved
+        || index_entry(&plan.root, &plan.file)? != plan.entry
+    {
+        return Err(fail(
+            "index or saved file changed before confirmation; preview again",
+        ));
+    }
+    plain_attributes(&plan.root, &plan.file)?;
+    let blob = git(
+        &plan.root,
+        &["hash-object", "--no-filters", "-w", "--stdin"],
+        Some(&plan.scratch.0.join("proposed")),
+        128,
+        &[0],
+    )?;
+    let oid = blob_id(&blob)?;
+    if oid != proposed
+        || index_snapshot(&plan.root) != plan.index
+        || saved_file(&plan.path)? != plan.saved
+    {
+        return Err(fail(
+            "index or saved file changed before staging; preview again",
+        ));
+    }
+    writer.commit(&plan.entry.0, oid, &plan.file)?;
+    writeln!(output, "Selected lines staged: {}", plan.file).map_err(|e| {
+        format!("selected lines were staged, but the receipt could not be written: {e}")
+    })
 }
 
 pub fn run_cli(
@@ -603,6 +776,6 @@ pub fn run_cli(
         None
     };
     output
-        .write_all(&preview(Path::new(path), first, last, expected.as_deref())?)
+        .write_all(&preview(Path::new(path), first, last, expected.as_deref())?.output)
         .map_err(|e| e.to_string())
 }

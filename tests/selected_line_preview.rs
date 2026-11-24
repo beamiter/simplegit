@@ -327,3 +327,142 @@ exec "$REAL_GIT" "$@"
     assert_eq!(fs::read(r.path()).unwrap(), b"new\n");
     assert!(!r.0.join(".git/index.lock").exists());
 }
+
+fn confirmation(r: &Repo, first: &str, last: &str) -> Vec<String> {
+    let preview = String::from_utf8(r.success(first, last)).unwrap();
+    ["index-snapshot ", "saved ", "proposed "]
+        .iter()
+        .map(|key| {
+            preview
+                .lines()
+                .find_map(|row| row.strip_prefix(key))
+                .unwrap()
+                .to_owned()
+        })
+        .chain([first.to_owned(), last.to_owned(), "--".to_owned()])
+        .chain([r.path().to_str().unwrap().to_owned()])
+        .collect()
+}
+
+fn confirm(args: &[String]) -> Output {
+    Command::new(BIN)
+        .arg("--stage-selected-lines-confirmed")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn confirmed_stage_updates_only_the_reviewed_crlf_row() {
+    let saved = b"one\r\nSELECT\r\nNO-DEBUG\r\ntail";
+    let r = Repo::new(b"one\r\ntail", saved);
+    fs::write(r.0.join("other.txt"), b"unrelated staged file\n").unwrap();
+    r.git(&["add", "other.txt"]);
+    let args = confirmation(&r, "2", "2");
+    let before = fs::read(r.0.join(".git/index")).unwrap();
+    let output = confirm(&args);
+    assert!(output.status.success(), "{output:?}");
+    assert_ne!(fs::read(r.0.join(".git/index")).unwrap(), before);
+    assert_eq!(r.git(&["show", ":chosen.txt"]), b"one\r\nSELECT\r\ntail");
+    assert_eq!(r.git(&["show", ":other.txt"]), b"unrelated staged file\n");
+    assert_eq!(fs::read(r.path()).unwrap(), saved);
+    assert!(!r.0.join(".git/index.lock").exists());
+    let after = fs::read(r.0.join(".git/index")).unwrap();
+    assert!(
+        !confirm(&args).status.success(),
+        "a confirmation was reused"
+    );
+    assert_eq!(fs::read(r.0.join(".git/index")).unwrap(), after);
+}
+
+#[test]
+fn confirmation_rejects_changed_tokens_saved_bytes_and_busy_lock() {
+    let r = Repo::new(b"old\n", b"new\n");
+    let args = confirmation(&r, "1", "1");
+    let original = fs::read(r.0.join(".git/index")).unwrap();
+    let objects = r.counts();
+    for slot in 0..3 {
+        let mut wrong = args.clone();
+        wrong[slot] = "0".repeat(wrong[slot].len());
+        let output = confirm(&wrong);
+        assert!(!output.status.success() && output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("preview again"));
+    }
+    fs::write(r.path(), b"not reviewed\n").unwrap();
+    assert!(!confirm(&args).status.success());
+    fs::write(r.path(), b"new\n").unwrap();
+    let lock = r.0.join(".git/index.lock");
+    fs::write(&lock, b"unrelated writer").unwrap();
+    let output = confirm(&args);
+    assert!(!output.status.success() && output.stdout.is_empty());
+    assert_eq!(fs::read(&lock).unwrap(), b"unrelated writer");
+    assert_eq!(fs::read(r.0.join(".git/index")).unwrap(), original);
+    assert_eq!(r.counts(), objects, "rejected confirmation wrote objects");
+    fs::remove_file(lock).unwrap();
+}
+
+#[test]
+fn writer_before_native_lock_rejects_confirmation_without_touching_either_entry() {
+    let r = Repo::new(b"old\n", b"new\n");
+    fs::write(r.0.join("other.txt"), b"before\n").unwrap();
+    r.git(&["add", "other.txt"]);
+    let args = confirmation(&r, "1", "1");
+    fs::write(r.0.join("other.txt"), b"independent\n").unwrap();
+    let bin = r.0.join("shim");
+    fs::create_dir(&bin).unwrap();
+    let reached = r.0.join("writer-ran");
+    let shim = bin.join("git");
+    let path = std::env::var_os("PATH").unwrap();
+    let real_git = std::env::split_paths(&path)
+        .map(|p| p.join("git"))
+        .find(|p| p.is_file())
+        .unwrap();
+    fs::write(
+        &shim,
+        r#"#!/bin/sh
+if [ "$1" = update-index ] && [ ! -e "$RACE_REACHED" ]; then
+    "$REAL_GIT" -C "$RACE_REPO" add -- other.txt || exit 92
+    : >"$RACE_REACHED"
+fi
+exec "$REAL_GIT" "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut dirs = vec![bin];
+    dirs.extend(std::env::split_paths(&path));
+    let output = Command::new(BIN)
+        .env("PATH", std::env::join_paths(dirs).unwrap())
+        .env("RACE_REACHED", &reached)
+        .env("RACE_REPO", &r.0)
+        .env("REAL_GIT", real_git)
+        .arg("--stage-selected-lines-confirmed")
+        .args(&args)
+        .output()
+        .unwrap();
+    assert!(reached.exists(), "intervening writer did not run");
+    assert!(
+        !output.status.success() && output.stdout.is_empty(),
+        "{output:?}"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("changed before confirmation"));
+    assert_eq!(r.git(&["show", ":chosen.txt"]), b"old\n");
+    assert_eq!(r.git(&["show", ":other.txt"]), b"independent\n");
+    assert_eq!(fs::read(r.path()).unwrap(), b"new\n");
+    assert!(!r.0.join(".git/index.lock").exists());
+}
+
+#[test]
+fn confirmation_refuses_configuration_that_would_convert_the_index() {
+    let r = Repo::new(b"old\n", b"new\n");
+    let args = confirmation(&r, "1", "1");
+    let before = fs::read(r.0.join(".git/index")).unwrap();
+    r.git(&["config", "core.splitIndex", "true"]);
+    let output = confirm(&args);
+    assert!(!output.status.success() && output.stdout.is_empty());
+    // Different Git versions can detect the now-unsupported layout during
+    // review revalidation or at the explicit ordinary-index gate.
+    assert!(!output.stderr.is_empty());
+    assert_eq!(fs::read(r.0.join(".git/index")).unwrap(), before);
+    assert!(!r.0.join(".git/index.lock").exists());
+}
