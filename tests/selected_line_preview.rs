@@ -257,3 +257,73 @@ fn confirmed_buffer_requires_exact_saved_bytes_and_a_bounded_complete_frame() {
     assert!(large.stdout.is_empty() && !large.status.success());
     assert!(String::from_utf8_lossy(&large.stderr).contains("byte budget"));
 }
+
+#[test]
+fn reports_a_whole_index_snapshot_only_for_an_ordinary_index() {
+    let r = Repo::new(b"old\n", b"new\n");
+    let expected = r.git(&["hash-object", "--no-filters", ".git/index"]);
+    let expected = std::str::from_utf8(&expected).unwrap().trim_end();
+    let text = String::from_utf8(r.success("1", "1")).unwrap();
+    assert!(text.contains(&format!("\nindex-snapshot {expected}\n")));
+    r.git(&["update-index", "--split-index"]);
+    let split = r.run("1", "1", &r.path());
+    if split.status.success() {
+        let text = String::from_utf8(split.stdout).unwrap();
+        assert!(text.contains("\nindex-snapshot unavailable\n"));
+    } else {
+        // Git versions can expose split entries as special index flags,
+        // which already make a preview ineligible.
+        assert!(split.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&split.stderr).contains("special index entry flags"));
+    }
+}
+
+#[test]
+fn unrelated_git_writer_retires_the_whole_index_preview() {
+    let r = Repo::new(b"old\n", b"new\n");
+    fs::write(r.0.join("other.txt"), b"before\n").unwrap();
+    r.git(&["add", "other.txt"]);
+    fs::write(r.0.join("other.txt"), b"independent\n").unwrap();
+    let bin = r.0.join("shim");
+    fs::create_dir(&bin).unwrap();
+    let reached = r.0.join("writer-ran");
+    let shim = bin.join("git");
+    let path = std::env::var_os("PATH").unwrap();
+    let real_git = std::env::split_paths(&path)
+        .map(|p| p.join("git"))
+        .find(|p| p.is_file())
+        .unwrap();
+    fs::write(
+        &shim,
+        r#"#!/bin/sh
+if [ "$1" = --no-pager ] && [ ! -e "$RACE_REACHED" ]; then
+    "$REAL_GIT" -C "$RACE_REPO" add -- other.txt || exit 92
+    : >"$RACE_REACHED"
+fi
+exec "$REAL_GIT" "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut dirs = vec![bin];
+    dirs.extend(std::env::split_paths(&path));
+    let output = Command::new(BIN)
+        .env("PATH", std::env::join_paths(dirs).unwrap())
+        .env("RACE_REACHED", &reached)
+        .env("RACE_REPO", &r.0)
+        .env("REAL_GIT", real_git)
+        .args(["--preview-selected-lines", "1", "1", "--"])
+        .arg(r.path())
+        .output()
+        .unwrap();
+    assert!(reached.exists(), "external writer did not run");
+    assert!(
+        !output.status.success() && output.stdout.is_empty(),
+        "{output:?}"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Git index changed"));
+    assert_eq!(r.git(&["show", ":chosen.txt"]), b"old\n");
+    assert_eq!(r.git(&["show", ":other.txt"]), b"independent\n");
+    assert_eq!(fs::read(r.path()).unwrap(), b"new\n");
+    assert!(!r.0.join(".git/index.lock").exists());
+}

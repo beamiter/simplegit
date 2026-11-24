@@ -156,7 +156,11 @@ COMMANDS                                                   *simplegit-commands*
   bytes no longer match the Vim buffer, reload first. Inserts can be selected
   individually; select the entire postimage of a replacement or the preview
   refuses to guess. Pure deletions do not select themselves. The split shows
-  captured Git blob IDs and a patch, not a reservation of the index.
+  captured Git blob IDs and a patch. For an ordinary index up to 8 MiB it
+  reports index-snapshot and refuses to show a result if any part of that
+  index changes during preview. In unsupported layouts, such as a linked
+  worktree or split index, no usable identifier is produced. A preview is
+  never a reservation of the index.
   No staging operation is performed, and hunk commands are unchanged.
 
   Leaving the requesting window/buffer or editing it discards a late result.

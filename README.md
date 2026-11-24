@@ -76,7 +76,12 @@ The standalone equivalent is
 `./lib/simplegit-daemon --preview-selected-lines 12 14 -- /path/to/tracked-file`.
 The inclusive range is in the saved file, not unsaved Vim text. The preview
 reports the worktree/path, mode, original indexed blob ID, saved blob ID and
-proposed blob ID, then the Git-rendered patch. It does **not** stage anything,
+proposed blob ID, then the Git-rendered patch. For an ordinary single Git
+index of at most 8 MiB, it also reports an `index-snapshot` identifier and
+rejects changes to the entire index during preview, including unrelated paths.
+Unsupported index layouts, such as linked worktrees and split indexes, do
+not produce a usable index identifier. The identifier does not reserve the index or authorize a write.
+The preview does **not** stage anything,
 write Git objects or change the existing hunk commands. Partial insertions are
 supported; a replacement must include every new line in its run or the preview
 refuses to guess which deletions you intended. Deletion-only changes are not

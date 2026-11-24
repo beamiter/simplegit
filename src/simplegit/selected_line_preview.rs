@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const FILE_LIMIT: usize = 256 * 1024;
+const INDEX_LIMIT: usize = 8 * 1024 * 1024;
 const DIFF_LIMIT: usize = 1024 * 1024;
 const MAX_ROWS: usize = 16_384;
 // Linux x86-64 only; other targets do not expose this CLI operation.
@@ -109,7 +110,7 @@ impl Drop for Scratch {
 
 // Walk pinned directory descriptors; never open a path by following a changed
 // component or a symlink. O_PATH lets us reject devices/FIFOs before reading.
-fn saved_file(path: &Path) -> PreviewResult<(FileIdentity, Vec<u8>)> {
+fn read_regular(path: &Path, limit: usize) -> PreviewResult<(FileIdentity, Vec<u8>)> {
     let open_path = |path: &Path| {
         OpenOptions::new()
             .read(true)
@@ -138,7 +139,7 @@ fn saved_file(path: &Path) -> PreviewResult<(FileIdentity, Vec<u8>)> {
         }
     }
     let stat = file.metadata().map_err(|e| e.to_string())?;
-    if !stat.is_file() || stat.len() > FILE_LIMIT as u64 {
+    if !stat.is_file() || stat.len() > limit as u64 {
         return Err(fail(
             "selected-line preview requires a small regular non-symlink file",
         ));
@@ -146,8 +147,45 @@ fn saved_file(path: &Path) -> PreviewResult<(FileIdentity, Vec<u8>)> {
     let read = File::open(fd_path(&file)).map_err(|e| e.to_string())?;
     Ok((
         (stat.dev(), stat.ino(), stat.mode()),
-        read_limited(read, FILE_LIMIT)?,
+        read_limited(read, limit)?,
     ))
+}
+
+fn saved_file(path: &Path) -> PreviewResult<(FileIdentity, Vec<u8>)> {
+    read_regular(path, FILE_LIMIT)
+}
+
+// A proof for a bounded, ordinary single index. Linked worktrees, separate
+// Git dirs and split-index repositories may still preview, but have no
+// single-file snapshot identity suitable for a later conditional operation.
+fn index_snapshot(root: &Path) -> Option<(FileIdentity, Vec<u8>)> {
+    let dot_git = root.join(".git");
+    if !dot_git.symlink_metadata().ok()?.is_dir()
+        || !git(
+            root,
+            &["rev-parse", "--path-format=absolute", "--shared-index-path"],
+            None,
+            4096,
+            &[0],
+        )
+        .ok()?
+        .is_empty()
+    {
+        return None;
+    }
+    let path = dot_git.join("index");
+    let actual = git(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        None,
+        4096,
+        &[0],
+    )
+    .ok()?;
+    if actual.strip_suffix(b"\n")? != path.as_os_str().as_encoded_bytes() {
+        return None;
+    }
+    read_regular(&path, INDEX_LIMIT).ok()
 }
 
 fn diff(scratch: &Path, right: &str) -> PreviewResult<Vec<u8>> {
@@ -452,6 +490,7 @@ fn preview(
                     .all(|b| b.is_ascii_alphanumeric() || b"_./-".contains(&b))
         })
         .ok_or_else(|| fail("preview requires a simple repository-relative file name"))?;
+    let whole_index = index_snapshot(root);
     let entry = index_entry(root, file)?;
     plain_attributes(root, file)?;
     let base = git(
@@ -488,6 +527,12 @@ fn preview(
     };
     let saved_id = oid("saved")?;
     let proposed_id = oid("proposed")?;
+    let index_id = if let Some((_, bytes)) = &whole_index {
+        fs::write(scratch.0.join("index-preimage"), bytes).map_err(|e| e.to_string())?;
+        oid("index-preimage")?
+    } else {
+        "unavailable".to_owned()
+    };
     let rendered = diff(&scratch.0, "proposed")?;
     let body = rendered
         .split_inclusive(|&byte| byte == b'\n')
@@ -506,8 +551,11 @@ fn preview(
             "index entry or saved file changed while building preview",
         ));
     }
+    if whole_index.is_some() && index_snapshot(root) != whole_index {
+        return Err(fail("Git index changed while building preview"));
+    }
     let mut out = format!(
-        "Selected-line preview only (no changes)\nworktree {root_name}\npath {file}\nmode {}\nbase {}\nsaved {saved_id}\nproposed {proposed_id}\n--- a/{file}\n+++ b/{file}\n",
+        "Selected-line preview only (no changes)\nworktree {root_name}\npath {file}\nmode {}\nbase {}\nsaved {saved_id}\nproposed {proposed_id}\nindex-snapshot {index_id}\n--- a/{file}\n+++ b/{file}\n",
         entry.0, entry.1
     ).into_bytes();
     out.extend(body);
