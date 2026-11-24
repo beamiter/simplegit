@@ -64,12 +64,17 @@ The installer performs a locked release build, atomically installs `lib/simplegi
 | `:SimpleGitToggleSigns` | Toggle the sign-column markers |
 | `:SimpleGitHealth` | Diagnostics |
 
-### Selected lines: read-only preview (Linux x86-64)
+### Selected lines: review and optional staging (Linux x86-64)
 
 In an unmodified local file, select a range in Vim and run
 `:'<,'>SimpleGitSelectedLinesPreview` (or use `:12,14SimpleGitSelectedLinesPreview`).
 Without a range it uses the cursor line. The split is read-only; press `q`
-to close it. Reload if another process changed the saved bytes since Vim
+to close it without staging. In a supported preview, press `S` (or run
+`:SimpleGitStageReviewedLines`) and explicitly choose **Stage**. Cancel is the
+default. The review is single-use after confirmation and only stages the shown
+patch; it never writes the file or commits. If the original Vim view, saved
+bytes or Git index changed, open a fresh preview. If the daemon cannot confirm
+a result, check the Git index before retrying. Reload if another process changed the saved bytes since Vim
 last read them. Reinstall the preview daemon after updating the plugin.
 
 The standalone equivalent is

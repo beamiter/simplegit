@@ -42,8 +42,12 @@ vim-integration: vim-selected-lines-preview
 .PHONY: vim-selected-lines-preview
 vim-selected-lines-preview:
 	@if [ "$$(uname -s):$$(uname -m)" = Linux:x86_64 ] && [ -x lib/simplegit-daemon ]; then \
-	  vim -Nu NONE -n -i NONE -es -S tests/vim_selected_lines_preview.vim -c 'cquit!' \
-	    && echo "selected-line Vim integration passed"; \
+	  log=$$(mktemp); status=0; \
+	  TERM=xterm vim -Nu NONE -n -i NONE -S tests/vim_selected_lines_preview.vim \
+	    -c 'cquit!' </dev/null >$$log 2>&1 || status=$$?; \
+	  if [ $$status -ne 0 ]; then cat $$log >&2; \
+	  else echo "selected-line Vim integration passed"; fi; \
+	  rm -f $$log; exit $$status; \
 	else echo "selected-line Vim integration skipped (Linux x86-64 installed daemon required)"; fi
 
 # Drives real `git commit` inside throwaway repositories.

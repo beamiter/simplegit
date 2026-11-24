@@ -52,7 +52,13 @@ try
     call assert_equal(-1, index(getline(1, '$'), "+NO-SELECT\r"))
     call assert_match('^saved [0-9a-f]\+$', getline(6))
     call assert_false(&modifiable)
+    call assert_equal(2, exists(':SimpleGitStageReviewedLines'))
+    call test_feedinput("\<CR>")
+    SimpleGitStageReviewedLines
+    call assert_equal(s:index_bytes, readblob(s:index), 'default cancel leaves index unchanged')
+    call assert_equal(-1, stridx(execute('messages'), 'review or source changed'), 'cancel reached dialog')
     close
+    call assert_equal(0, exists(':SimpleGitStageReviewedLines'), 'command belongs only to live preview')
   endif
   call assert_equal(s:origin, win_getid())
   call assert_equal(s:index_bytes, readblob(s:index), 'index unchanged')
@@ -136,6 +142,58 @@ try
   2SimpleGitSelectedLinesPreview
   if s:Await({-> &buftype ==# 'nofile'}, 'large confirmed buffer frame')
     call assert_true(index(getline(1, '$'), '+large SELECT') >= 0)
+    close
+  endif
+  execute 'edit ' .. fnameescape(s:file)
+  2SimpleGitSelectedLinesPreview
+  if s:Await({-> &buftype ==# 'nofile'}, 'source-edit confirmation review')
+    call win_execute(s:origin, "call setline(2, 'new unsaved source')")
+    SimpleGitStageReviewedLines
+    call assert_match('review or source changed', execute('messages'))
+    close
+  endif
+  call assert_equal(s:saved_bytes, readblob(s:file))
+  edit!
+
+  " A mutated preview must not act on its previous hidden proposal.
+  2SimpleGitSelectedLinesPreview
+  if s:Await({-> &buftype ==# 'nofile'}, 'changed review text')
+    setlocal modifiable
+    call setline('$', 'tampered review')
+    setlocal nomodifiable nomodified
+    let s:messages_before = execute('messages')
+    SimpleGitStageReviewedLines
+    call assert_notequal(s:messages_before, execute('messages'))
+    call assert_equal("one\r\ntail", system(s:git .. 'show :chosen.txt'))
+    close
+  endif
+
+  " Another Git writer after rendering must not stage the old patch, even
+  " when the selected file and its Vim view themselves are unchanged.
+  2SimpleGitSelectedLinesPreview
+  if s:Await({-> &buftype ==# 'nofile'}, 'index-race confirmation review')
+    call writefile(['peer stage'], s:repo .. '/peer.txt')
+    call system(s:git .. 'add -- peer.txt')
+    let s:peer_index = readblob(s:index)
+    call test_feedinput('s')
+    SimpleGitStageReviewedLines
+    call s:Await({-> execute('messages') =~# 'reviewed index or content changed'}, 'native stale-stage refusal')
+    call assert_equal(s:peer_index, readblob(s:index))
+    call assert_equal("one\r\ntail", system(s:git .. 'show :chosen.txt'))
+    close
+  endif
+
+  2SimpleGitSelectedLinesPreview
+  if s:Await({-> &buftype ==# 'nofile'}, 'current confirmation review')
+    call test_feedinput('s')
+    SimpleGitStageReviewedLines
+    call s:Await({-> execute('messages') =~# 'Selected lines staged: chosen.txt'}, 'real native stage receipt')
+    call assert_equal("one\r\nSELECT\r\ntail", system(s:git .. 'show :chosen.txt'))
+    call assert_equal("peer stage\n", system(s:git .. 'show :peer.txt'))
+    call assert_equal(s:saved_bytes, readblob(s:file), 'worktree unchanged after staging')
+    let s:staged_index = readblob(s:index)
+    SimpleGitStageReviewedLines
+    call assert_equal(s:staged_index, readblob(s:index), 'one shot review')
     close
   endif
 finally

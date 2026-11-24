@@ -1,12 +1,14 @@
 vim9script
 
-# Separate, one-shot read-only operation. Never falls back to a hunk action.
+# Separate, one-shot review and confirmed stage. Never falls back to a hunk action.
 const ROOT = expand('<sfile>:p:h:h:h')
 const FILE_LIMIT = 256 * 1024
 const ROW_LIMIT = 16384
 const OUTPUT_LIMIT = 1024 * 1024 + 8192
 const WAIT_NOTICE_MS = 10000
 var active: dict<any> = {}
+var review: dict<any> = {}
+var staging: dict<any> = {}
 
 def Warn(message: string)
   echohl WarningMsg
@@ -57,6 +59,110 @@ augroup simplegit_selected_line_preview
   autocmd WinLeave,BufLeave,TabLeave * call simplegit#line_preview#Cancel()
 augroup END
 
+# Read only the fixed metadata rows, never search the rendered patch for IDs.
+def HeaderId(row: string, label: string): string
+  return matchstr(row, '^' .. label .. ' \zs\%([0-9a-f]\{40}\|[0-9a-f]\{64}\)$')
+enddef
+
+def BoundReview(request: dict<any>): bool
+  var origin = getwininfo(request.win)
+  return review is request
+      && win_getid() == request.review_win && bufnr('%') == request.review_buf
+      && &buftype ==# 'nofile' && b:changedtick == request.review_tick && !&modifiable && !&modified
+      && !empty(origin) && origin[0].bufnr == request.buffer
+      && bufloaded(request.buffer)
+      && getbufvar(request.buffer, 'changedtick') == request.tick
+      && !getbufvar(request.buffer, '&modified')
+      && fnamemodify(bufname(request.buffer), ':p') ==# request.path
+      && empty(getbufvar(request.buffer, 'vimrc_remote', {}))
+      && [&encoding, getbufvar(request.buffer, '&fileformat'),
+        getbufvar(request.buffer, '&fileencoding'), getbufvar(request.buffer, '&bomb'),
+        getbufvar(request.buffer, '&endofline'), getbufvar(request.buffer, '&binary'),
+        getbufvar(request.buffer, '&buftype')] ==# request.shape
+      && Binary() ==# request.exe
+enddef
+
+def StageFinish(result: dict<any>)
+  if staging isnot result || !result.closed || !has_key(result, 'exit')
+    return
+  endif
+  staging = {}
+  if result.exit == 0 && result.stdout ==# result.receipt .. "\n" && !result.overflow
+    echomsg result.receipt
+    return
+  endif
+  var detail = split(result.stderr, "\n")
+  Warn(empty(detail) ? 'staging not confirmed; check the Git index before retrying'
+    : substitute(detail[0], '[[:cntrl:]]', ' ', 'g') .. '; check the index before retrying')
+enddef
+
+def StageOutput(result: dict<any>, key: string, chunk: string)
+  if staging isnot result || result.overflow
+    return
+  endif
+  if strlen(result[key]) + strlen(chunk) > 8192
+    result.overflow = true
+    return
+  endif
+  result[key] ..= chunk
+enddef
+
+def StageClose(result: dict<any>)
+  result.closed = true
+  StageFinish(result)
+enddef
+
+def StageExit(result: dict<any>, status: number)
+  result.exit = status
+  StageFinish(result)
+enddef
+
+export def StageReviewed()
+  if !empty(staging)
+    Warn('a confirmed stage is still processing; check the receipt first')
+    return
+  endif
+  var request = review
+  if empty(request) || !BoundReview(request)
+    Warn('review or source changed; open a fresh preview')
+    return
+  endif
+  if confirm(printf('Stage this reviewed patch for %s (lines %d–%d)?',
+        request.file, request.first, request.last), "&Cancel\n&Stage", 1) != 2
+    return
+  endif
+  if !BoundReview(request) || !empty(staging)
+    Warn('review or source changed; open a fresh preview')
+    return
+  endif
+  # A confirmed review is single-use even if launch fails. Git independently
+  # revalidates the exact disk bytes and whole index under its own lock.
+  review = {}
+  var result: dict<any> = {
+    stdout: '', stderr: '', closed: false, overflow: false,
+    receipt: 'Selected lines staged: ' .. request.file,
+  }
+  staging = result
+  try
+    var started = job_start([request.exe, '--stage-selected-lines-confirmed',
+      request.index_id, request.saved_id, request.proposed_id, string(request.first),
+      string(request.last), '--', request.path], {
+      noblock: 1, stoponexit: '', in_io: 'null', out_mode: 'raw', err_mode: 'raw',
+      out_cb: (_, chunk) => StageOutput(result, 'stdout', chunk),
+      err_cb: (_, chunk) => StageOutput(result, 'stderr', chunk),
+      close_cb: (_) => StageClose(result),
+      exit_cb: (_, status) => StageExit(result, status),
+    })
+    if job_status(started) ==# 'fail'
+      staging = {}
+      Warn('could not start confirmed staging; open a fresh preview')
+    endif
+  catch
+    staging = {}
+    Warn('staging not confirmed; check the Git index before retrying')
+  endtry
+enddef
+
 def Finish(request: dict<any>)
   # Vim can deliver exit before the channel close (and before final stdout).
   if active isnot request || !request.closed || !has_key(request, 'exit')
@@ -78,10 +184,30 @@ def Finish(request: dict<any>)
   resize 12
   setlocal buftype=nofile bufhidden=wipe noswapfile nobuflisted
   noautocmd setlocal filetype=diff
-  setline(1, split(request.stdout, "\n", true))
+  var rows = split(request.stdout, "\n", true)
+  setline(1, rows)
+  request.stdout = ''
   setlocal nomodifiable nomodified
   nnoremap <silent><buffer> q <Cmd>close<CR>
   normal! gg
+  review = {}
+  if len(rows) < 10 || rows[2] !~# '^path [ -~]\+$'
+    return
+  endif
+  request.saved_id = HeaderId(rows[5], 'saved')
+  request.proposed_id = HeaderId(rows[6], 'proposed')
+  request.index_id = HeaderId(rows[7], 'index-snapshot')
+  if empty(request.index_id) || len(request.saved_id) != len(request.index_id)
+      || len(request.proposed_id) != len(request.index_id)
+    return
+  endif
+  request.file = strpart(rows[2], 5)
+  request.review_win = win_getid()
+  request.review_buf = bufnr('%')
+  request.review_tick = b:changedtick
+  review = request
+  command! -buffer SimpleGitStageReviewedLines call simplegit#line_preview#StageReviewed()
+  nnoremap <silent><buffer> S <Cmd>SimpleGitStageReviewedLines<CR>
 enddef
 
 def Append(request: dict<any>, key: string, chunk: string)
@@ -172,6 +298,7 @@ export def Start(first: number, last: number)
   endif
   var request: dict<any> = {
     win: win_getid(), buffer: bufnr('%'), tick: b:changedtick, path: path,
+    first: first, last: last, exe: exe,
     shape: [&encoding, &fileformat, &fileencoding, &bomb, &endofline, &binary, &buftype],
     stdout: '', stderr: '', closed: false, discarded: false,
   }
@@ -208,3 +335,6 @@ export def Start(first: number, last: number)
     Warn('could not exchange buffer bytes with the preview daemon; run ./install.sh or retry')
   endtry
 enddef
+
+# Also compile the cold confirmation path in the defcompile gate.
+defcompile
