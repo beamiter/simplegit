@@ -63,6 +63,27 @@ The installer performs a locked release build, atomically installs `lib/simplegi
 | `:SimpleGitToggleSigns` | Toggle the sign-column markers |
 | `:SimpleGitHealth` | Diagnostics |
 
+### Selected lines: read-only preview (Linux x86-64)
+
+```sh
+./lib/simplegit-daemon --preview-selected-lines 12 14 -- /path/to/tracked-file
+```
+
+The inclusive range is in the saved file, not unsaved Vim text. The preview
+reports the worktree/path, mode, original indexed blob ID, saved blob ID and
+proposed blob ID, then the Git-rendered patch. It does **not** stage anything,
+write Git objects or change the existing hunk commands. Partial insertions are
+supported; a replacement must include every new line in its run or the preview
+refuses to guess which deletions you intended. Deletion-only changes are not
+implicitly selected. CRLF and missing final newlines are preserved.
+
+This mode supports small, ordinary local UTF-8 tracked files with simple
+ASCII repository-relative names. It rejects symlinks, mode changes, special
+index entries and any Git attributes or autocrlf setting that could change
+the line coordinate system. It checks the captured target index entry and
+saved file again before reporting but does not reserve the index afterward.
+There is no apply subcommand.
+
 ### Statusline
 
 ```vim

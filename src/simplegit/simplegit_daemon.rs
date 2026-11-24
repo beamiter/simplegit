@@ -1,3 +1,6 @@
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod selected_line_preview;
+
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -2876,13 +2879,14 @@ const USAGE: &str = "\
 Usage: simplegit-daemon [OPTION]
 
 With no arguments the daemon serves newline-delimited JSON requests on stdin
-and writes replies to stdout.  That is how the Vim plugin starts it; there is
-nothing useful to do with it interactively.
+and writes replies to stdout. That is how the Vim plugin starts it.
 
 Options:
   -V, --version    print the version and exit
   -h, --help       print this help and exit
       --self-test  run one request through the daemon in-process and exit
+      --preview-selected-lines FIRST LAST -- FILE
+                   print a read-only saved-file preview (Linux x86-64)
 ";
 
 /// Drives a real request through [`run`] over in-memory pipes.
@@ -2945,6 +2949,16 @@ async fn main() -> std::process::ExitCode {
         Some("--help" | "-h") => {
             println!("simplegit-daemon {}\n\n{USAGE}", env!("CARGO_PKG_VERSION"));
             std::process::ExitCode::SUCCESS
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        Some("--preview-selected-lines") => {
+            match selected_line_preview::run_cli(&args[1..], std::io::stdout().lock()) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(message) => {
+                    eprintln!("simplegit-daemon: {message}");
+                    std::process::ExitCode::FAILURE
+                }
+            }
         }
         Some("--self-test") => match self_test().await {
             Ok(()) => {
